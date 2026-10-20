@@ -28,7 +28,6 @@ from sklearn import svm, linear_model
 # this is my code base, this assumes that you can access it
 import util
 import pt_util
-import dichotomies as dic
 import server_utils as su
 
 from sklearn.exceptions import ConvergenceWarning
