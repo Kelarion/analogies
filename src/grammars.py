@@ -13,6 +13,8 @@ import torch
 
 import os
 import re
+import inspect
+import functools
 import random
 from time import time
 from itertools import combinations, product
@@ -409,8 +411,58 @@ def _pick(rng, options, weights):
     return options[int(np.searchsorted(np.cumsum(w), rng.random() * w.sum()))]
 
 
+def _spec_repr(v):
+    """Deterministic text for a constructor argument: graphs by their sorted nodes and
+    edges (with attributes), callables by name, arrays as lists, the rest by repr."""
+    if isinstance(v, nx.Graph):
+        sort = lambda xs: sorted(xs, key=repr)
+        node = lambda n, d: (n, sort(d.items()))
+        if v.is_multigraph():
+            edges = sort((u, w, k, sort(d.items())) for u, w, k, d in v.edges(keys=True, data=True))
+        else:
+            edges = sort((u, w, sort(d.items())) for u, w, d in v.edges(data=True))
+        return '%s(nodes=%r, edges=%r)' % (type(v).__name__, sort(node(n, d) for n, d in v.nodes(data=True)), edges)
+    if callable(v) and not isinstance(v, Sequential):
+        return getattr(v, '__qualname__', type(v).__name__)
+    if isinstance(v, np.ndarray):
+        return repr(v.tolist())
+    if isinstance(v, (list, tuple)):
+        inner = ', '.join(_spec_repr(x) for x in v)
+        return '[%s]' % inner if isinstance(v, list) else '(%s)' % inner
+    if isinstance(v, dict):
+        return '{%s}' % ', '.join('%r: %s' % (k, _spec_repr(x)) for k, x in sorted(v.items(), key=repr))
+    return repr(v)
+
+
+def _record_init(init):
+    """Wrap a Sequential subclass's __init__ to remember the call that built the object
+    (the outermost constructor's, when they chain through super().__init__)."""
+    sig = inspect.signature(init)
+
+    @functools.wraps(init)
+    def wrapped(self, *args, **kwargs):
+        if '_init_spec' not in self.__dict__:
+            bound = sig.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            self._init_spec = (type(self).__name__, dict(list(bound.arguments.items())[1:]))
+        init(self, *args, **kwargs)
+    return wrapped
+
+
 class Sequential:
     """Everything that does not depend on how the state is represented."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if '__init__' in cls.__dict__:
+            cls.__init__ = _record_init(cls.__init__)
+
+    def __repr__(self):
+        """The constructor call that built this object, e.g. FSA(graph=MultiDiGraph(...),
+        length=1). Equal arguments give equal reprs, which the experiment hashing in
+        super_experiments relies on (the default repr contains a memory address)."""
+        name, args = self.__dict__.get('_init_spec', (type(self).__name__, {}))
+        return '%s(%s)' % (name, ', '.join('%s=%s' % (k, _spec_repr(v)) for k, v in args.items()))
 
     def state(self, seq=()):
         """A state with `seq` pushed. Stops early if the prefix dies, so

@@ -1,19 +1,19 @@
-transformers
-jaxtyping
-transformer_lens
-nnsight
---extra-index-url https://download.pytorch.org/whl/cu126
-torch 
-torchvision 
-torchaudio 
+# Direct dependencies of the ICL repo: icl_utils, icl_tasks, run_icl, and the repler
+# modules they need (grammars, automata, super_experiments, util, server_utils, pt_util).
+#
+# Pin torch, transformers and transformer-lens to versions you know work together,
+# e.g. the ones from a working Colab session:
+#   !pip freeze | grep -iE "^(torch|transformers|transformer.lens)="
+
+# numerics, graphs, plotting
 numpy
 scipy
-matplotlib
-scikit-learn
-cvxpy
 networkx
-pandas
-numba
-einops
+matplotlib
 tqdm
-nltk
+
+# models
+torch
+transformers
+transformer-lens>=3.0    # TransformerBridge (transformer_lens.model_bridge) arrived in 3.0
+accelerate               # from_pretrained(..., device_map="cuda") needs it
