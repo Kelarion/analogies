@@ -11,7 +11,7 @@ from icl_tasks import AutomatonTask
 from icl_model import ICLModel
 from icl_utils import plot_icl
 
-SAVE_DIR = os.path.join(os.environ.get('SCRATCH', '.'), 'icl_results')
+SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 # %% What to run: lists are swept, tuples are matched 1-1 (as in send_to_server)
 task_args = {'task': AutomatonTask,
@@ -30,7 +30,10 @@ mod_args = {'model': ICLModel,
             'effort': 'low',
             'seed': 0}
 
-# %% Run (one model load per model_name; runs sharing a model are grouped)
+# %% Either: submit as a Slurm job array, one job per combination (from the cluster)
+# su.send_to_server(task_args, mod_args, verbose=True)            # or name='my-sweep'
+
+# %% Or: run here, e.g. in an interactive session (each model is loaded once)
 exps, _ = su.get_all_experiments(task_args, mod_args)
 exps.sort(key=lambda e: e['model_args']['args'].get('model_name', ''))
 for e in exps:

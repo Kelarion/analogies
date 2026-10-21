@@ -1,13 +1,18 @@
-CODE_DIR = '/home/kelarion/github/repler/src/'
-SAVE_DIR = '/mnt/c/Users/mmall/OneDrive/Documents/uni/columbia/main/'
+import os
 
-REMOTE_SYNC_SERVER = 'ma3811@motion.rcs.columbia.edu' #must have ssh keys set up
-REMOTE_CODE = '/burg/home/ma3811/repler/'
-REMOTE_RESULTS = '/burg/theory/users/ma3811/results/'
+# Where things live, from the environment so the same file works on the laptop and the cluster.
+# SAVE_DIR: results (Experiment.save_experiment / load_experiments).
+# SWEEP_DIR: one folder per submitted sweep, holding its task/model pickles, job script and logs.
+_BASE = os.environ.get('SCRATCH', os.path.expanduser('~'))
+SAVE_DIR = os.environ.get('ICL_RESULTS', os.path.join(_BASE, 'icl_results')) + '/'
+SWEEP_DIR = os.environ.get('ICL_SWEEPS', os.path.join(_BASE, 'icl_sweeps'))
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # src/.. = repo root
+JOB_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'array_template.sh')
+WORKER = os.path.join(REPO_DIR, 'jobs', 'run_experiment.py')
 
 import socket
-import os
 import sys
+import time
 import glob
 import importlib
 import pickle as pkl
@@ -563,73 +568,59 @@ def parse_params(dictionary, forbidden_keys=None):
     return out_dicts
 
 
-def send_to_server(task_args, mod_args, run_remote=True, verbose=False):
-    """ 
-    if run_remote=False, will just run the first experiment locally (for debugging)
+def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
+                   name=None, max_parallel=8, template=None):
+    """
+    Submit every task x model combination as one Slurm job array, from the cluster itself.
 
-    any values which are list-type will be combined together independently, any values which 
-    are tuple-type will be matched together 1-1. 
+    Any values which are list-type are combined independently; tuple-type values are
+    matched 1-1 (see parse_params).
 
+    Each call gets its own folder SWEEP_DIR/<name or timestamp>/ with the task_i / model_j
+    pickles, the rendered job script and the logs, so a new sweep can't overwrite the
+    inputs of one still in the queue. Array task k runs task k % n_task with model
+    k // n_task (see jobs/run_experiment.py), and results go to SAVE_DIR as usual.
+
+    run_remote=False runs the first combination here instead, for debugging.
+    max_parallel caps how many array tasks run at once.
     """
 
-    ##### Pickle experiment parameters
-    ##########################################
+    tasks = parse_params(task_args, forbidden_keys=['task'])
+    models = parse_params(mod_args, forbidden_keys=['model'])
+    n_task, n_tot = len(tasks), len(tasks) * len(models)
 
-    exp_idx = 0
-    for this_dset in parse_params(task_args, forbidden_keys=['task']):
+    sweep = os.path.join(SWEEP_DIR, name or time.strftime('%Y%m%d-%H%M%S'))
+    if os.path.exists(sweep):
+        raise FileExistsError(f'{sweep} already exists; pick another name')
+    os.makedirs(os.path.join(sweep, 'logs'))
 
-        dset_info = {'task':task_args['task'], 'args':this_dset}
-        if verbose:
-            print('saving: ' + SAVE_DIR+'server_cache/task_%d.pkl'%exp_idx)
-        pkl.dump(dset_info, open(SAVE_DIR+'server_cache/task_%d.pkl'%exp_idx,'wb'))
-        exp_idx += 1
-
-    ##### Pickle network/optimizer parameters
-    ##########################################
-
-    net_idx = 0
-    for this_mod in parse_params(mod_args, forbidden_keys=['model']):
-
-        dset_info = {'model': mod_args['model'], 'args': this_mod}
-
-        if verbose:
-            print('saving: ' + SAVE_DIR+'server_cache/model_%d.pkl'%net_idx)
-        pkl.dump(dset_info, open(SAVE_DIR+'server_cache/model_%d.pkl'%net_idx,'wb'))
-        net_idx += 1
-
+    for i, args in enumerate(tasks):
+        with open(os.path.join(sweep, 'task_%d.pkl' % i), 'wb') as f:
+            pkl.dump({'task': task_args['task'], 'args': args}, f)
+    for j, args in enumerate(models):
+        with open(os.path.join(sweep, 'model_%d.pkl' % j), 'wb') as f:
+            pkl.dump({'model': mod_args['model'], 'args': args}, f)
     if verbose:
-        print('\nSending %d jobs to server ...\n'%(net_idx*exp_idx))
+        print(f'{n_task} tasks x {len(models)} models = {n_tot} jobs, in {sweep}')
 
-    ###### Send to pickles server
-    ##########################################
-    if run_remote:
+    if not run_remote:
+        print('Running the first job here...')
+        subprocess.check_call([sys.executable, WORKER, '0', str(n_task), sweep])
+        return sweep
 
-        print('[{}] Giving files to {}...'.format(sys.platform, REMOTE_SYNC_SERVER))
+    with open(template or JOB_TEMPLATE) as f:
+        script = f.read().format(n_tot=n_tot - 1, n_task=n_task, sweep_dir=sweep,
+                                 repo=REPO_DIR, max_parallel=max_parallel)
+    script_file = os.path.join(sweep, 'job_script.sh')
+    with open(script_file, 'w') as f:
+        f.write(script)
 
-        cmd = 'rsync {local}*.pkl {remote} -v'.format(local=SAVE_DIR+'server_cache/',
-            remote=REMOTE_SYNC_SERVER+':'+REMOTE_RESULTS)
-        subprocess.check_call(cmd, shell=True)
-
-        tmplt_file = open(CODE_DIR+'/job_script_template.sh','r')
-        with open(SAVE_DIR+'server_cache/job_script.sh','w') as script_file:
-            sbatch_text = tmplt_file.read().format(n_tot=net_idx*exp_idx - 1, n_task=exp_idx, file_dir=REMOTE_CODE)
-            script_file.write(sbatch_text)
-        tmplt_file.close()
-
-        ####### Run job array 
-        ###########################################
-
-        cmd = f"ssh ma3811@ginsburg.rcs.columbia.edu 'sbatch -s' < {SAVE_DIR+'server_cache/job_script.sh'}"
-        subprocess.call(cmd, shell=True)
-
-    else:
-        print('Running job...')
-
-        cmd = f"python {CODE_DIR}/run_experiment.py 0 1"
-        subprocess.call(cmd, shell=True)
+    out = subprocess.run(['sbatch', script_file], capture_output=True, text=True)
+    print(out.stdout.strip() or out.stderr.strip())
+    out.check_returncode()
+    return sweep
 
 
-# for retrieving from the server
 def get_all_experiments(task_args, model_args, bool_friendly=True):
 
     ##### Loop over experiment parameters
@@ -695,6 +686,8 @@ def _canon(v):
         return v.item()
     if isinstance(v, np.ndarray):
         return tuple(v.tolist())
+    if type(v).__eq__ is object.__eq__ and v is not None:
+        return repr(v)    # identity equality can't match across processes; compare by repr
     try:
         hash(v)
         return v

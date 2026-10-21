@@ -1,0 +1,22 @@
+#!/bin/bash
+# Job-array template filled in by server_utils.send_to_server: {{name}} fields are
+# placeholders, so literal braces in bash have to be doubled ({{ }}).
+#
+# Partition: main caps resources (2 GPUs, 48G, 8 CPUs per partitions.md). long has no cap
+# but is preemptible: a preempted task is requeued and rerun from the start, which is safe
+# here because a run only saves at the end.
+#SBATCH --job-name=icl
+#SBATCH --partition=long
+#SBATCH --gres=gpu:1
+#SBATCH --constraint=80gb
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=0-11:59:00
+#SBATCH --array=0-{n_tot}%{max_parallel}
+#SBATCH --output={sweep_dir}/logs/%a.out
+
+export HF_HUB_OFFLINE=1        # weights must already be downloaded (hf download ...)
+cd {repo}
+echo "commit: $(git rev-parse HEAD)"
+uv sync --check -q || {{ echo "environment out of date: run 'uv sync' on the login node"; exit 1; }}
+uv run --no-sync python jobs/run_experiment.py $SLURM_ARRAY_TASK_ID {n_task} {sweep_dir}
