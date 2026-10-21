@@ -1,0 +1,37 @@
+[project]
+name = "analogies"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "cvxpy>=1.9.3",
+    "einops>=0.8.2",
+    "jaxtyping>=0.3.11",
+    "matplotlib>=3.11.2",
+    "networkx>=3.7",
+    "nltk>=3.10.4",
+    "nnsight>=0.8.1",
+    "numba>=0.68.0",
+    "numpy>=2.5.4",
+    "pandas>=3.0.6",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "torch>=2.14.1",
+    "torchaudio>=2.11.0",
+    "torchvision>=0.29.1",
+    "tqdm>=4.70.1",
+    "transformer-lens>=4.2.0",
+    "transformers>=5.20.2",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "ipython>=9.17.1",
+]
