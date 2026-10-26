@@ -8,9 +8,10 @@ from collections import defaultdict
 
 import networkx as nx
 import numpy as np
+import string
 
 from grammars import EOS, _TOL, Sequential, _pick
-
+import mln
 
 def _ordered(labels):
     """Sorted when the labels are comparable (ints), else in first-seen order."""
@@ -245,16 +246,27 @@ class FSA(Automaton):
     conditioned on never taking a forbidden pair -- exactly what rejection
     sampling would give, which also shifts probability at *earlier* steps away
     from nodes where a forbidden action was likely.
+
+    backtrack=False forbids stepping straight back: arriving at v from u, the
+    edges from v to u are dropped and the rest renormalised -- unless nothing
+    else is left, at a dead end, when the walk may turn back. Only edges are
+    dropped, so with slip an action that sometimes lands on u stays available
+    with its other outcomes (and so becomes a little less likely). The
+    walk is then a Markov chain on (node, node just left), and length,
+    mean_length, end_at and condition apply to that chain exactly, so the
+    bridge plans around backtracks rather than being forced into them. The
+    forced last step of generate(end_with=...) is exempt.
     """
 
     KINDS = ("action", "node")           # the order within a step
 
     def __init__(self, graph, init=None, length=None, mean_length=None,
                  forbid=(), condition=False, action="action", weights="weight",
-                 end_at=None, show=("node", "action"), _mode=None):
+                 end_at=None, show=("node", "action"), backtrack=True, _mode=None):
         if length is not None and mean_length is not None:
             raise ValueError("give length or mean_length, not both")
         self.graph, self.init, self.condition = graph, init, condition
+        self.backtrack = backtrack
         self.end_at = end_at
         self._action, self._weights = action, weights
 
@@ -333,6 +345,27 @@ class FSA(Automaton):
         self.out_q = [np.array(x, float) for x in out_q]
         self.n_actions = A
 
+        # The walk's state is a config (node, node just left), the latter -1 at
+        # the start, or always when backtracking is allowed (then the configs
+        # are just the nodes, in order). The bridge below runs over configs.
+        cfgs = [(i, -1) for i in range(n)]
+        if not backtrack:
+            cfgs += sorted({(int(j), i) for i in range(n) for j in self.out_j[i]})
+        sid = {c: k for k, c in enumerate(cfgs)}
+        N = len(cfgs)
+        self._cfg_index = sid
+        self._cfg_q, self._cfg_next = [], []
+        T = np.zeros((N, N))
+        for k, (i, came_from) in enumerate(cfgs):
+            q = self.out_q[i]
+            if came_from >= 0:
+                q = self._no_backtrack(i, came_from, q)
+            nxt = np.array([sid[(int(j), -1 if backtrack else i)] for j in self.out_j[i]], int)
+            np.add.at(T[k], nxt, q)
+            self._cfg_q.append(q)
+            self._cfg_next.append(nxt)
+        node_of_cfg = np.array([i for i, _ in cfgs], int)
+
         pi = np.zeros(n)
         if init is None:
             w = np.array([float(graph.nodes[s].get("start", 0.0)) for s in nodes])
@@ -351,40 +384,41 @@ class FSA(Automaton):
         # rate and otherwise takes a held-out action, and that mass is lost --
         # so only the full graph's sinks halt outright.
         sinks = tot <= 0
-        dead = sinks if condition else (A0.sum(1) <= _TOL)
+        dead = (sinks if condition else (A0.sum(1) <= _TOL))[node_of_cfg]
         if end_at is not None and _mode[0] == "sink":
             raise ValueError("ending at a node needs length or mean_length")
+        at_end = (node_of_cfg == idx[end_at]) if end_at is not None else None
         if self.length is not None:
-            Z = np.ones((self.length + 1, n))        # Z[k, i] = P(k more steps)
+            Z = np.ones((self.length + 1, N))        # Z[k, c] = P(k more steps)
             if end_at is not None:                   # ... and then be at end_at
-                Z[0] = 0.0
-                Z[0][idx[end_at]] = 1.0
+                Z[0] = at_end.astype(float)
             for k in range(1, self.length + 1):
-                Z[k] = A0 @ Z[k - 1]
+                Z[k] = T @ Z[k - 1]
             self.Z = Z
             z = Z[-1]
         else:
-            h = (np.full(n, 1.0 / self.mean_length) if self.mean_length is not None
-                 else np.zeros(n))
+            h = (np.full(N, 1.0 / self.mean_length) if self.mean_length is not None
+                 else np.zeros(N))
             h[dead] = 1.0
-            M = (1.0 - h)[:, None] * A0
+            M = (1.0 - h)[:, None] * T
             # halting only counts at end_at, if given: walks that halt anywhere
             # else are conditioned away
             h_end = h.copy()
             if end_at is not None:
-                h_end[np.arange(n) != idx[end_at]] = 0.0
+                h_end[~at_end] = 0.0
             can = h_end > 0
             while True:
                 nxt = can | ((M[:, can].sum(1) > 0) if can.any() else False)
                 if np.array_equal(nxt, can):
                     break
                 can = nxt
-            z = np.zeros(n)
+            z = np.zeros(N)
             if can.any():
                 sub = np.where(can)[0]
                 z[sub] = np.linalg.solve(np.eye(len(sub)) - M[np.ix_(sub, sub)], h_end[sub])
             z = np.clip(z, 0.0, 1.0)
             self.h, self.h_end, self.z = h, h_end, z
+        z = z[:n]                                    # the start configs (i, -1)
         self.p_finite = float(pi @ z)
         if self.p_finite <= _TOL:
             raise ValueError("no walk can finish under these restrictions")
@@ -394,15 +428,26 @@ class FSA(Automaton):
 
     def start(self):
         show = "node" in self.show
-        return [(float(self.pi[i]), (int(self.node_tok[i]),) if show else (), int(i))
+        return [(float(self.pi[i]), (int(self.node_tok[i]),) if show else (), (int(i), -1))
                 for i in np.nonzero(self.pi)[0]]
 
-    def options(self, i, steps):
-        w, stop = self._edge_weights(i, steps)
+    def options(self, config, steps):
+        i, _ = config
+        w, stop = self._edge_weights(config, steps)
+        prev = -1 if self.backtrack else int(i)
         out = [(stop, (EOS,), None)] if stop > 0.0 else []
         for wk, a, j in zip(w, self.out_a[i], self.out_j[i]):
-            out.append((float(wk), self._emit(action=a + 1, node=self.node_tok[j]), int(j)))
+            out.append((float(wk), self._emit(action=a + 1, node=self.node_tok[j]), (int(j), prev)))
         return out
+
+    def _no_backtrack(self, i, u, q):
+        """Node i's edge probabilities q after arriving from u: the edges back
+        to u dropped and the rest scaled up to the same total -- unless no
+        other edge is left, a dead end, when q stands."""
+        back = self.out_j[i] == u
+        if not back.any() or q[~back].sum() <= 0.0:
+            return q
+        return np.where(back, 0.0, q) * (q.sum() / q[~back].sum())
 
     def transitions(self):
         """One trial per edge, showing what a one-step walk shows (the grammar
@@ -537,7 +582,8 @@ class FSA(Automaton):
             cache[key] = FSA(self.graph, init=self.init,
                              forbid=self.forbid | key[0], condition=self.condition,
                              action=self._action, weights=self._weights,
-                             end_at=end_at, show=self.show, _mode=mode)
+                             end_at=end_at, show=self.show, backtrack=self.backtrack,
+                             _mode=mode)
         return cache[key]
 
     def _as_pairs(self, forbid):
@@ -560,27 +606,29 @@ class FSA(Automaton):
         return FSA(self.graph, init=self.init, forbid=self.forbid | set(pairs),
                    condition=self.condition, action=self._action,
                    weights=self._weights, end_at=self.end_at, show=self.show,
-                   _mode=self._mode)
+                   backtrack=self.backtrack, _mode=self._mode)
 
     # -- one step ---------------------------------------------------------------
 
-    def _edge_weights(self, i, steps):
-        """Probability of each allowed edge out of node i, and of stopping."""
-        q, j = self.out_q[i], self.out_j[i]
+    def _edge_weights(self, config, steps):
+        """Probability of each allowed edge out of the config's node, and of
+        stopping. config is (node index, node just left, or -1)."""
+        k = self._cfg_index[config]
+        q, j = self._cfg_q[k], self._cfg_next[k]
         if self.length is not None:
             rem = self.length - steps
             if rem <= 0:
                 return np.zeros_like(q), 1.0
-            return q * self.Z[rem - 1][j] / self.Z[rem][i], 0.0
-        zi = self.z[i]
-        return (1.0 - self.h[i]) * q * self.z[j] / zi, self.h_end[i] / zi
+            return q * self.Z[rem - 1][j] / self.Z[rem][k], 0.0
+        zk = self.z[k]
+        return (1.0 - self.h[k]) * q * self.z[j] / zk, self.h_end[k] / zk
 
     def action_dist(self, i, steps):
-        w, stop = self._edge_weights(i, steps)
+        w, stop = self._edge_weights((i, -1), steps)
         return np.bincount(self.out_a[i], weights=w, minlength=self.n_actions), stop
 
     def dest_dist(self, i, action_token, steps):
-        w, _ = self._edge_weights(i, steps)
+        w, _ = self._edge_weights((i, -1), steps)
         m = self.out_a[i] == action_token - 1
         d = np.bincount(self.out_j[i][m], weights=w[m], minlength=len(self.pi))
         tot = d.sum()
@@ -1163,4 +1211,46 @@ def grid(n, m=None, torus=False, slip=0.0,
 def cycle(k):
     """A directed k-cycle with a single action, 0."""
     return nx.MultiDiGraph([(i, (i + 1) % k, {"action": 0}) for i in range(k)])
+
+
+def random_relation(k, r=1, degree=2, density=None):
+
+    rels = ['R' + str(i) for i in range(r)]
+    properties = [f"inf {R}(x,y) -> {R}(x,y)" for R in rels] # tautology
+
+    mod = mln.MLN(k, properties, degree=degree, density=density, constraint='weak')
+
+    return mod.sample()
+
+
+def spatial_relation(k, d, commutes=False, total=False, density=None):
+
+    rels = ['R' + str(i) for i in range(d)]
+    pairs = [(rel, 'L'+str(i)) for i,rel in enumerate(rels)]
+
+    properties = [mln.Spatial(*pairs, total=total)]
+
+    if commutes:
+        for i,p1 in enumerate(pairs):
+            for p2 in pairs[i+1:]:
+                properties.append(mln.commute(p1[0], p2[0]))
+                properties.append(mln.commute(p1[0], p2[1]))
+                properties.append(mln.commute(p1[1], p2[0]))
+                properties.append(mln.commute(p1[1], p2[1]))
+
+
+    mod = mln.MLN(k, properties, density=density)
+
+    return mod.sample()
+
+
+def block_relation(k, n, r=1, density=0.1):
+
+    rels = ['R' + str(i) for i in range(d)]
     
+    properties = [mln.categorical('In')] # latent category
+    properties += [mln.sbm('In', R) for R in rels]
+
+    mod = mln.MLN(k, properties, latents=n)
+
+    return mod.sample()

@@ -2,23 +2,32 @@ import os
 
 # Where things live, from the environment so the same file works on the laptop and the cluster.
 # SAVE_DIR: results (Experiment.save_experiment / load_experiments).
-# SWEEP_DIR: one folder per submitted sweep, holding its task/model pickles, job script and logs.
+# SWEEP_DIR: one folder per submitted sweep: its task/model pickles, job script and logs.
 _BASE = os.environ.get('SCRATCH', os.path.expanduser('~'))
 SAVE_DIR = os.environ.get('ICL_RESULTS', os.path.join(_BASE, 'icl_results')) + '/'
 SWEEP_DIR = os.environ.get('ICL_SWEEPS', os.path.join(_BASE, 'icl_sweeps'))
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # src/.. = repo root
 JOB_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'array_template.sh')
 WORKER = os.path.join(REPO_DIR, 'jobs', 'run_experiment.py')
+DOWNLOAD_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'download_template.sh')
+WEIGHTS = 'jobs/weights.py'          # relative to the repo, run on the cluster
+
+# Submitting from elsewhere (e.g. the laptop): the ssh host, and the repo's path there.
+REMOTE_HOST = os.environ.get('ICL_REMOTE_HOST', 'mila')
+REMOTE_REPO = os.environ.get('ICL_REMOTE_REPO', '~/analogies')
 
 import socket
 import sys
 import time
+import json
+import shlex
+import shutil
 import glob
 import importlib
 import pickle as pkl
 import subprocess
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 import numpy as np
 import torch
@@ -27,6 +36,71 @@ from tqdm import tqdm
 import itertools as itt
 
 import util
+
+class Build:
+    """
+    A deferred constructor call, for task_args / mod_args values that are expensive to make:
+
+        'grammar': Build(auto.FSA, Build(auto.cycle, 5), length=1)
+
+    stands for auto.FSA(auto.cycle(5), length=1). Nothing is built when the sweep is
+    defined or submitted: Task and Model call build() on their fields when they are
+    constructed, i.e. inside the job (nested Builds first). The un-built Build is what is
+    recorded in .args, hashed into the save name, and matched by load_experiments, via its
+    repr, which spells out the call: automata.FSA(automata.cycle(5), length=1).
+    """
+    def __init__(self, func, *args, **kwargs):
+        self.func, self.args, self.kwargs = func, args, kwargs
+
+    def build(self):
+        return self.func(*resolve(self.args), **resolve(self.kwargs))
+
+    def __repr__(self):
+        name = f'{self.func.__module__}.{self.func.__qualname__}'
+        parts = [_build_repr(a) for a in self.args]
+        parts += [f'{k}={_build_repr(v)}' for k, v in sorted(self.kwargs.items())]
+        return f'{name}({", ".join(parts)})'
+
+    def __eq__(self, other):
+        return isinstance(other, Build) and repr(self) == repr(other)
+
+    def __hash__(self):
+        return hash(repr(self))
+
+
+def _build_repr(v):
+    if isinstance(v, np.ndarray):
+        return f'array({v.tolist()!r})'           # numpy's own repr truncates large arrays
+    if isinstance(v, (list, tuple)):
+        inner = ', '.join(_build_repr(x) for x in v)
+        return f'[{inner}]' if isinstance(v, list) else f'({inner})'
+    if isinstance(v, dict):
+        return '{' + ', '.join(f'{k!r}: {_build_repr(x)}' for k, x in sorted(v.items(), key=repr)) + '}'
+    if isinstance(v, type) or (callable(v) and hasattr(v, '__qualname__')):
+        return f'{v.__module__}.{v.__qualname__}'
+    return repr(v)
+
+
+def contains_build(v):
+    if isinstance(v, Build):
+        return True
+    if isinstance(v, (list, tuple)):
+        return any(contains_build(x) for x in v)
+    if isinstance(v, dict):
+        return any(contains_build(x) for x in v.values())
+    return False
+
+
+def resolve(v):
+    """v with every Build in it (including inside lists, tuples and dicts) built."""
+    if isinstance(v, Build):
+        return v.build()
+    if isinstance(v, (list, tuple)) and contains_build(v):
+        return type(v)(resolve(x) for x in v)
+    if isinstance(v, dict) and contains_build(v):
+        return {k: resolve(x) for k, x in v.items()}
+    return v
+
 
 class Parameter(np.lib.mixins.NDArrayOperatorsMixin):
     """
@@ -568,57 +642,162 @@ def parse_params(dictionary, forbidden_keys=None):
     return out_dicts
 
 
+def _remote(cmd, capture=True):
+    """Run `cmd` in a login shell on REMOTE_HOST (so $SCRATCH, PATH etc. are set)."""
+    out = subprocess.run(['ssh', REMOTE_HOST, 'bash -lc ' + shlex.quote(cmd)],
+                         capture_output=capture, text=True)
+    if out.returncode:
+        raise RuntimeError(f'on {REMOTE_HOST}: {cmd}\n{out.stderr if capture else ""}')
+    return out.stdout.strip() if capture else None
+
+
+def _git(*args, cwd=REPO_DIR):
+    return subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True).stdout.strip()
+
+
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
-                   name=None, max_parallel=8, template=None):
+                   name=None, max_parallel=8, template=None, remote=None, check_commit=True,
+                   ensure_weights=True):
     """
-    Submit every task x model combination as one Slurm job array, from the cluster itself.
+    Submit every task x model combination as one Slurm job array.
 
     Any values which are list-type are combined independently; tuple-type values are
-    matched 1-1 (see parse_params).
+    matched 1-1 (see parse_params). Only the arguments are pickled; tasks and models are
+    built inside the jobs.
 
-    Each call gets its own folder SWEEP_DIR/<name or timestamp>/ with the task_i / model_j
-    pickles, the rendered job script and the logs, so a new sweep can't overwrite the
-    inputs of one still in the queue. Array task k runs task k % n_task with model
-    k // n_task (see jobs/run_experiment.py), and results go to SAVE_DIR as usual.
+    Each call gets its own folder <sweeps>/<name or timestamp>/ with the task_i / model_j
+    pickles, the job script and the logs, so a new sweep can't overwrite the inputs of one
+    still in the queue. Array task k runs task k % n_task with model k // n_task (see
+    jobs/run_experiment.py); results go to the cluster's SAVE_DIR.
 
+    remote: None submits with sbatch here if this machine has it, else over ssh to
+        REMOTE_HOST (pickles written here, copied over with rsync). True/False forces it.
+    check_commit: when submitting remotely, refuse unless the cluster's checkout is at
+        this repo's commit, since the jobs run the cluster's code on pickles made here.
+    ensure_weights: if the model class has a model_name field, check that each model in the
+        sweep is fully in the cluster's Hugging Face cache; for any that isn't, first submit
+        a CPU job that downloads it, and make the array wait for that job to succeed.
     run_remote=False runs the first combination here instead, for debugging.
     max_parallel caps how many array tasks run at once.
     """
+    if remote is None:
+        remote = run_remote and shutil.which('sbatch') is None
 
     tasks = parse_params(task_args, forbidden_keys=['task'])
     models = parse_params(mod_args, forbidden_keys=['model'])
     n_task, n_tot = len(tasks), len(tasks) * len(models)
+    name = name or time.strftime('%Y%m%d-%H%M%S')
 
-    sweep = os.path.join(SWEEP_DIR, name or time.strftime('%Y%m%d-%H%M%S'))
-    if os.path.exists(sweep):
-        raise FileExistsError(f'{sweep} already exists; pick another name')
-    os.makedirs(os.path.join(sweep, 'logs'))
+    if remote:
+        here = _git('rev-parse', 'HEAD')
+        if _git('status', '--porcelain', '--untracked-files=no'):
+            print('warning: uncommitted changes here; the jobs will run the cluster\'s code')
+        info = _remote('echo $SCRATCH; echo ${ICL_RESULTS:-$SCRATCH/icl_results}; '
+                       'echo ${ICL_SWEEPS:-$SCRATCH/icl_sweeps}; '
+                       f'cd {REMOTE_REPO} && pwd && git rev-parse HEAD').splitlines()
+        scratch, results, sweeps, repo, there = info[-5:]   # last lines, past any login chatter
+        if check_commit and here != there:
+            raise RuntimeError(f'cluster checkout is at {there[:8]}, this repo at {here[:8]}: '
+                               'push here and pull there first (or check_commit=False)')
+        sweep = os.path.join(sweeps, name)
+    else:
+        scratch, repo, results = _BASE, REPO_DIR, SAVE_DIR.rstrip('/')
+        sweep = os.path.join(SWEEP_DIR, name)
+
+    local = os.path.join(SWEEP_DIR, name)        # where the files are written
+    if os.path.exists(local):
+        raise FileExistsError(f'{local} already exists; pick another name')
+    os.makedirs(os.path.join(local, 'logs'))
 
     for i, args in enumerate(tasks):
-        with open(os.path.join(sweep, 'task_%d.pkl' % i), 'wb') as f:
+        with open(os.path.join(local, 'task_%d.pkl' % i), 'wb') as f:
             pkl.dump({'task': task_args['task'], 'args': args}, f)
     for j, args in enumerate(models):
-        with open(os.path.join(sweep, 'model_%d.pkl' % j), 'wb') as f:
+        with open(os.path.join(local, 'model_%d.pkl' % j), 'wb') as f:
             pkl.dump({'model': mod_args['model'], 'args': args}, f)
     if verbose:
-        print(f'{n_task} tasks x {len(models)} models = {n_tot} jobs, in {sweep}')
+        print(f'{n_task} tasks x {len(models)} models = {n_tot} jobs, in {sweep}'
+              + (f' on {REMOTE_HOST}' if remote else ''))
 
     if not run_remote:
         print('Running the first job here...')
-        subprocess.check_call([sys.executable, WORKER, '0', str(n_task), sweep])
-        return sweep
+        subprocess.check_call([sys.executable, WORKER, '0', str(n_task), local])
+        return local
 
+    fill = dict(n_tot=n_tot - 1, n_task=n_task, sweep_dir=sweep, repo=repo, scratch=scratch,
+                results=results, max_parallel=max_parallel)
     with open(template or JOB_TEMPLATE) as f:
-        script = f.read().format(n_tot=n_tot - 1, n_task=n_task, sweep_dir=sweep,
-                                 repo=REPO_DIR, max_parallel=max_parallel)
-    script_file = os.path.join(sweep, 'job_script.sh')
-    with open(script_file, 'w') as f:
+        script = f.read().format(**fill)
+    with open(os.path.join(local, 'job_script.sh'), 'w') as f:
         f.write(script)
 
-    out = subprocess.run(['sbatch', script_file], capture_output=True, text=True)
-    print(out.stdout.strip() or out.stderr.strip())
-    out.check_returncode()
+    names = _model_names(mod_args, models) if ensure_weights else []
+    missing = _missing_weights(names, scratch, repo, remote) if names else []
+    if missing:
+        with open(DOWNLOAD_TEMPLATE) as f:
+            script = f.read().format(models=' '.join(shlex.quote(m) for m in missing), **fill)
+        with open(os.path.join(local, 'download.sh'), 'w') as f:
+            f.write(script)
+
+    if remote:
+        _remote(f'mkdir -p {sweep}')
+        subprocess.run(['rsync', '-a', local + '/', f'{REMOTE_HOST}:{sweep}/'], check=True)
+
+    after = None
+    if missing:
+        after = _sbatch(os.path.join(sweep, 'download.sh'), remote)
+        print(f'Not cached on the cluster: {", ".join(missing)}. Downloading first (job {after}); '
+              'the array starts once that succeeds.')
+    job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after)
+    print(f'Submitted batch job {job} ({n_tot} array tasks)')
     return sweep
+
+
+def _model_names(mod_args, models):
+    """The model_name of every model in the sweep (the field's default where not given),
+    or [] if the model class has no model_name field."""
+    cls = mod_args['model']
+    if not is_dataclass(cls):
+        return []
+    default = {f.name: f.default for f in fields(cls)}
+    if 'model_name' not in default:
+        return []
+    return sorted({m.get('model_name', default['model_name']) for m in models})
+
+
+def _missing_weights(names, scratch, repo, remote):
+    """Which of `names` aren't fully in the cluster's Hugging Face cache (jobs/weights.py)."""
+    hf_home = f'{scratch}/.cache/huggingface'
+    if remote:
+        args = ' '.join(shlex.quote(n) for n in names)
+        out = _remote(f'cd {repo} && HF_HOME={hf_home} .venv/bin/python {WEIGHTS} check {args}')
+    else:
+        out = subprocess.run([sys.executable, os.path.join(repo, WEIGHTS), 'check', *names],
+                             capture_output=True, text=True, check=True,
+                             env={**os.environ, 'HF_HOME': hf_home}).stdout
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def _sbatch(script, remote, after=None):
+    """Submit `script`, optionally to start only once job `after` has succeeded; returns the job id."""
+    args = ['sbatch', '--parsable'] + ([f'--dependency=afterok:{after}'] if after else []) + [script]
+    if remote:
+        out = _remote(' '.join(shlex.quote(a) for a in args))
+    else:
+        res = subprocess.run(args, capture_output=True, text=True)
+        if res.returncode:
+            raise RuntimeError(res.stderr.strip())
+        out = res.stdout
+    return out.strip().splitlines()[-1].split(';')[0]
+
+
+def fetch_results(dest=None):
+    """Copy the cluster's results into SAVE_DIR here (or `dest`), e.g. for plotting on the
+    laptop. Only new or changed files are transferred."""
+    dest = dest or SAVE_DIR
+    os.makedirs(dest, exist_ok=True)
+    results = _remote('echo ${ICL_RESULTS:-$SCRATCH/icl_results}').splitlines()[-1]
+    subprocess.run(['rsync', '-a', f'{REMOTE_HOST}:{results}/', dest], check=True)
 
 
 def get_all_experiments(task_args, model_args, bool_friendly=True):

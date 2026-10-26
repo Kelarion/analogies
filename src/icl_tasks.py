@@ -119,8 +119,9 @@ class AutomatonTask(GrammarTask):
       order each sample (see the automaton's transitions())
 
     With holdout=True, each block holds out one random unit from all its
-    trials but the last, which ends with it: a (node, action) pair for an
-    FSA, a (state, pop, action) group for a PDA (see sample_holdout). A listed
+    trials but the last, which ends with it: a (u, v) node pair -- every
+    edge u -> v -- for an FSA, a (state, pop, action) group for a PDA (see
+    sample_holdout). A listed
     block leaves the unit's transitions out of the listing and ends with one
     of them, so it has a trial more than the listing it is left out of, and
     its length can vary between samples. With symmetric=True as well, the
@@ -185,3 +186,4 @@ class AutomatonTask(GrammarTask):
             h, forbid = ctx
             return self._draw(rng, forbid=forbid, end_with=h if last else None)
         return self._draw(rng)
+        
