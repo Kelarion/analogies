@@ -22,7 +22,7 @@ task_args = {'task': AutomatonTask,
              # Build(f, ...) = f(...), made inside the job, not here; sweep with a list of them
              # 'grammar': Build(auto.FSA, Build(auto.cycle, 5), length=1),
              'grammar': grams,
-             'num_trials': [[None, None], []],       # a list-valued field needs wrapping: [[...]]
+             'num_trials': [[None, None]],       # a list-valued field needs wrapping: [[...]]
              'samps': 20,
              'holdout': True,
              'backtrack': False,
