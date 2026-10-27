@@ -5,6 +5,7 @@ Both kinds are Sequentials, so anything that only needs `generate`,
 `continuations` and `vocab` takes either."""
 
 from collections import defaultdict
+from dataclasses import dataclass
 
 import networkx as nx
 import numpy as np
@@ -12,6 +13,17 @@ import string
 
 from grammars import EOS, _TOL, Sequential, _pick
 import mln
+
+@dataclass(frozen=True, order=True)
+class Edge:
+    """A hold-out unit for an FSA: Edge(u, v, a) is the one transition u -a-> v,
+    and Edge(u, v) every edge u -> v whatever its action. Use it in forbid,
+    end_with and reverse like a (node, action) pair. A class of its own rather
+    than a tuple, so it can't be mistaken for one."""
+    u: object
+    v: object
+    action: object = None
+
 
 def _ordered(labels):
     """Sorted when the labels are comparable (ints), else in first-seen order."""
@@ -327,7 +339,9 @@ class FSA(Automaton):
             raise ValueError("mean_length must be at least 1")
 
         keep = [(i, j, a, w / tot[i]) for i, j, a, w in edges
-                if (nodes[i], a) not in self.forbid]
+                if (nodes[i], a) not in self.forbid
+                and Edge(nodes[i], nodes[j]) not in self.forbid
+                and Edge(nodes[i], nodes[j], a) not in self.forbid]
         if not condition:                            # renormalise what is left
             left = np.zeros(n)
             for i, _, _, q in keep:
@@ -475,12 +489,19 @@ class FSA(Automaton):
         return _ordered(a for ii, jj, a in self._edges if ii == i and jj == j)
 
     def reverse(self, pair):
-        """The (node, action) pairs that undo `pair` = (u, a): (v, b) for each
-        node v that a can take u to, and each action b with an edge v -> u,
-        in the full graph. To hold out an edge in both directions:
-        forbid={pair} | g.reverse(pair). With slip (or any nondeterminism)
-        this can be several pairs per destination."""
-        (u, a), = self._as_pairs([pair])
+        """The units that undo `pair`. For a (node, action) pair (u, a): the
+        pairs (v, b) for each node v that a can take u to, and each action b
+        with an edge v -> u, in the full graph -- with slip (or any
+        nondeterminism) this can be several pairs per destination. For
+        Edge(u, v, a) or Edge(u, v): {Edge(v, u)}, every edge back whatever its
+        action, if the full graph has one, else nothing. To hold out both
+        directions: forbid={pair} | g.reverse(pair)."""
+        unit, = self._as_pairs([pair])
+        if isinstance(unit, Edge):
+            i, j = self._node_index[unit.u], self._node_index[unit.v]
+            return {Edge(unit.v, unit.u)} if any(ii == j and jj == i
+                                                 for ii, jj, _ in self._edges) else set()
+        u, a = unit
         i = self._node_index[u]
         dests = {j for ii, j, aa in self._edges if ii == i and aa == a}
         if not dests:
@@ -493,7 +514,7 @@ class FSA(Automaton):
     def generate(self, rng=None, tree=False, max_len=10_000, forbid=(),
                  end_with=None):
         """Sample a walk, as for any grammar. `forbid` holds out (node, action)
-        pairs for this call only.
+        pairs and Edges for this call only.
 
         end_with=(node, action) makes that pair the last one taken: the walk is
         conditioned to be at `node` with one action to go (exactly, not by
@@ -501,6 +522,10 @@ class FSA(Automaton):
         stops. Pass a set or list of pairs to pick one uniformly. The pair is
         not added to `forbid`, so hold it out there if it must not also appear
         earlier -- leave it out to make a control sequence ending on a seen pair.
+        end_with=Edge(u, v, a) takes that transition: at u, action a, landing
+        on v (Edge(u, v) chooses among u's actions to v by weight). The probs
+        row for v is still where the full graph sends a from u, as the truth
+        to score against.
 
         probs[k] is always the distribution token k was drawn from: the bridge
         for the prefix, the forced last step (whatever mass the prefix had on
@@ -513,7 +538,7 @@ class FSA(Automaton):
             g = self._restricted(forbid) if forbid else self
             return Sequential.generate(g, rng, tree, max_len)
 
-        s_end, a_end = self._choose_end(end_with, rng)
+        s_end, a_end, v_end = self._choose_end(end_with, rng)
         kind, val = self._mode
         if kind == "length":
             if val < 1:
@@ -530,7 +555,8 @@ class FSA(Automaton):
         stop, last[EOS] = last[EOS], 0.0         # the forced last step
         at = self.token_of_action[a_end]
         dest = self._raw_dest(s_end, a_end)
-        nt = int(_pick(rng, np.arange(len(dest)), dest))
+        nt = (self.token_of_node[v_end] if v_end is not None
+              else int(_pick(rng, np.arange(len(dest)), dest)))
         eos = np.zeros(len(self.vocab))
         eos[EOS] = 1.0
         if "action" in self.show:
@@ -546,12 +572,54 @@ class FSA(Automaton):
         probs = probs[:-1] + rows + [eos]
         return (toks, probs, self.decode(toks)) if tree else (toks, probs)
 
-    def sample_holdout(self, rng):
-        """A random (node, action) pair to hold out: a node uniformly, then one
-        of its actions uniformly."""
-        i = rng.integers(len(self.states))                   # node *index*
-        a = rng.choice(self.out_a[i])                        # action index
+    def sample_holdout(self, rng, unit="pair"):
+        """A random unit to hold out. unit="edge": Edge(u, v), every edge
+        u -> v whatever its action, for a transition u -a-> v drawn uniformly
+        among those left (so node pairs joined by more actions come up more
+        often). unit="pair": a (node, action) pair, a node uniformly among
+        those with an action left (so never a sink), then one of its actions
+        uniformly."""
+        if unit == "edge":
+            es = list(dict.fromkeys((i, int(a), int(j)) for i in range(len(self.states))
+                                    for a, j in zip(self.out_a[i], self.out_j[i])))
+            if not es:
+                raise ValueError("no edge to hold out")
+            i, _, j = es[rng.integers(len(es))]
+            return Edge(self.states[i], self.states[j])
+        if unit != "pair":
+            raise ValueError(f"unit must be 'pair' or 'edge', not {unit!r}")
+        nodes = [i for i in range(len(self.states)) if len(self.out_a[i])]
+        if not nodes:
+            raise ValueError("no node has an action to hold out")
+        i = nodes[rng.integers(len(nodes))]                  # node *index*
+        acts = list(dict.fromkeys(self.out_a[i]))            # each action once
+        a = acts[rng.integers(len(acts))]                    # action index
         return (self.states[i], self.actions[a])             # as *labels*
+
+    def can_end_with(self, unit, forbid=()):
+        """Whether generate(forbid=forbid, end_with=unit) has any walk to give,
+        for one unit: a (node, action) pair or an Edge. False when the unit has
+        no edge, or when length/mean_length leave no room for it."""
+        kind, val = self._mode
+        if kind == "sink" or (kind == "length" and val < 1):
+            return False
+        unit, = self._as_pairs([unit])
+        if isinstance(unit, Edge):
+            i, j = self._node_index[unit.u], self._node_index[unit.v]
+            if not any(ii == i and jj == j and (unit.action is None or a == unit.action)
+                       for ii, jj, a, _ in self._raw):
+                return False
+            s = unit.u
+        else:
+            s = unit[0]
+            if not self._raw_dest(*unit).any():
+                return False
+        pre_mode = ("length", val - 1) if kind == "length" else self._mode
+        try:
+            self._restricted(forbid, end_at=s, mode=pre_mode)
+        except ValueError:
+            return False
+        return True
 
     def _choose_end(self, end_with, rng):
         if isinstance(end_with, (set, frozenset, list)):
@@ -559,10 +627,21 @@ class FSA(Automaton):
             if not pairs:
                 raise ValueError("end_with is empty")
             end_with = pairs[int(rng.integers(len(pairs)))]
-        (s_end, a_end), = self._as_pairs([end_with])
+        unit, = self._as_pairs([end_with])
+        if isinstance(unit, Edge):               # an action u -> v, by weight
+            i, j = self._node_index[unit.u], self._node_index[unit.v]
+            acts = [(a, w) for ii, jj, a, w in self._raw if ii == i and jj == j
+                    and (unit.action is None or a == unit.action)]
+            if not acts:
+                raise KeyError(f"no edge {unit.u!r} -> {unit.v!r}"
+                               + ("" if unit.action is None else f" with action {unit.action!r}"))
+            w = np.array([w for _, w in acts], float)
+            k = int(_pick(rng, np.arange(len(acts)), w / w.sum()))
+            return unit.u, acts[k][0], unit.v
+        s_end, a_end = unit
         if not self._raw_dest(s_end, a_end).any():
             raise KeyError(f"no action {a_end!r} at node {s_end!r}")
-        return s_end, a_end
+        return s_end, a_end, None
 
     def _raw_dest(self, s, a):
         """Where action a from node s goes in the full graph, over the vocab."""
@@ -587,9 +666,17 @@ class FSA(Automaton):
         return cache[key]
 
     def _as_pairs(self, forbid):
-        """Validate held-out (node, action) pairs."""
+        """Validate held-out (node, action) pairs and Edges."""
         out = set()
         for item in forbid:
+            if isinstance(item, Edge):
+                for s in (item.u, item.v):
+                    if s not in self._node_index:
+                        raise KeyError(f"unknown node {s!r}")
+                if item.action is not None and item.action not in self.token_of_action:
+                    raise KeyError(f"unknown action {item.action!r}")
+                out.add(item)
+                continue
             try:
                 s, a = item
             except (TypeError, ValueError):
@@ -1049,6 +1136,16 @@ class PDA(Automaton):
         toks = toks + list(e)
         probs = probs[:-1] + [last] + rows[1:]
         return (toks, probs, self.decode(toks)) if tree else (toks, probs)
+
+    def can_end_with(self, group, forbid=()):
+        """Whether generate(forbid=forbid, end_with=group) has any run to give,
+        for one (state, pop, action) group."""
+        (s, pop, _), = self._as_groups([group])
+        try:
+            self._restricted(set(forbid), end_at=(s, pop), **self._prefix_mode())
+        except ValueError:
+            return False
+        return True
 
     def _prefix_mode(self):
         """The termination for the part of a run before a forced last step."""

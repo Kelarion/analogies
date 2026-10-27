@@ -119,18 +119,23 @@ class AutomatonTask(GrammarTask):
       order each sample (see the automaton's transitions())
 
     With holdout=True, each block holds out one random unit from all its
-    trials but the last, which ends with it: a (u, v) node pair -- every
-    edge u -> v -- for an FSA, a (state, pop, action) group for a PDA (see
-    sample_holdout). A listed
+    trials but the last, which ends with it: for an FSA, Edge(u, v) -- every
+    edge u -> v whatever its action -- for a transition drawn uniformly (or
+    with holdout_unit="pair" a (node, action) pair); for a PDA, a (state, pop,
+    action) group (see sample_holdout). A listed
     block leaves the unit's transitions out of the listing and ends with one
     of them, so it has a trial more than the listing it is left out of, and
     its length can vary between samples. With symmetric=True as well, the
     units that reverse it (see the automaton's reverse()) are held out of
     every trial, the last included, so u -> v is tested having seen neither
-    u -> v nor v -> u."""
+    u -> v nor v -> u. A sampled block only draws hold-outs that some walk can
+    end on with all that held out (see can_end_with), redrawing the rest.
+    max_redraws: how many draws to try before giving up."""
 
     holdout: bool = False
     symmetric: bool = False
+    holdout_unit: str = "edge"          # FSA only: "edge" or "pair"
+    max_redraws: int = 1000
 
     def _block_sizes(self):
         g = self.grammar
@@ -166,8 +171,15 @@ class AutomatonTask(GrammarTask):
         g = self.grammar
         h, forbid = None, set()
         if self.holdout:                                     # what to withhold
-            h = g.sample_holdout(rng)
-            forbid = ({h} | g.reverse(h)) if self.symmetric else {h}
+            for _ in range(self.max_redraws):
+                h = (g.sample_holdout(rng, unit=self.holdout_unit) if isinstance(g, auto.FSA)
+                     else g.sample_holdout(rng))
+                forbid = ({h} | g.reverse(h)) if self.symmetric else {h}
+                if self.num_trials[b] is None or g.can_end_with(h, forbid):
+                    break                                    # listings need no walk
+            else:
+                raise ValueError(f"no hold-out in {self.max_redraws} draws could be "
+                                 "ended on by a walk that avoids it")
         if self.num_trials[b] is None:                       # a shuffled listing
             trans = self._listing(forbid)
             trials = [trans[k] for k in rng.permutation(len(trans))]
@@ -186,4 +198,3 @@ class AutomatonTask(GrammarTask):
             h, forbid = ctx
             return self._draw(rng, forbid=forbid, end_with=h if last else None)
         return self._draw(rng)
-        
