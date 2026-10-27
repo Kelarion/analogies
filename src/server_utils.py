@@ -732,7 +732,7 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         f.write(script)
 
     names = _model_names(mod_args, models) if ensure_weights else []
-    missing = _missing_weights(names, scratch, repo, remote) if names else []
+    missing = _missing_weights(names, scratch, repo, remote) if names else {}
     if missing:
         with open(DOWNLOAD_TEMPLATE) as f:
             script = f.read().format(models=' '.join(shlex.quote(m) for m in missing), **fill)
@@ -746,8 +746,9 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     after = None
     if missing:
         after = _sbatch(os.path.join(sweep, 'download.sh'), remote)
-        print(f'Not cached on the cluster: {", ".join(missing)}. Downloading first (job {after}); '
-              'the array starts once that succeeds.')
+        for m, why in missing.items():
+            print(f'Not cached on the cluster: {m}\n    ({why})')
+        print(f'Downloading first (job {after}); the array starts once that succeeds.')
     job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after)
     print(f'Submitted batch job {job} ({n_tot} array tasks)')
     return sweep
@@ -766,7 +767,7 @@ def _model_names(mod_args, models):
 
 
 def _missing_weights(names, scratch, repo, remote):
-    """Which of `names` aren't fully in the cluster's Hugging Face cache (jobs/weights.py)."""
+    """{name: why} for the `names` not fully in the cluster's Hugging Face cache (jobs/weights.py)."""
     hf_home = f'{scratch}/.cache/huggingface'
     if remote:
         args = ' '.join(shlex.quote(n) for n in names)
