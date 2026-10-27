@@ -16,7 +16,7 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 # %% What to run: lists are swept, tuples are matched 1-1 (as in send_to_server)
 
-grams = [Build(auto.FSA, Build(auto.random_relation, k, degree=2)) for k in range(5, 50, 5)]
+grams = [Build(auto.FSA, Build(auto.random_relation, k, degree=2), backtrack=False) for k in range(5, 50, 5)]
 
 task_args = {'task': AutomatonTask,
              # Build(f, ...) = f(...), made inside the job, not here; sweep with a list of them
@@ -25,7 +25,6 @@ task_args = {'task': AutomatonTask,
              'num_trials': [[None, None]],       # a list-valued field needs wrapping: [[...]]
              'samps': 20,
              'holdout': True,
-             'backtrack': False,
              'max_tok': np.inf,
              'seed': 0}
 
