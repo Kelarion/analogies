@@ -1,22 +1,283 @@
-## Define possible prompt building blocks
+"""
+Compositional prompts, chosen by the task and tailored to it.
 
-triplets = ("You will be presented with sequences of triplets. "
-            "For example: a b c, d e f. ")
-hint = "The last triplet will start with '{} {}' and you should provide the third word. "
-nouns = "The tokens will be arbitrary nouns. "
-structured = ("Your job is to complete the final query according to the structure. ")
-only_final = "Output ONLY the next word. "
+The task chooses with one field per component (see GrammarTask), which spec_from
+turns into a spec: segment names joined with '+', e.g.
+
+    spec_from(explicitness=3, describe_format=True, describe_task=True, hint=True,
+              answer_only=True) == 'explicit+format+task+hint+only'
+
+The spec is what is passed to the model and saved with the data. A task can also
+give one directly (GrammarTask.prompt), which overrides its fields: for prompts the
+fields can't express, like the complete prompts from before composition.
+
+Each name is a *variant* of one *slot* (see SLOTS), and a spec takes at most one
+variant per slot, so variants of a slot exclude each other: the levels of
+explicitness are all in 'frame', so 'explicit+vague' is an error. Order in the
+spec doesn't matter; the text always comes out in slot order. Presets (PRESETS)
+stand for whole specs and can be mixed with names ('sas+hint'); '' is no prompt.
+
+A variant is a list of Parts, tried in order: the first whose `when` holds for
+the task is used. That is how one name is tailored to the task -- 'explicit'
+says "directed graph" for an FSA and "pushdown automaton" for a PDA -- and a
+name that fits nothing about the task is an error ('triplets' with 5-token
+trials), raised when the task is made (see check), not on the cluster.
+
+Where a part's text goes:
+  system      the system prompt ('raw' mode: the start of the stream)
+  transition  at the start of every block after the first
+  block       at the start of every block, the first included, after any transition
+              text, and filled in with that block's own fields (see below)
+
+Text is a str.format template. Its fields are the task's facts (see
+GrammarTask.prompt_facts, plus the ones derive() adds) and, per sample, the
+ones render() fills in from the model:
+  pool     what the words are, from the model's token pool (POOLS)
+and per block, from the block's final trial (the one that is cut):
+  prefix   its shown words, e.g. 'poodle chair'
+  target   'word', or '2 words' when more are held out
+  missing  what to provide, as the hint says it: 'third word', 'next word', ...
+`block` text gets its own block's; `system` and `transition` text the final block's.
+"""
+from dataclasses import dataclass
+from typing import Callable
+
+# -- what the parts are made of ------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Part:
+    system: str = ''
+    transition: str = ''
+    block: str = ''
+    when: Callable = None       # facts -> bool; None means always
+    chat_only: bool = False     # left out in 'raw' mode, where nothing is "output"
 
-PROMPTS = {
-    'sas': triplets+structured+only_final,
-    'one_word': ("You will be presented with a sequence that has a certain pattern. "
-                 "Your job is to provide the next word in the sequence, according to the "
-                 "pattern. The pattern will be shared between sequences. Output ONLY the next word."),
+    def fits(self, facts):
+        return self.when is None or bool(self.when(facts))
+
+
+def _all(*preds):
+    return lambda f: all(p(f) for p in preds)
+
+
+is_fsa = lambda f: f['structure'] == 'fsa'
+is_pda = lambda f: f['structure'] == 'pda'
+shows = lambda *kinds: lambda f: set(f['shows'] or ()) == set(kinds)
+shared = lambda f: f['share_toks']
+fixed_len = lambda n=None: lambda f: (f['trial_len'] is not None if n is None
+                                      else f['trial_len'] == n)
+
+# -- the segments ----------------------------------------------------------------------
+
+## Frame: how much the model is told about where the sequences come from
+vague = [Part("You will be shown sequences of words. ")]
+
+moderate = [
+    Part("You will be shown sequences of words with a certain structure. ",
+         "Now the words have been reassigned, but the structure is the same. ", when=shared),
+    Part("You will be shown sequences of words with a certain structure. ",
+         "Now the words will be different, but the structure is the same. "),
+]
+
+switched = "Now the labels have been switched, but the {noun} is the same. "
+explicit = [
+    Part("You will be shown sequences from a directed graph, where nodes and edges are "
+         "labelled with arbitrary words. ", switched, when=_all(is_fsa, shows('node', 'action'))),
+    Part("You will be shown the nodes visited by walks on a directed graph, where nodes "
+         "are labelled with arbitrary words. ", switched, when=_all(is_fsa, shows('node'))),
+    Part("You will be shown the edges taken by walks on a directed graph, where edges "
+         "are labelled with arbitrary words. ", switched, when=_all(is_fsa, shows('action'))),
+    Part("You will be shown runs of a pushdown automaton (a directed graph with a stack), "
+         "where states, transitions and stack symbols are labelled with arbitrary words. ",
+         switched, when=is_pda),     # TODO: tailor to which labels are shown, as for the FSA
+    Part("You will be shown sentences generated by a formal grammar, whose symbols are "
+         "arbitrary words. ", switched),
+]
+
+## Format: what a trial looks like
+triplets = Part("You will be presented with sequences of triplets. For example: a b c, d e f. ",
+                when=fixed_len(3))
+fixed = Part("Each sequence has {trial_len} words, and sequences are separated by commas. ",
+             when=fixed_len())
+free = Part("Sequences can have different lengths, and are separated by commas. ")
+
+## The rest
+vocab = Part("The tokens will be {pool}. ")
+task_desc = Part("Your job is to complete the next {target} in the sequence. ")
+hint = Part(block="The last {unit} will start with '{prefix}' and you should provide the {missing}. ")
+only_final = Part("Output ONLY the next {target}. ", chat_only=True)
+
+one_word = Part("You will be presented with a sequence that has a certain pattern. "
+                "Your job is to provide the next word in the sequence, according to the "
+                "pattern. The pattern will be shared between sequences. Output ONLY the next word.")
+
+# slot -> {variant name: parts to try in order}. Slot order is text order, and
+# variant names must be unique across slots, since specs name variants alone.
+SLOTS = {
+    'full':   {'one_word': [one_word]},          # complete prompts from before composition
+    'frame':  {'vague': vague, 'moderate': moderate, 'explicit': explicit},
+    'format': {'format': [triplets, fixed, free], 'triplets': [triplets]},
+    'vocab':  {'vocab': [vocab]},
+    'task':   {'task': [task_desc]},
+    'hint':   {'hint': [hint]},
+    'answer': {'only': [only_final]},
 }
 
+PRESETS = {
+    'sas': 'vague+task+only',
+}
 
-DEFAULT_PROMPT = {'dialogue': 'sas', 'single': 'one_word', 'raw': None}
+# explicitness 0..3, as the variant of 'frame' it picks (0: no frame)
+EXPLICITNESS = (None, 'vague', 'moderate', 'explicit')
+
+# what the words of each of ICLModel's TOKEN_POOLS are, for {pool}
+POOLS = {'nouns': 'arbitrary nouns', 'chars': 'arbitrary letters and digits'}
+
+_SLOT_OF = {}
+for _slot, _variants in SLOTS.items():
+    for _name in _variants:
+        assert _name not in _SLOT_OF and _name not in PRESETS, f"name {_name!r} is ambiguous"
+        _SLOT_OF[_name] = _slot
+
+# -- composing ----------------------------------------------------------------------------
 
 
+def spec_from(explicitness=0, describe_format=False, describe_vocab=False,
+              describe_task=False, hint=False, answer_only=False):
+    """The spec for a choice of components:
+    explicitness     0 none, 1 vague, 2 moderate, 3 explicit (or the name of the level):
+                     what the model is told about where the sequences come from
+    describe_format  what a trial looks like (triplets, N words, or varying lengths)
+    describe_vocab   what the words are (from the model's token pool)
+    describe_task    "Your job is to complete the next word ..."
+    hint             open each block with the start of its final trial
+    answer_only      "Output ONLY the next word." (left out in 'raw' mode)
+    """
+    if explicitness in EXPLICITNESS[1:]:
+        explicitness = EXPLICITNESS.index(explicitness)
+    if explicitness not in range(len(EXPLICITNESS)):
+        raise ValueError(f"explicitness is 0..{len(EXPLICITNESS) - 1} or one of "
+                         f"{EXPLICITNESS[1:]}, not {explicitness!r}")
+    names = [EXPLICITNESS[explicitness],
+             describe_format and 'format', describe_vocab and 'vocab',
+             describe_task and 'task', hint and 'hint', answer_only and 'only']
+    return '+'.join(n for n in names if n)
+
+
+
+def parse(spec):
+    """{slot: variant} for a spec."""
+    chosen = {}
+    for name in (spec or '').split('+'):
+        name = name.strip()
+        if not name or name == 'none':
+            continue
+        if name in PRESETS:
+            sub = parse(PRESETS[name])
+            clash = set(sub) & set(chosen)
+        elif name in _SLOT_OF:
+            sub = {_SLOT_OF[name]: name}
+            clash = set(sub) & set(chosen)
+        else:
+            raise ValueError(f"unknown prompt segment {name!r}; segments are "
+                             f"{sorted(_SLOT_OF)}, presets {sorted(PRESETS)}")
+        if clash:
+            s = clash.pop()
+            raise ValueError(f"{spec!r} takes two variants of '{s}' "
+                             f"({chosen[s]!r} and {sub[s]!r}); they exclude each other")
+        chosen.update(sub)
+    return chosen
+
+
+def derive(facts):
+    """The task's facts plus the fields that follow from them."""
+    return dict(facts, unit='triplet' if facts['trial_len'] == 3 else 'sequence')
+
+
+def compose(spec, facts):
+    """The Parts a spec makes for a task, in text order: per slot, the first of the
+    variant's parts that fits the task."""
+    chosen, facts = parse(spec), derive(facts)
+    parts = []
+    for slot, name in sorted(chosen.items(), key=lambda kv: list(SLOTS).index(kv[0])):
+        fit = [p for p in SLOTS[slot][name] if p.fits(facts)]
+        if not fit:
+            raise ValueError(f"prompt segment {name!r} doesn't apply to this task ({_brief(facts)})")
+        parts.append(fit[0])
+    return parts
+
+
+def check(spec, facts):
+    """Raise now, rather than mid-job, if `spec` can't be made for a task with these facts."""
+    compose(spec, facts)
+
+
+def needs_prefix(spec, facts):
+    """Whether the prompt names the shown start of trials (the hint), which needs
+    k_show > 0. The model checks this before loading any weights."""
+    return any('{prefix}' in p.system + p.transition + p.block for p in compose(spec, facts))
+
+
+def render(spec, facts, mode, pool, finals):
+    """The text of a prompt for one sample:
+        {'system': str or None, 'blocks': [text at the start of each block]}
+    pool    key into POOLS (the model's `tokens`)
+    finals  for each block, (the words shown of its final trial, how many are held out)
+    """
+    facts = derive(facts)
+    if len(finals) != facts['n_blocks']:
+        raise ValueError(f"finals has {len(finals)} blocks, the task {facts['n_blocks']}")
+    parts = [p for p in compose(spec, facts) if not (p.chat_only and mode == 'raw')]
+    if (any('{prefix}' in p.system + p.transition + p.block for p in parts)
+            and not all(prefix for prefix, _ in finals)):
+        raise ValueError("the hint needs part of each block's final trial shown (k_show > 0)")
+    fields = [_fields(facts, pool, prefix, n) for prefix, n in finals]
+
+    system = ''.join(p.system for p in parts).format_map(fields[-1]).strip()
+    trans = ''.join(p.transition for p in parts).format_map(fields[-1])
+    lead = ''.join(p.block for p in parts)
+    blocks = [((trans if b else '') + lead.format_map(f)).strip() for b, f in enumerate(fields)]
+    return {'system': system or None, 'blocks': blocks}
+
+
+def _fields(facts, pool, prefix, n_target):
+    """The template fields for a block whose final trial shows `prefix` and hides
+    n_target words."""
+    pos = len(prefix) + 1                      # position of the first missing word
+    if n_target == 1 and facts['trial_len'] is not None:
+        missing = f"{_ordinal(pos)} word"
+    elif n_target == 1:
+        missing = "next word"
+    else:
+        missing = f"{'last' if facts['trial_len'] is not None else 'next'} {n_target} words"
+    return dict(facts, pool=POOLS.get(pool, 'arbitrary words'), prefix=' '.join(prefix),
+                target='word' if n_target == 1 else f'{n_target} words', missing=missing)
+
+
+def preview(task, mode='dialogue', pool='nouns', k_hide=1):
+    """Print what the task's prompt makes for its first sample, with the symbols
+    written as w1, w2, ... (the model would put words there). Needs no model."""
+    from dataclasses import replace
+    data = replace(task, samps=1).sample()
+    finals = [([f'w{t}' for t in trials[-1][:len(trials[-1]) - 1 - k_hide]], k_hide)
+              for trials in data['blocks'][0]]                # each block's final trial
+    out = render(data['prompt']['spec'], data['prompt']['facts'], mode, pool, finals)
+    print(f"[spec] {data['prompt']['spec']!r}")
+    print(f"[system] {out['system']}")
+    for b, text in enumerate(out['blocks']):
+        if text:
+            print(f"[start of block {b}] {text}")
+    return out
+
+
+def _ordinal(n):
+    words = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth',
+             'ninth', 'tenth']
+    return words[n - 1] if n <= len(words) else f"{n}th"
+
+
+def _brief(facts):
+    keys = ('structure', 'shows', 'trial_len', 'n_blocks', 'share_toks')
+    return ', '.join(f'{k}={facts.get(k)!r}' for k in keys)
+    

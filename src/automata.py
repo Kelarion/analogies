@@ -1335,7 +1335,6 @@ def spatial_relation(k, d, commutes=False, total=False, density=None):
                 properties.append(mln.commute(p1[1], p2[0]))
                 properties.append(mln.commute(p1[1], p2[1]))
 
-
     mod = mln.MLN(k, properties, density=density)
 
     return mod.sample()

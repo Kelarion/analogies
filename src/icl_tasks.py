@@ -5,13 +5,29 @@ import numpy as np
 import super_experiments as sxp
 import grammars as gram
 import automata as auto
+import prompts
 
 
 @dataclass
 class GrammarTask(sxp.Task):
     """Sequences of trials from any Sequential, in blocks of num_trials
     trials, each trial ending in the 0 delimiter. Subclasses change what a
-    block is through _block_sizes, _new_block and _trial."""
+    block is through _block_sizes, _new_block and _trial.
+
+    The prompt the model gets is chosen by the fields below (see prompts.spec_from),
+    tailored to the task by prompt_facts, checked against the task when the task is
+    made, and passed on to the model as data['prompt']. So a sweep over prompts is a
+    sweep over task_args, one field at a time. All off (the default) is no prompt.
+
+    explicitness     0 none, 1 vague, 2 moderate, 3 explicit: what the model is told
+                     about where the sequences come from
+    describe_format  say what a trial looks like (triplets, N words, varying lengths)
+    describe_vocab   say what the words are (from the model's token pool)
+    describe_task    "Your job is to complete the next word in the sequence."
+    hint             open each block with the start of its final trial
+    answer_only      "Output ONLY the next word." (left out in 'raw' mode)
+    prompt           a spec (see prompts.py), used instead of the fields above when
+                     given: e.g. 'one_word', or '' for no prompt"""
 
     grammar: gram.Sequential
     num_trials: list
@@ -20,6 +36,40 @@ class GrammarTask(sxp.Task):
     min_tok: int = 2
     max_tok: int = 50
     seed: int = None
+    explicitness: int = 0
+    describe_format: bool = False
+    describe_vocab: bool = False
+    describe_task: bool = False
+    hint: bool = False
+    answer_only: bool = False
+    prompt: str = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        spec = self.prompt_spec                           # checks the fields
+        if isinstance(self.grammar, gram.Sequential):     # not if still an unbuilt Build
+            prompts.check(spec, self.prompt_facts())
+
+    @property
+    def prompt_spec(self):
+        """The spec of the prompt (see prompts.py): `prompt` if given, else the fields'."""
+        if self.prompt is not None:
+            return self.prompt
+        return prompts.spec_from(self.explicitness, self.describe_format, self.describe_vocab,
+                                 self.describe_task, self.hint, self.answer_only)
+
+    # -- what the prompt can say about the task --------------------------------
+
+    def prompt_facts(self):
+        """What a prompt may assume about the task (the `when` of a prompts.Part sees
+        these, and its text can use them as fields). Plain values, so they are saved
+        with the data. Subclasses add to them."""
+        g = self.grammar
+        fixed = isinstance(g, gram.RegularGrammar) and g.length is not None
+        return {'structure': 'grammar', 'noun': 'grammar', 'shows': None,
+                'trial_len': g.length if fixed else None,      # tokens per trial, if fixed
+                'n_blocks': len(self.num_trials), 'share_toks': self.share_toks,
+                'holdout': False, 'listed': False}
 
     # -- what a block is ----------------------------------------------------
 
@@ -53,6 +103,8 @@ class GrammarTask(sxp.Task):
 
     def sample(self):
 
+        facts, spec = self.prompt_facts(), self.prompt_spec
+        prompts.check(spec, facts)
         rng = np.random.default_rng(self.seed)
         nt = len(self.grammar.vocab)
         nblk = len(self._block_sizes())
@@ -106,7 +158,12 @@ class GrammarTask(sxp.Task):
             blks.append(blocks)
             which_block.append(trl_blk)
 
-        return {'X': seqs, 'Y': Ys, 'B': which_block, 'blocks': blks, 'V': V}
+        if facts['trial_len'] is not None:                 # the prompt may say so
+            lens = {len(t) - 1 for b in blks for blk in b for t in blk}
+            assert lens == {facts['trial_len']}, f"trial lengths {lens}, expected {facts['trial_len']}"
+
+        return {'X': seqs, 'Y': Ys, 'B': which_block, 'blocks': blks, 'V': V,
+                'prompt': {'spec': spec, 'facts': facts}}
 
 
 @dataclass
@@ -119,23 +176,32 @@ class AutomatonTask(GrammarTask):
       order each sample (see the automaton's transitions())
 
     With holdout=True, each block holds out one random unit from all its
-    trials but the last, which ends with it: for an FSA, Edge(u, v) -- every
-    edge u -> v whatever its action -- for a transition drawn uniformly (or
-    with holdout_unit="pair" a (node, action) pair); for a PDA, a (state, pop,
-    action) group (see sample_holdout). A listed
+    trials but the last, which ends with it: a (u, v) node pair -- every
+    edge u -> v -- for an FSA, a (state, pop, action) group for a PDA (see
+    sample_holdout). A listed
     block leaves the unit's transitions out of the listing and ends with one
     of them, so it has a trial more than the listing it is left out of, and
     its length can vary between samples. With symmetric=True as well, the
     units that reverse it (see the automaton's reverse()) are held out of
     every trial, the last included, so u -> v is tested having seen neither
-    u -> v nor v -> u. A sampled block only draws hold-outs that some walk can
-    end on with all that held out (see can_end_with), redrawing the rest.
-    max_redraws: how many draws to try before giving up."""
+    u -> v nor v -> u."""
 
     holdout: bool = False
     symmetric: bool = False
-    holdout_unit: str = "edge"          # FSA only: "edge" or "pair"
-    max_redraws: int = 1000
+
+    def prompt_facts(self):
+        g = self.grammar
+        if not isinstance(g, auto.Automaton):        # _block_sizes says so when sampling
+            return super().prompt_facts()
+        start, step = len(g._start_kinds), len(g._step_kinds)
+        lens = {start + step if n is None                  # a listing: one step each
+                else (start + g.length * step if g.length is not None else None)
+                for n in self.num_trials}
+        pda = isinstance(g, auto.PDA)
+        return dict(super().prompt_facts(),
+                    structure='pda' if pda else 'fsa', noun='automaton' if pda else 'graph',
+                    shows=tuple(g._step_kinds), trial_len=lens.pop() if len(lens) == 1 else None,
+                    holdout=self.holdout, listed=any(n is None for n in self.num_trials))
 
     def _block_sizes(self):
         g = self.grammar
@@ -171,15 +237,8 @@ class AutomatonTask(GrammarTask):
         g = self.grammar
         h, forbid = None, set()
         if self.holdout:                                     # what to withhold
-            for _ in range(self.max_redraws):
-                h = (g.sample_holdout(rng, unit=self.holdout_unit) if isinstance(g, auto.FSA)
-                     else g.sample_holdout(rng))
-                forbid = ({h} | g.reverse(h)) if self.symmetric else {h}
-                if self.num_trials[b] is None or g.can_end_with(h, forbid):
-                    break                                    # listings need no walk
-            else:
-                raise ValueError(f"no hold-out in {self.max_redraws} draws could be "
-                                 "ended on by a walk that avoids it")
+            h = g.sample_holdout(rng)
+            forbid = ({h} | g.reverse(h)) if self.symmetric else {h}
         if self.num_trials[b] is None:                       # a shuffled listing
             trans = self._listing(forbid)
             trials = [trans[k] for k in rng.permutation(len(trans))]
@@ -198,3 +257,4 @@ class AutomatonTask(GrammarTask):
             h, forbid = ctx
             return self._draw(rng, forbid=forbid, end_with=h if last else None)
         return self._draw(rng)
+        

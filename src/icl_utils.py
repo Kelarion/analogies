@@ -151,7 +151,7 @@ class ChatLM:
         return on[len(os.path.commonprefix([on, off])):]
 
     def build_prompt(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
-                     think=True, effort_without_thinking=False, **template_kwargs):
+                     think=True, effort_without_thinking=False, block_text=None, **template_kwargs):
         """
         mode:
           'raw'      one continuous token stream, no chat template (self.bos, if any, first)
@@ -163,7 +163,13 @@ class ChatLM:
         Returns input_ids, spans [(role, block, start, end)], target.
         'user' spans are each block's context; 'assistant' spans are the completions of
         non-final blocks (in 'raw'/'single' these are just stream positions, not separate turns).
+        Prompt text is never in a span.
 
+        system_prompt: {'role': 'system', 'content': ...}; in 'raw' mode, which has no system
+                       message, its content starts the stream as plain text instead.
+        block_text:    text to put just before each block (one string per block, '' for none):
+                       at the start of the block's user turn in 'dialogue', on a line of its
+                       own in the stream otherwise.
         effort_without_thinking: in non-thinking mode, add the template's reasoning-effort
                                  instruction to the system message as thinking mode would.
         """
@@ -174,27 +180,42 @@ class ChatLM:
             sys_msg = [{'role': 'system', 'content': content}]
 
         to_ids = lambda x: torch.as_tensor(task_toks[x], dtype=torch.long)
+        text_ids = lambda t: torch.as_tensor(self._ids(t), dtype=torch.long)
+        block_text = block_text or [''] * len(blocks)
+        assert len(block_text) == len(blocks), "block_text needs one entry per block"
 
-        # ordered (label, ids) segments; unlabeled entries are trial delimiters
-        segs = []
+        # turns of (role, [(label, ids)]); unlabeled pieces are delimiters and prompt text
+        turns = []
+        if mode == 'raw' and system_prompt:
+            turns.append(('system', [(None, text_ids(system_prompt['content'].strip() + '\n\n'))]))
         for b, trials in enumerate(blocks):
             ctx, comp = split_block(trials, k_show, k_hide)
-            segs.append((('user', b), to_ids(ctx)))
+            user = [(('user', b), to_ids(ctx))]
+            if block_text[b]:
+                text = block_text[b].strip()
+                lead = text + '\n' if mode == 'dialogue' else '\n' + text + '\n'
+                user.insert(0, (None, text_ids(lead)))
+            turns.append(('user', user))
             if b < len(blocks) - 1:
-                segs.append((('assistant', b), to_ids(comp)))
+                asst = [(('assistant', b), to_ids(comp))]
                 if mode != 'dialogue':                      # in dialogue, the turn boundary replaces it
-                    segs.append((None, to_ids(np.array([0]))))
+                    asst.append((None, to_ids(np.array([0]))))
+                turns.append(('assistant', asst))
             else:
                 target = to_ids(comp)
 
-        lens = [len(s) for _, s in segs]
+        pieces = [p for _, ps in turns for p in ps]
+        lens = [len(ids) for _, ids in pieces]
 
         if mode == 'dialogue':
-            messages = sys_msg + [{'role': lab[0], 'content': self.placeholder} for lab, _ in segs]
-            input_ids, starts = self.splice_template(messages, [s for _, s in segs], think,
-                                                     **template_kwargs)
+            messages = sys_msg + [{'role': role, 'content': self.placeholder} for role, _ in turns]
+            input_ids, turn_starts = self.splice_template(
+                messages, [torch.cat([ids for _, ids in ps]) for _, ps in turns], think,
+                **template_kwargs)
+            starts = [t0 + off for t0, (_, ps) in zip(turn_starts, turns)
+                      for off in np.concatenate([[0], np.cumsum([len(i) for _, i in ps])[:-1]])]
         else:
-            stream = torch.cat([s for _, s in segs])
+            stream = torch.cat([ids for _, ids in pieces])
             if mode == 'raw':
                 offset = 0 if self.bos is None else 1
                 input_ids = stream if self.bos is None else torch.cat([torch.tensor([self.bos]), stream])
@@ -205,7 +226,7 @@ class ChatLM:
                 raise ValueError(f"unknown mode {mode!r}")
             starts = offset + np.concatenate([[0], np.cumsum(lens)[:-1]])
 
-        spans = [(*lab, int(s), int(s) + n) for (lab, _), s, n in zip(segs, starts, lens) if lab]
+        spans = [(*lab, int(s), int(s) + n) for (lab, _), s, n in zip(pieces, starts, lens) if lab]
         return input_ids, spans, target
 
     # -- thinking ---------------------------------------------------------------
@@ -266,7 +287,7 @@ class ChatLM:
 
     @torch.no_grad()
     def run_trial(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
-                  think=True, thinking_budget=4000, equiv=None, **template_kwargs):
+                  think=True, thinking_budget=4000, equiv=None, block_text=None, **template_kwargs):
         """
         Build the prompt, think if asked (not in 'raw' mode), and score it.
 
@@ -278,7 +299,8 @@ class ChatLM:
           input_ids the full prompt including any reasoning (without the target)
         """
         input_ids, spans, target = self.build_prompt(
-            mode, blocks, task_toks, k_show, k_hide, system_prompt, think, **template_kwargs)
+            mode, blocks, task_toks, k_show, k_hide, system_prompt, think,
+            block_text=block_text, **template_kwargs)
         input_ids, target = input_ids.to(self.device), target.to(self.device)
         if mode != 'raw' and think:
             input_ids = self.reason(input_ids, thinking_budget)
@@ -576,3 +598,4 @@ def task_logprobs(logs, task_toks, equiv=None):
     if equiv is None:
         return logs[:, task_toks] - spc.logsumexp(logs, axis=-1, keepdims=True)
     return equiv.logprobs(logs, task_toks)
+    

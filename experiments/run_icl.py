@@ -26,7 +26,20 @@ task_args = {'task': AutomatonTask,
              'samps': 20,
              'holdout': True,
              'max_tok': np.inf,
+             # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
+             # 'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             # 'describe_format': True,
+             # 'describe_task': True,
+             # 'hint': [False, True],
+             # 'answer_only': True,
              'seed': 0}
+
+# %% Check what a prompt says for a task, without a model (symbols shown as w1, w2, ...)
+# import prompts
+# prompts.preview(AutomatonTask(grammar=auto.FSA(auto.random_relation(10, degree=2), backtrack=False),
+#                               num_trials=[None, None], samps=1, holdout=True, max_tok=np.inf,
+#                               explicitness=3, describe_format=True, describe_task=True,
+#                               hint=True, answer_only=True), mode='dialogue')
 
 mod_args = {'model': ICLModel,
             'model_name': 'Qwen/Qwen3.8-27B',
