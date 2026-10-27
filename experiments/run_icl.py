@@ -33,7 +33,8 @@ task_args = {'task': RelationTask,
              'holdout': True, 
              'max_tok': np.inf,
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
-             'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             # 'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             'explicitness': 0,
              'describe_format': (True, False),
              'describe_task': (True, False),
              'describe_vocab': False,

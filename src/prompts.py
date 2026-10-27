@@ -96,7 +96,7 @@ explicit = [
 ]
 
 ## Format: what a trial looks like
-triplets = Part("You will be presented with sequences of triplets. For example: a b c, d e f. ",
+triplets = Part("The sequences will be triplets. For example: a b c, d e f. ",
                 when=fixed_len(3))
 fixed = Part("Each sequence has {trial_len} words, and sequences are separated by commas. ",
              when=fixed_len())

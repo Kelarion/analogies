@@ -1321,7 +1321,7 @@ def random_relation(k, r=1, degree=2, density=None, seed=None):
     return mod.sample(rng=np.random.default_rng(seed))
 
 
-def spatial_relation(k, d, commutes=False, total=False, density=None, seed=None):
+def spatial_relation(k, d, commutes=0, total=False, density=None, seed=None):
 
     rels = ['R' + str(i) for i in range(d)]
     pairs = [(rel, 'L'+str(i)) for i,rel in enumerate(rels)]
@@ -1331,10 +1331,10 @@ def spatial_relation(k, d, commutes=False, total=False, density=None, seed=None)
     if commutes:
         for i,p1 in enumerate(pairs):
             for p2 in pairs[i+1:]:
-                properties.append(mln.commute(p1[0], p2[0]))
-                properties.append(mln.commute(p1[0], p2[1]))
-                properties.append(mln.commute(p1[1], p2[0]))
-                properties.append(mln.commute(p1[1], p2[1]))
+                properties.append(mln.commute(p1[0], p2[0], w=commutes))
+                properties.append(mln.commute(p1[0], p2[1], w=commutes))
+                properties.append(mln.commute(p1[1], p2[0], w=commutes))
+                properties.append(mln.commute(p1[1], p2[1], w=commutes))
 
     mod = mln.MLN(k, properties, density=density)
 
@@ -1351,4 +1351,3 @@ def block_relation(k, n, r=1, density=0.1, seed=None):
     mod = mln.MLN(k, properties, latent=n)
 
     return mod.sample(rng=np.random.default_rng(seed))
-    
