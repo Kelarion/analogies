@@ -8,38 +8,45 @@ import automata as auto
 import server_utils as su
 from server_utils import Build
 import super_experiments as sxp
-from icl_tasks import AutomatonTask
+from icl_tasks import RelationTask
 from icl_model import ICLModel
 from icl_utils import plot_icl
 
 SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 # %% What to run: lists are swept, tuples are matched 1-1 (as in send_to_server)
+# The task's fields describe the grammar (see the end of icl_tasks.py), which is made
+# inside the job. Fields can be swept, linked and loaded by one at a time, e.g.
+#   'k': list(range(5, 50, 5))                 sweep k
+#   'k': (5, 10, 20), 'degree': (2, 2, 3)      (k, degree) pairs, not all 9 combinations
+#   'graph_seed': [0, 1, 2]                    three different graphs of each size
 
-grams = [Build(auto.FSA, Build(auto.random_relation, k, degree=2), backtrack=False) for k in range(5, 50, 5)]
-
-task_args = {'task': AutomatonTask,
-             # Build(f, ...) = f(...), made inside the job, not here; sweep with a list of them
-             # 'grammar': Build(auto.FSA, Build(auto.cycle, 5), length=1),
-             'grammar': grams,
-             'num_trials': [[None, None]],       # a list-valued field needs wrapping: [[...]]
+k = su.Set([8, 16])
+task_args = {'task': RelationTask,
+             'k': k,
+             'degree': 2,
+             'backtrack': False,
+             'graph_seed': 0,                  # same graph for every prompt condition below
+             'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
+             'length': 1,
              'samps': 20,
-             'holdout': True,
+             'holdout': True, 
              'max_tok': np.inf,
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
-             # 'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
-             # 'describe_format': True,
-             # 'describe_task': True,
-             # 'hint': [False, True],
-             # 'answer_only': True,
-             'seed': 0}
+             'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             'describe_format': (True, False),
+             'describe_task': (True, False),
+             'describe_vocab': False,
+             'hint': [False, True],
+             'answer_only': (True, False),
+             'seed': 0,
+             }
 
 # %% Check what a prompt says for a task, without a model (symbols shown as w1, w2, ...)
 # import prompts
-# prompts.preview(AutomatonTask(grammar=auto.FSA(auto.random_relation(10, degree=2), backtrack=False),
-#                               num_trials=[None, None], samps=1, holdout=True, max_tok=np.inf,
-#                               explicitness=3, describe_format=True, describe_task=True,
-#                               hint=True, answer_only=True), mode='dialogue')
+# prompts.preview(RelationTask(k=10, degree=2, num_trials=[None, None], samps=1, holdout=True,
+#                              max_tok=np.inf, explicitness=3, describe_format=True,
+#                              describe_task=True, hint=True, answer_only=True), mode='dialogue')
 
 mod_args = {'model': ICLModel,
             'model_name': 'Qwen/Qwen3.8-27B',
@@ -50,6 +57,7 @@ mod_args = {'model': ICLModel,
             'k_hide': 1,
             # 'effort': 'low',
             'seed': 0}
+
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
 # (pickles copied to the cluster over ssh) or on the cluster; push/pull first either way.

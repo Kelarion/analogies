@@ -1310,17 +1310,18 @@ def cycle(k):
     return nx.MultiDiGraph([(i, (i + 1) % k, {"action": 0}) for i in range(k)])
 
 
-def random_relation(k, r=1, degree=2, density=None):
-
+def random_relation(k, r=1, degree=2, density=None, seed=None):
+    """A random graph on k nodes with r relations (MLN-sampled). The same seed gives the
+    same graph; seed=None gives a different one every call."""
     rels = ['R' + str(i) for i in range(r)]
     properties = [f"inf {R}(x,y) -> {R}(x,y)" for R in rels] # tautology
 
     mod = mln.MLN(k, properties, degree=degree, density=density, constraint='weak')
 
-    return mod.sample()
+    return mod.sample(rng=np.random.default_rng(seed))
 
 
-def spatial_relation(k, d, commutes=False, total=False, density=None):
+def spatial_relation(k, d, commutes=False, total=False, density=None, seed=None):
 
     rels = ['R' + str(i) for i in range(d)]
     pairs = [(rel, 'L'+str(i)) for i,rel in enumerate(rels)]
@@ -1337,16 +1338,17 @@ def spatial_relation(k, d, commutes=False, total=False, density=None):
 
     mod = mln.MLN(k, properties, density=density)
 
-    return mod.sample()
+    return mod.sample(rng=np.random.default_rng(seed))
 
 
-def block_relation(k, n, r=1, density=0.1):
+def block_relation(k, n, r=1, density=0.1, seed=None):
 
-    rels = ['R' + str(i) for i in range(d)]
+    rels = ['R' + str(i) for i in range(r)]
     
     properties = [mln.categorical('In')] # latent category
     properties += [mln.sbm('In', R) for R in rels]
 
-    mod = mln.MLN(k, properties, latents=n)
+    mod = mln.MLN(k, properties, latent=n)
 
-    return mod.sample()
+    return mod.sample(rng=np.random.default_rng(seed))
+    

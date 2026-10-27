@@ -295,8 +295,7 @@ class Set(Parameter):
 
         roots = set()
         for val in values:
-            if isinstance(val, Parameter):
-                roots = roots | val.roots
+            roots = roots | _param_roots(val)
 
         if len(roots) > 0:
             self.roots = roots
@@ -305,7 +304,30 @@ class Set(Parameter):
 
     def generate_values(self):
 
-        return [v() if isinstance(v, Parameter) else v for v in self.values]
+        return [_eval_params(v) for v in self.values]
+
+
+def _param_roots(v):
+    """The root parameters a value depends on, looking inside lists, tuples and dicts
+    (so Set([[k, 2 * k]]) depends on k)."""
+    if isinstance(v, Parameter):
+        return set(v.roots)
+    if isinstance(v, (list, tuple)):
+        return set().union(*(_param_roots(x) for x in v)) if v else set()
+    if isinstance(v, dict):
+        return set().union(*(_param_roots(x) for x in v.values())) if v else set()
+    return set()
+
+
+def _eval_params(v):
+    """v with every parameter in it (inside lists, tuples and dicts too) evaluated."""
+    if isinstance(v, Parameter):
+        return v()
+    if isinstance(v, (list, tuple)):
+        return type(v)(_eval_params(x) for x in v)
+    if isinstance(v, dict):
+        return {k: _eval_params(x) for k, x in v.items()}
+    return v
 
 
 class Integer(Parameter):
@@ -400,6 +422,8 @@ class ParamSet:
 
             values = self.param.generate_values(lb, ub)
 
+        if len(values) == 0:          # e.g. a range whose bounds cross for this outer value
+            return iter(())
         self.param.value = values[0]
 
         if self.param.root_instance:
@@ -524,42 +548,21 @@ class ParamIter:
         self.order = util.topsort(self.couplings)
         self.inv_ord = np.argsort(self.order)
 
-        ## Initialize iterators following the partial order
-        self.ittrs = [self.sets[i].init_values() for i in self.order] 
-        self.current = None
+        return self._combos(0, [None] * len(self.order))
 
-        return self 
-
-    def __next__(self):
-
-        ## Basically implement nested for loops
-        if self.current is None:
-            self.current = [next(itr) for itr in self.ittrs]
-        else:
-            max_loop = self.loop_next(-1)
-        
-        return tuple(self.current[i] for i in self.inv_ord)
-
-    def loop_next(self, it):
-        """
-        Recursion to advance nested for loops
-        """
-
-        try:
-            # print(it)
-            self.current[it] = next(self.ittrs[it])
-
-        except StopIteration:
-            # if -it > len(self.ittrs):
-            #     raise StopIteration
-
-            self.loop_next(it-1)
-
-            self.ittrs[it] = self.sets[self.order[it]].init_values()
-            self.current[it] = next(self.ittrs[it])
-
-        except IndexError:
-            raise StopIteration
+    def _combos(self, depth, current):
+        """Nested for loops over the sets in dependency order. Each set's values are made
+        once the sets it depends on hold their current values, so a range that is empty
+        for some outer value skips just that value."""
+        if depth == len(self.order):
+            yield tuple(current[i] for i in self.inv_ord)
+            return
+        s = self.sets[self.order[depth]]
+        for val in s.init_values():
+            if s.param.root_instance:
+                s.param.value = val       # what the sets below see
+            current[depth] = val
+            yield from self._combos(depth + 1, current)
 
     def __mod__(self, other):
 
@@ -591,6 +594,17 @@ class ParamIter:
 ##############################################################################
 ########### Utility functions ################################################
 ##############################################################################
+
+def _plain(v):
+    """numpy scalars as Python ones, also inside lists, tuples and dicts."""
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, (list, tuple)):
+        return type(v)(_plain(x) for x in v)
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    return v
+
 
 def parse_params(dictionary, forbidden_keys=None):
     """
@@ -633,9 +647,11 @@ def parse_params(dictionary, forbidden_keys=None):
         var_k = ()
         var_v = ()
 
-    ## Make experiment dictionaries
+    ## Make experiment dictionaries (iterators yield numpy scalars: hand out plain Python
+    ## numbers, so a swept k=6 gets the same save name as a typed k=6)
     out_dicts = []
     for var_vals in ParamIter(*var_v):
+        var_vals = tuple(_plain(v) for v in var_vals)
         for mch_vals in tup_vals:
             out_dicts.append( dict(zip(var_k+tup_keys, var_vals+mch_vals), **fixed_prms) )
 

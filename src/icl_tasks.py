@@ -8,7 +8,7 @@ import automata as auto
 import prompts
 
 
-@dataclass
+@dataclass(kw_only=True)
 class GrammarTask(sxp.Task):
     """Sequences of trials from any Sequential, in blocks of num_trials
     trials, each trial ending in the 0 delimiter. Subclasses change what a
@@ -27,9 +27,14 @@ class GrammarTask(sxp.Task):
     hint             open each block with the start of its final trial
     answer_only      "Output ONLY the next word." (left out in 'raw' mode)
     prompt           a spec (see prompts.py), used instead of the fields above when
-                     given: e.g. 'one_word', or '' for no prompt"""
+                     given: e.g. 'one_word', or '' for no prompt
 
-    grammar: gram.Sequential
+    The grammar is either given (grammar=..., or a Build of one), or left out and made by
+    make_grammar() from the task's own fields, as the subclasses at the end of this file do.
+    Either way it is made when the task is, i.e. inside the job. Fields are keyword-only,
+    so subclasses can add required ones."""
+
+    grammar: gram.Sequential = None
     num_trials: list
     samps: int
     share_toks: bool = False    # should train and test sequences share tokens?
@@ -45,10 +50,16 @@ class GrammarTask(sxp.Task):
     prompt: str = None
 
     def __post_init__(self):
-        super().__post_init__()
+        super().__post_init__()                           # records .args, builds any Build
+        if self.grammar is None:
+            self.grammar = self.make_grammar()
         spec = self.prompt_spec                           # checks the fields
-        if isinstance(self.grammar, gram.Sequential):     # not if still an unbuilt Build
-            prompts.check(spec, self.prompt_facts())
+        prompts.check(spec, self.prompt_facts())
+
+    def make_grammar(self):
+        """The grammar, from the task's fields, when none is given. Subclasses that
+        describe their grammar by fields override this."""
+        raise TypeError(f"{type(self).__name__} needs grammar=...")
 
     @property
     def prompt_spec(self):
@@ -166,7 +177,7 @@ class GrammarTask(sxp.Task):
                 'prompt': {'spec': spec, 'facts': facts}}
 
 
-@dataclass
+@dataclass(kw_only=True)
 class AutomatonTask(GrammarTask):
     """GrammarTask for an automaton (FSA or PDA). There can be any number of
     blocks, as for GrammarTask, and each is one of these kinds:
@@ -257,4 +268,52 @@ class AutomatonTask(GrammarTask):
             h, forbid = ctx
             return self._draw(rng, forbid=forbid, end_with=h if last else None)
         return self._draw(rng)
-        
+
+
+# -- tasks that describe their grammar by fields -------------------------------------------
+# Each field is an ordinary task argument: it can be swept (a list), linked to other fields
+# (tuples, matched 1-1), and matched on its own when loading. The grammar is made inside the
+# job. For random graphs, graph_seed fixes which graph: the same graph_seed gives the same
+# graph in every job (across prompt conditions, models and reruns), None a fresh one per job.
+
+@dataclass(kw_only=True)
+class RelationTask(AutomatonTask):
+    """AutomatonTask on an FSA over a random relation (automata.random_relation)."""
+    k: int                       # nodes
+    r: int = 1                   # relations
+    degree: int = 2
+    density: float = None
+    backtrack: bool = False
+    length: int = None           # steps per walk; sampled blocks with holdout need this
+    mean_length: float = None    # ... or this (see automata.FSA)
+    graph_seed: int = 0
+
+    def make_grammar(self):
+        G = auto.random_relation(self.k, r=self.r, degree=self.degree, density=self.density,
+                                 seed=self.graph_seed)
+        return auto.FSA(G, backtrack=self.backtrack, length=self.length,
+                        mean_length=self.mean_length)
+
+
+@dataclass(kw_only=True)
+class CycleTask(AutomatonTask):
+    """AutomatonTask on an FSA walking a directed k-cycle (automata.cycle)."""
+    k: int
+    length: int = 1
+
+    def make_grammar(self):
+        return auto.FSA(auto.cycle(self.k), length=self.length)
+
+
+@dataclass(kw_only=True)
+class GridTask(AutomatonTask):
+    """AutomatonTask on an FSA moving around an n x m grid (automata.grid)."""
+    n: int
+    m: int = None
+    torus: bool = False
+    slip: float = 0.0
+    length: int = 1
+
+    def make_grammar(self):
+        return auto.FSA(auto.grid(self.n, self.m, torus=self.torus, slip=self.slip),
+                        length=self.length)

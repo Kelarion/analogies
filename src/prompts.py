@@ -148,7 +148,7 @@ def spec_from(explicitness=0, describe_format=False, describe_vocab=False,
     """The spec for a choice of components:
     explicitness     0 none, 1 vague, 2 moderate, 3 explicit (or the name of the level):
                      what the model is told about where the sequences come from
-    describe_format  what a trial looks like (triplets, N words, or varying lengths)
+    describe_format  what a trial looks like (triplets, words, or varying lengths)
     describe_vocab   what the words are (from the model's token pool)
     describe_task    "Your job is to complete the next word ..."
     hint             open each block with the start of its final trial
@@ -280,4 +280,3 @@ def _ordinal(n):
 def _brief(facts):
     keys = ('structure', 'shows', 'trial_len', 'n_blocks', 'share_toks')
     return ', '.join(f'{k}={facts.get(k)!r}' for k in keys)
-    
