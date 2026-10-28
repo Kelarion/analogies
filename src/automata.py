@@ -1310,35 +1310,34 @@ def cycle(k):
     return nx.MultiDiGraph([(i, (i + 1) % k, {"action": 0}) for i in range(k)])
 
 
-def random_relation(k, r=1, degree=2, density=None, seed=None):
+def random_relation(k, r=1, degree=2, density=None, seed=None, functional=False):
     """A random graph on k nodes with r relations (MLN-sampled). The same seed gives the
     same graph; seed=None gives a different one every call."""
     rels = ['R' + str(i) for i in range(r)]
     properties = [f"inf {R}(x,y) -> {R}(x,y)" for R in rels] # tautology
+    if functional:
+        properties += [mln.functional(R) for R in rels]
 
     mod = mln.MLN(k, properties, degree=degree, density=density, constraint='weak')
 
     return mod.sample(rng=np.random.default_rng(seed))
 
 
-def spatial_relation(k, d, commutes=0, total=False, density=None, seed=None):
-
+def spatial_relation(k, d, commutes=0, total=False, degree=None, inverse=False, seed=None):
+    
     rels = ['R' + str(i) for i in range(d)]
-    pairs = [(rel, 'L'+str(i)) for i,rel in enumerate(rels)]
+    items = [(r, 'L' + str(i)) for i, r in enumerate(rels)] if inverse else rels
 
-    properties = [mln.Spatial(*pairs, total=total)]
-
+    properties = [mln.Spatial(*items, total=total)]
     if commutes:
-        for i,p1 in enumerate(pairs):
-            for p2 in pairs[i+1:]:
-                properties.append(mln.commute(p1[0], p2[0], w=commutes))
-                properties.append(mln.commute(p1[0], p2[1], w=commutes))
-                properties.append(mln.commute(p1[1], p2[0], w=commutes))
-                properties.append(mln.commute(p1[1], p2[1], w=commutes))
-
-    mod = mln.MLN(k, properties, density=density)
-
-    return mod.sample(rng=np.random.default_rng(seed))
+        groups = [it if isinstance(it, tuple) else (it,) for it in items]
+        for i, A in enumerate(groups):
+            for B in groups[i + 1:]:
+                properties += [mln.commute(a, b, w=commutes) for a in A for b in B]
+    
+    mod = mln.MLN(k, properties, degree=degree)
+    
+    return mod.sample(rng=np.random.default_rng(seed), method='tempering')
 
 
 def block_relation(k, n, r=1, density=0.1, seed=None):

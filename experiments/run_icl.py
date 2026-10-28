@@ -24,17 +24,19 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 k = su.Set([8, 16])
 task_args = {'task': RelationTask,
              'k': k,
-             'degree': 2,
+             'd': 2,
+             'degree': 0.5,
              'backtrack': False,
              'graph_seed': 0,                  # same graph for every prompt condition below
-             'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
+             # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
+             'num_trials': [2*[4*k**2], 4*[2*k**2], 8*[k**2]],
              'length': 1,
              'samps': 20,
              'holdout': True, 
              'max_tok': np.inf,
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
-             # 'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
-             'explicitness': 0,
+             'explicitness': [0, 1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             # 'explicitness': 0,
              'describe_format': (True, False),
              'describe_task': (True, False),
              'describe_vocab': False,

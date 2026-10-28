@@ -280,17 +280,22 @@ class AutomatonTask(GrammarTask):
 class RelationTask(AutomatonTask):
     """AutomatonTask on an FSA over a random relation (automata.random_relation)."""
     k: int                       # nodes
-    r: int = 1                   # relations
-    degree: int = 2
-    density: float = None
+    d: int = 2                   # relations
+    degree: int = 0.5
+    commutes: float = 0.0
+    inverse: bool = False
+    total: bool = False
     backtrack: bool = False
     length: int = None           # steps per walk; sampled blocks with holdout need this
     mean_length: float = None    # ... or this (see automata.FSA)
     graph_seed: int = 0
 
     def make_grammar(self):
-        G = auto.random_relation(self.k, r=self.r, degree=self.degree, density=self.density,
+        G = auto.spatial_relation(self.k, d=self.r, degree=self.degree,
+                                 commutes=self.commutes, inverse=self.inverse, 
+                                 total=self.total, 
                                  seed=self.graph_seed)
+
         return auto.FSA(G, backtrack=self.backtrack, length=self.length,
                         mean_length=self.mean_length)
 

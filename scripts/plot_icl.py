@@ -29,23 +29,23 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 k = su.Set([8, 16])
 task_args = {'task': RelationTask,
-             'k': k,
-             'degree': 2,
-             'backtrack': False,
-             'graph_seed': 0,                  # same graph for every prompt condition below
-             'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
-             'length': 1,
-             'samps': 20,
-             'holdout': True, 
-             'max_tok': np.inf,
-             # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
-             'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
-             'describe_format': (True, False),
-             'describe_task': (True, False),
-             'describe_vocab': False,
-             'hint': [False, True],
-             'answer_only': (True, False),
-             'seed': 0,
+             # 'k': k,
+             # 'degree': 2,
+             # 'backtrack': False,
+             # 'graph_seed': 0,                  # same graph for every prompt condition below
+             # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
+             # 'length': 1,
+             # 'samps': 20,
+             # 'holdout': True, 
+             # 'max_tok': np.inf,
+             # # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
+             # 'explicitness': [1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             # 'describe_format': (True, False),
+             # 'describe_task': (True, False),
+             # 'describe_vocab': False,
+             # 'hint': [False, True],
+             # 'answer_only': (True, False),
+             # 'seed': 0,
              }
 
 # Check what a prompt says for a task, without a model (symbols shown as w1, w2, ...)
@@ -89,5 +89,6 @@ records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
 #              title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
 # plt.tight_layout()
 # plt.show()
+
 
 

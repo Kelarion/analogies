@@ -643,6 +643,7 @@ class _SpatialRuntime:
         self.count = [0, 0]
         self.rel_index = {p: l for l, p in enumerate(c.relations)}
         self.mirror = {a: b for a, b in P.pairs}
+        self.single = set(P.singles)
 
     def owned(self):
         return self.own
@@ -654,15 +655,21 @@ class _SpatialRuntime:
         c = self.c
         return [c.state[i, c.offset[a]:c.offset[a] + c.k * c.k].reshape(c.k, c.k).astype(int) for a in self.P.base]
 
+    def holds(self, i):                          # how many relations hold from x to y
+        C = 0
+        for a, A_ in zip(self.P.base, self.mats(i)):
+            C = C + (A_ if a in self.single else A_ + A_.T)   # a pair's mirror holds the other way
+        return C
+
     def valid(self, i, total=None):              # replica i obeys the rules
-        Ms = self.mats(i)
         total = self.P.total if total is None else total
-        for A_ in Ms:
-            if A_.trace() or (A_.sum(1) > 1).any() or (A_.sum(0) > 1).any():
+        for a, A_ in zip(self.P.base, self.mats(i)):
+            pair = a not in self.single
+            if A_.trace() or (A_.sum(1) > 1).any() or (pair and (A_.sum(0) > 1).any()):
                 return False
-            if total and ((A_.sum(1) != 1).any() or (A_.sum(0) != 1).any()):
+            if total and ((A_.sum(1) != 1).any() or (pair and (A_.sum(0) != 1).any())):
                 return False
-        return bool((sum(A_ + A_.T for A_ in Ms) <= 1).all())   # one direction per pair, either way
+        return bool((self.holds(i) <= 1).all())
 
     def init(self, i):
         c, P = self.c, self.P
@@ -670,7 +677,9 @@ class _SpatialRuntime:
             c.state[i, c.offset[a]:c.offset[a] + c.k * c.k] = 0
         if not P.total:
             return                               # start with no edges
-        for a in P.base:                         # a random permutation for each, obeying the rest
+        for a in P.base:                         # a random permutation for each pair, obeying the rest
+            if a in self.single:
+                continue
             for _ in range(5000):
                 perm = c.rng.permutation(c.k)
                 c.state[i, c.offset[a] + np.arange(c.k) * c.k + perm] = 1
@@ -680,6 +689,16 @@ class _SpatialRuntime:
             else:
                 raise ValueError(f"{P!r}: found no start where every node has each direction "
                                  f"(too few nodes?)")
+        for a in P.singles:                      # then each single relation: any free target
+            C = self.holds(i)
+            for x in c.rng.permutation(c.k):
+                ys = [y for y in range(c.k) if y != x and C[x, y] == 0]
+                if not ys:
+                    raise ValueError(f"{P!r}: found no start where every node has each direction "
+                                     f"(too few nodes?)")
+                y = int(c.rng.choice(ys))
+                c.state[i, c.offset[a] + x * c.k + y] = 1
+                C[x, y] += 1
 
     def start(self):                             # each node's target and predecessor, per relation
         c = self.c
@@ -687,7 +706,8 @@ class _SpatialRuntime:
         for a in self.P.base:
             adj = c.state[:, c.offset[a]:c.offset[a] + c.k * c.k].reshape(c.R, c.k, c.k)
             self.tgt[a] = np.where(adj.any(2), adj.argmax(2), -1)
-            self.pred[a] = np.where(adj.any(1), adj.argmax(1), -1)
+            if a not in self.single:             # a pair's relation is one-to-one
+                self.pred[a] = np.where(adj.any(1), adj.argmax(1), -1)
 
     def swap(self, i, j):
         for arr in list(self.tgt.values()) + list(self.pred.values()):
@@ -703,16 +723,21 @@ class _SpatialRuntime:
             if u == v or t[u] >= 0:
                 return False
             t[u] = v
+        pair = a not in self.single
         for u, v in add:
-            if t[v] == u or (t == v).sum() > 1:  # a 2-cycle, or v with two predecessors
+            if pair and (t[v] == u or (t == v).sum() > 1):   # a 2-cycle, or v with two predecessors
                 return False
-            for b in self.P.base:
-                if b != a and (self.tgt[b][i, u] == v or self.tgt[b][i, v] == u):
+            for b in self.P.base:                # another relation from u to v (or, with a
+                if b == a:                       # mirror involved, from v to u)?
+                    continue
+                if self.tgt[b][i, u] == v:
+                    return False
+                if (pair or b not in self.single) and self.tgt[b][i, v] == u:
                     return False
         return True
 
     def edges(self, E, a, rem, add):             # update one replica's shown edges
-        la, lb = self.rel_index.get(a), self.rel_index.get(self.mirror[a])
+        la, lb = self.rel_index.get(a), self.rel_index.get(self.mirror.get(a))
         for (u, v), val in [(e, 0) for e in rem] + [(e, 1) for e in add]:
             if la is not None:
                 E[la, u, v] = val
@@ -734,7 +759,8 @@ class _SpatialRuntime:
             for i in range(R):
                 a, x, c = P.base[int(ai[i])], int(xs[i]), int(cs[i])
                 ti = int(self.tgt[a][i, x])
-                if rot[i]:                   # rotate three nodes' targets: x <- y's, y <- z's, z <- x's
+                single = a in self.single
+                if rot[i] and not single:    # rotate three nodes' targets: x <- y's, y <- z's, z <- x's
                     x, y, z = (int(v) for v in trio[i])
                     t3 = [int(self.tgt[a][i, v]) for v in (x, y, z)]
                     rem = tuple((u, t) for u, t in zip((x, y, z), t3) if t >= 0)
@@ -748,9 +774,9 @@ class _SpatialRuntime:
                 elif ti == c:
                     continue
                 else:
-                    pi = int(self.pred[a][i, c])
+                    pi = -1 if single else int(self.pred[a][i, c])   # a single relation: just point at c
                     if pi < 0:
-                        if P.total:
+                        if P.total and not single:
                             continue
                         rem, add = ((x, ti),) if ti >= 0 else (), ((x, c),)
                     else:
@@ -789,10 +815,12 @@ class _SpatialRuntime:
                 S[acc] += g_rules[ok]
                 for u, v in rem:
                     self.tgt[a][acc, u] = -1
-                    self.pred[a][acc, v] = -1
+                    if a in self.pred:
+                        self.pred[a][acc, v] = -1
                 for u, v in add:
                     self.tgt[a][acc, u] = v
-                    self.pred[a][acc, v] = u
+                    if a in self.pred:
+                        self.pred[a][acc, v] = u
                 for i in acc:
                     self.edges(Edges[i], a, rem, add)
 
@@ -1221,22 +1249,28 @@ class Path(Block):
 
 
 class Spatial(Structure):
-    """Relations as spatial directions, sampled as one structure. Each pair
-    (a, b) -- by default ("N", "S") and ("E", "W") -- are inverses, and:
+    """Relations as spatial directions, sampled as one structure. Give pairs
+    (a, b) of inverse directions -- by default ("N", "S") and ("E", "W") --
+    and/or single relations with no inverse, e.g. Spatial("A", "B", "C") or
+    Spatial(("N", "S"), "A"). Then:
 
-      functional   every node has at most one edge in each direction
-      inverse      b(y,x) exactly when a(x,y): b is stored as a's mirror
-                   image, so only a is sampled and the inverse always holds
-      exclusive    at most one direction between any two nodes (so no
-                   2-cycles and no collapsed directions like N = W)
-      total        (option) every node has exactly one edge in each direction
+      functional   every node has at most one edge in each relation
+      inverse      for a pair, b(y,x) exactly when a(x,y): b is stored as a's
+                   mirror image, so only a is sampled and the inverse always
+                   holds; so a pair's relations are one-to-one, and have no
+                   2-cycles
+      exclusive    at most one relation from x to y, counting mirrors (so no
+                   collapsed directions like N = W)
+      total        (option) every node has exactly one edge in each relation:
+                   a pair's relations are then permutations, a single one a
+                   function (several nodes may point to the same node)
 
     These hold by construction. Each move picks a node x, one of the sampled
     relations and a new target c (or none), and adds, removes or moves x's
-    edge there -- or, if c already has a predecessor p, swaps: x takes c and p
-    takes x's old target; or it rotates three nodes' targets. Moves keep
-    every rule above and are accepted according to the change in the other
-    rules' score. With total, only swaps and rotations.
+    edge there. For a pair, if c already has a predecessor p, it swaps: x
+    takes c and p takes x's old target; or it rotates three nodes' targets.
+    Moves keep every rule above and are accepted according to the change in
+    the other rules' score. With total, nothing is removed.
 
     Commutation and other geometry are ordinary rules on top, e.g.
     commute("N", "E") (with total, one implies the rest; without, add every
@@ -1247,18 +1281,25 @@ class Spatial(Structure):
         MLN(16, [Spatial(total=True), commute("N", "E", "inf")])
     """
 
-    def __init__(self, *pairs, total=False):
-        self.pairs = [tuple(p) for p in (pairs or (("N", "S"), ("E", "W")))]
-        if any(len(p) != 2 for p in self.pairs):
-            raise ValueError("Spatial takes pairs of relations, e.g. ('N', 'S'), ('E', 'W')")
+    def __init__(self, *items, total=False):
+        self.items, self.pairs, self.singles = [], [], []
+        for it in (items or (("N", "S"), ("E", "W"))):
+            if isinstance(it, str):
+                self.singles.append(it)
+                self.items.append(it)
+            elif len(it) == 2 and all(isinstance(p, str) for p in it):
+                self.pairs.append(tuple(it))
+                self.items.append(tuple(it))
+            else:
+                raise ValueError(f"Spatial takes relation names or pairs of them, not {it!r}")
         self.total = total
-        self.preds = [r for p in self.pairs for r in p]
+        self.preds = [r for it in self.items for r in ((it,) if isinstance(it, str) else it)]
         if len(set(self.preds)) != len(self.preds):
-            raise ValueError("each relation can be in only one pair")
+            raise ValueError("each relation can appear only once")
 
     @property
-    def base(self):
-        return [a for a, _ in self.pairs]
+    def base(self):                              # the sampled relations, in order
+        return [it if isinstance(it, str) else it[0] for it in self.items]
 
     def predicates(self):
         return [(p, ("n", "n")) for p in self.preds]
@@ -1284,7 +1325,7 @@ class Spatial(Structure):
         return _SpatialRuntime(ctx, self)
 
     def __repr__(self):
-        return ("Spatial(" + ", ".join("/".join(p) for p in self.pairs) +
+        return ("Spatial(" + ", ".join(it if isinstance(it, str) else "/".join(it) for it in self.items) +
                 (", total" if self.total else "") + ")")
 
 
@@ -1969,12 +2010,14 @@ class MLN:
             fixed.update(dict.fromkeys(latent.graph.get("relations", {})))
         self._stage_of = _stage_plan(self.sig, self.relations, fixed, have_graph, order)
         if degree is not None:                   # a target degree is a density in other units
+            mirrored = {b for e, kd, _ in entries if kd == "structure" for b, _ in e.mirrors()}
             if not isinstance(degree, dict):
-                degree = {p: degree for p in self.relations}
+                degree = {p: degree for p in self.relations if p not in mirrored}
             m_lat = 0 if latent is None else (int(latent) if isinstance(latent, (int, np.integer))
                                               else latent.number_of_nodes())
             dens = (dict(self.density) if isinstance(self.density, dict) else
-                    {p: self.density for p in self.relations} if self.density is not None else {})
+                    {p: self.density for p in self.relations if p not in mirrored}
+                    if self.density is not None else {})
             for p, d in degree.items():
                 types = self.sig.get(p)
                 if types is None or len(types) != 2:
@@ -1984,8 +2027,21 @@ class MLN:
                 size = (k if types[1] == "n" else m_lat) - (types[0] == types[1] and distinct)
                 if not 0 < d < size:
                     raise ValueError(f"degree for {p!r} must be between 0 and {size}, not {d}")
+                if p in total and d > 1:
+                    raise ValueError(f"degree for {p!r} is {d}, but each node has at most one {p} edge")
                 dens[p] = d / size
             self.density = dens
+        if isinstance(self.density, dict) or self.density is not None:   # targets a structure can't reach
+            for p, q in (self.density.items() if isinstance(self.density, dict) else
+                         ((p, self.density) for p in self.relations)):
+                types = self.sig.get(p)
+                if p in total and types and len(types) == 2:
+                    size = (k if types[1] == "n" else (0 if latent is None else
+                            int(latent) if isinstance(latent, (int, np.integer)) else latent.number_of_nodes()))
+                    size -= types[0] == types[1] and distinct
+                    if size and q * size > 1:
+                        warnings.warn(f"density {q} for {p!r} means {q * size:.2g} edges per node, but each "
+                                      f"node has at most one: it will saturate (use degree=, at most 1)")
         self.degree = degree
 
     def _stage(self, item):
@@ -2176,14 +2232,36 @@ def gluing_diagram(G, directions=None, root=None, ax=None, max_patches=None):
     max_patches (default: a quarter of the nodes) the spanning tree is drawn
     in layers instead, with every other edge a labelled pair of half-edges.
 
-    directions  {relation: (dx, dy)}, default N/S/E/W. Pairs that mirror each
-                other (N(x,y) with S(y,x)) are drawn once.
+    directions  {relation: (dx, dy)}. By default N/S/E/W if the graph has
+                those relations, else the mirrored pairs the sample records
+                (G.graph["mirrors"], from Spatial): the first sampled relation
+                points right, its mirror left, the second up, its mirror down.
+                Pairs that mirror each other are drawn once.
     Returns {letter: (dx, dy) translation} for the gluings within patches.
     """
     import matplotlib.pyplot as plt
     from collections import deque
-    dirs = dict(_DIRECTIONS if directions is None else directions)
-    rel = {l: p for p, l in G.graph.get("relations", {}).items()}
+    rels = G.graph.get("relations", {})
+    rel = {l: p for p, l in rels.items()}
+    if directions is None and any(p in rels for p in _DIRECTIONS):
+        directions = _DIRECTIONS
+    elif directions is None and G.graph.get("mirrors"):
+        mirrors = G.graph["mirrors"]             # mirror -> sampled relation
+        bases = [p for p in rels if p in set(mirrors.values())]
+        if len(bases) > 2:
+            warnings.warn(f"{len(bases)} axes ({bases}); drawing the first two")
+        unit = [(1, 0), (0, 1)]
+        directions = {}
+        for a, (dx, dy) in zip(bases, unit):
+            directions[a] = (dx, dy)
+            directions.update({b: (-dx, -dy) for b, base in mirrors.items() if base == a})
+    elif directions is None:
+        raise ValueError(f"gluing_diagram: which relations are directions? The graph has {sorted(rels)}; "
+                         f"pass directions={{relation: (dx, dy)}}")
+    dirs = dict(directions)
+    if not any(p in dirs for p in rels):
+        raise ValueError(f"gluing_diagram: none of the directions {sorted(dirs)} is a relation of the graph "
+                         f"({sorted(rels)})")
     links = {}                                   # one per geometric link: (u, v, (dx, dy))
     for u, v, d in G.edges(data=True):
         p = rel.get(d.get("action"))
@@ -2367,14 +2445,15 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
         relations = sorted(p for p, s in sig.items() if s == ("n", "n"))
     # fields live outside the factors (in h, below) so density can tune them;
     # a zero-weight rule per field just makes its atoms part of the model
+    mirrored = {b for P in declared for b, _ in P.mirrors()}   # these share their partner's atoms
     if field is None:
         field = {}
     elif not isinstance(field, dict):
-        field = {p: field for p in relations}
+        field = {p: field for p in relations if p not in mirrored}
     if density is None:
         density = {}
     elif not isinstance(density, dict):
-        density = {p: density for p in relations}
+        density = {p: density for p in relations if p not in mirrored}
     mu = {p: float(h) for p, h in field.items()}
     for p, q in density.items():
         if not 0 < q < 1:
@@ -2917,6 +2996,7 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
             else:
                 hidden[p] = vals
         G.graph["relations"] = {p: l for l, p in enumerate(relations)}
+        G.graph["mirrors"] = {b: a for b, a in mirror_of.items() if b in relations and a in relations}
         G.graph["predicates"] = {p: tuple({"n": "node", "l": "latent"}[t] for t in sig[p])
                                  for p in sorted(sig)}
         G.graph["hidden"] = hidden

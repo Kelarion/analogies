@@ -22,8 +22,10 @@ from scipy.spatial import ConvexHull
 from scipy.spatial import HalfspaceIntersection
 from scipy.spatial.distance import pdist, squareform
 from scipy.optimize import linprog as lp
+import itertools as it
 from itertools import permutations, combinations
 import itertools as itt
+import networkx as nx
 
 #%%
 class PCA3D(object):
@@ -1018,5 +1020,14 @@ def loglog(x, y=None, **kwargs):
 
     plt.loglog(xplot, yplot, **kwargs)
 
+
+def draw_multigraph(G, cols='weight', **draw_args):
+
+    connectionstyle = [f"arc3,rad={r}" for r in it.accumulate([0.15] * 4)]
+    # connectionstyle = [f"angle3,angleA={r}" for r in it.accumulate([30] * 4)]
+
+    edge_color = [data[cols] for u, v, data in G.edges(data=True)]
+
+    nx.draw(G, connectionstyle=connectionstyle, edge_color=edge_color, **draw_args)
 
 # def triangle(X, )

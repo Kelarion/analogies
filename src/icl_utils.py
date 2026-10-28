@@ -458,8 +458,14 @@ def ngram(data, i, order=1, alpha=1.0):
 
 REF_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X']
 
+def ylabel(perplexity=False, kl=False):
+    """The y-axis label for a score from plot_icl (or icl_sweeps), given how it's shown."""
+    if kl:
+        return 'perplexity / true perplexity (exp KL)' if perplexity else '−KL(Y ‖ model)'
+    return 'perplexity (exp cross-entropy)' if perplexity else 'log-likelihood (−cross-entropy)'
+
 def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title='', cmap='viridis',
-             refs=(), perplexity=False):
+             refs=(), perplexity=False, kl=False):
     """
     n_trl:  number of trials (comma-separated segments) per block to show, from the block's start
     k_hide: if given, show only the last k_hide tokens of each trial; otherwise every token
@@ -474,6 +480,10 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
                       'bigram': partial(ngram, order=1, alpha=0.5)}
     perplexity: plot exp(cross-entropy) of each token, taken before averaging over samples,
                 instead of log-likelihood; the references likewise.
+    kl:     plot -KL(Y || model), the log-likelihood less the best achievable (-H(Y)), so that
+            0 is the true distribution; the references likewise. The same as the
+            log-likelihood wherever Y is deterministic. With perplexity, exp(KL): the
+            model's perplexity as a multiple of the true distribution's.
     """
     refs = dict(refs)
     f = (lambda v: np.exp(-v)) if perplexity else (lambda v: v)
@@ -502,10 +512,11 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
     stars = [[] for _ in range(nblk)]
     for i in range(len(logp_ctx)):
         Y, B, blocks = data['Y'][i], data['B'][i], data['blocks'][i]
+        best = spc.xlogy(Y, Y).sum(-1) if kl else np.zeros(len(Y))  # -H(Y), what kl subtracts
         ref = {}                                                    # per-position reference scores
         for k, pred in refs.items():
             P = pred(data, i)
-            ref[k] = spc.xlogy(Y, P / P.sum(-1, keepdims=True)).sum(-1)
+            ref[k] = spc.xlogy(Y, P / P.sum(-1, keepdims=True)).sum(-1) - best
 
         for b in range(nblk):
             t0 = np.argmax(B == b)
@@ -517,7 +528,9 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
             rest, s = asst[1:-1], len(ctx)                          # completion tokens after the first
             if len(rest):
                 vals[s:s + len(rest)] = xent(rest, Y[t0 + s:t0 + s + len(rest)])
-            stars[b].append(f(xent(asst[0], Y[t0 + len(ctx) - 1])))  # first completion token, assistant turn
+            vals -= best[t0:t0 + len(vals)]
+            stars[b].append(f(xent(asst[0], Y[t0 + len(ctx) - 1])    # first completion token, assistant turn
+                              - best[t0 + len(ctx) - 1]))
 
             curves['model'][b].append(to_grid(f(vals), blocks[b]))
             for k, r in ref.items():                                # only where the model is scored
@@ -561,7 +574,7 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
     # ax.set_xticks(ticks, labels)
     ax.set_title(title)
     ax.set_xlabel('trial')
-    ax.set_ylabel('perplexity (exp cross-entropy)' if perplexity else 'log-likelihood (−cross-entropy)')
+    ax.set_ylabel(ylabel(perplexity, kl))
     ax.legend(loc='upper right' if perplexity else 'lower right', fontsize='small')
 
 
@@ -598,4 +611,3 @@ def task_logprobs(logs, task_toks, equiv=None):
     if equiv is None:
         return logs[:, task_toks] - spc.logsumexp(logs, axis=-1, keepdims=True)
     return equiv.logprobs(logs, task_toks)
-    
