@@ -674,7 +674,7 @@ def _git(*args, cwd=REPO_DIR):
 
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
                    name=None, max_parallel=8, template=None, remote=None, check_commit=True,
-                   ensure_weights=True):
+                   ensure_weights=True, per_job=1):
     """
     Submit every task x model combination as one Slurm job array.
 
@@ -694,7 +694,12 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     ensure_weights: if the model class has a model_name field, check that each model in the
         sweep is fully in the cluster's Hugging Face cache; for any that isn't, first submit
         a CPU job that downloads it, and make the array wait for that job to succeed.
-    run_remote=False runs the first combination here instead, for debugging.
+    per_job: combinations each array task runs, one after another in one process, so the
+        model is loaded once per job instead of once per combination. Loading a large model
+        can take longer than a short experiment, and many jobs loading at once strain the
+        shared filesystem: for short runs, pick per_job so a job lasts tens of minutes.
+        Consecutive combinations share a model, so a job loads one (or two, at a boundary).
+    run_remote=False runs the first array task here instead, for debugging.
     max_parallel caps how many array tasks run at once.
     """
     if remote is None:
@@ -703,6 +708,7 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     tasks = parse_params(task_args, forbidden_keys=['task'])
     models = parse_params(mod_args, forbidden_keys=['model'])
     n_task, n_tot = len(tasks), len(tasks) * len(models)
+    n_jobs = -(-n_tot // per_job)
     name = name or time.strftime('%Y%m%d-%H%M%S')
 
     if remote:
@@ -732,17 +738,21 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     for j, args in enumerate(models):
         with open(os.path.join(local, 'model_%d.pkl' % j), 'wb') as f:
             pkl.dump({'model': mod_args['model'], 'args': args}, f)
+    with open(os.path.join(local, 'sweep.json'), 'w') as f:
+        json.dump({'n_task': n_task, 'n_tot': n_tot, 'per_job': per_job}, f)
     if verbose:
-        print(f'{n_task} tasks x {len(models)} models = {n_tot} jobs, in {sweep}'
+        print(f'{n_task} tasks x {len(models)} models = {n_tot} combinations, '
+              f'in {n_jobs} jobs of up to {per_job}, in {sweep}'
               + (f' on {REMOTE_HOST}' if remote else ''))
 
     if not run_remote:
         print('Running the first job here...')
-        subprocess.check_call([sys.executable, WORKER, '0', str(n_task), local])
+        subprocess.check_call([sys.executable, WORKER, '0', str(n_task), local,
+                               str(per_job), str(n_tot)])
         return local
 
-    fill = dict(n_tot=n_tot - 1, n_task=n_task, sweep_dir=sweep, repo=repo, scratch=scratch,
-                results=results, max_parallel=max_parallel)
+    fill = dict(last=n_jobs - 1, n_tot=n_tot, per_job=per_job, n_task=n_task, sweep_dir=sweep,
+                repo=repo, scratch=scratch, results=results, max_parallel=max_parallel)
     with open(template or JOB_TEMPLATE) as f:
         script = f.read().format(**fill)
     with open(os.path.join(local, 'job_script.sh'), 'w') as f:
@@ -768,7 +778,7 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         print(f'Downloading first (job {after}); the array starts once that succeeds.')
     job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after)
     _record_job(sweep, job, remote)
-    print(f'Submitted batch job {job} ({n_tot} array tasks)')
+    print(f'Submitted batch job {job} ({n_jobs} array tasks)')
     return sweep
 
 
@@ -850,31 +860,12 @@ def sweep_status(sweep=None, remote=None, verbose=True):
 
 
 def _print_status(st):
-    tasks = st['tasks']
-    live = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is None}
-    failed = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is not None}
-    print(f"{st['sweep']}: {sum(t['done'] for t in tasks.values())} of {st['n_tot']} done, "
-          f"{len(live)} queued or running, {len(failed)} failed")
-    if not failed:
-        return
-    causes = {}
-    for t in failed.values():
-        causes[t['cause']] = causes.get(t['cause'], 0) + 1
-    print('  by cause: ' + ', '.join(f'{c} {n}' for c, n in sorted(causes.items(), key=lambda x: -x[1])))
-    ran, bad = {}, {}
-    for t in tasks.values():
-        if t['node']:
-            ran[t['node']] = ran.get(t['node'], 0) + 1
-            if not t['done'] and t['cause'] is not None:
-                bad[t['node']] = bad.get(t['node'], 0) + 1
-    if bad:
-        print('  failures per node: ' + ', '.join(f'{n} {bad[n]}/{ran[n]}'
-                                                 for n in sorted(bad, key=lambda n: -bad[n])))
-    for i, t in sorted(failed.items()):
-        print(f"  {i:>4}  {t['node'] or '?':<12} {(t['start'] or '?')[:19]:<19}  {t['cause']}"
-              + ('' if t['transient'] else '  (not transient)'))
-        if t['detail']:
-            print(f"        {t['detail'][:110]}")
+    """The summary from jobs/sweep_status.py (this repo's copy), so there's one formatter."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('sweep_status', os.path.join(REPO_DIR, STATUS))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    print(mod.summary(st))
 
 
 def _ranges(ix):
@@ -890,9 +881,10 @@ def _ranges(ix):
 
 def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None, dry_run=False):
     """
-    Resubmit the array tasks of a sweep that didn't save a result and aren't queued or
-    running, as a new array job running the sweep's own job script (same pickles, so the
-    results land where the originals' would have).
+    Resubmit the array tasks of a sweep that didn't save all their results and aren't queued
+    or running, as a new array job running the sweep's own job script (same pickles, so the
+    results land where the originals' would have). Within a task, combinations that already
+    finished are skipped, so only the missing ones run again.
 
     Tasks that failed for reasons a retry won't fix (a Python error, the time limit, running
     out of memory, missing weights, ...) are listed and left out unless include_errors=True,

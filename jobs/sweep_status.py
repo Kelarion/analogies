@@ -1,8 +1,11 @@
 """
 What happened to each array task of a sweep (run on the cluster, by server_utils.sweep_status):
 
-    python jobs/sweep_status.py [SWEEP]      SWEEP: a folder name in the sweeps folder, a path,
-                                             or nothing for the most recent sweep
+    python3 jobs/sweep_status.py [SWEEP] [--text]
+
+SWEEP: a folder name in the sweeps folder, a path, or nothing for the most recent sweep.
+--text prints a readable summary instead of JSON (no project environment needed, so a lone
+copy of this file works too: python3 ~/sweep_status.py SWEEP --text).
 
 Prints JSON: {'sweep': path, 'n_tot': ..., 'max_parallel': ..., 'tasks': {index: {...}}}, each
 task with: done (its result was saved), state (Slurm's, from sacct, if the job ids were
@@ -70,22 +73,24 @@ def sacct(job_ids):
     return info
 
 
-def find_job_ids(d):
-    """The array jobs that ran this sweep's job script, for sweeps that didn't record them:
-    from Slurm's accounting (the submit command names the script), else from the queue."""
-    script = os.path.join(d, 'job_script.sh')
-    ids = []
-    out = subprocess.run(['sacct', '-u', os.environ.get('USER', ''), '-S', 'now-60days', '-X',
-                          '-n', '-P', '--format=JobID,SubmitLine'],
-                         capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        job, _, submit = line.partition('|')
-        if script in submit:
-            ids.append(job.split('_')[0])
-    if not ids:                                   # older Slurm without SubmitLine: live jobs only
-        out = subprocess.run(['squeue', '--me', '-h', '-o', '%F|%o'],
-                             capture_output=True, text=True).stdout
-        ids = [job for job, _, cmd in (l.partition('|') for l in out.splitlines()) if script in cmd]
+def find_job_ids(d, warnings):
+    """The array jobs that ran this sweep's job script, for sweeps that didn't record them.
+    Slurm's accounting is searched by the submit command (it names the script), else by the
+    log path (it names the sweep's folder); else the queue, for jobs still alive. Fields a
+    Slurm version doesn't have are skipped, and its complaints collected in `warnings`."""
+    script, logs = os.path.join(d, 'job_script.sh'), os.path.join(d, 'logs')
+    for field, needle in (('SubmitLine', script), ('StdOut', logs)):
+        res = subprocess.run(['sacct', '-u', os.environ.get('USER', ''), '-S', 'now-60days', '-X',
+                              '-n', '-P', f'--format=JobID,{field}'],
+                             capture_output=True, text=True)
+        if res.returncode or res.stderr.strip():
+            warnings.append(f'sacct --format=JobID,{field}: ' + (res.stderr.strip() or f'exit {res.returncode}'))
+        ids = [line.split('|', 1)[0].split('_')[0] for line in res.stdout.splitlines()
+               if needle in line.partition('|')[2]]
+        if ids:
+            return sorted(set(ids), key=int)
+    res = subprocess.run(['squeue', '--me', '-h', '-o', '%F|%o'], capture_output=True, text=True)
+    ids = [job for job, _, cmd in (l.partition('|') for l in res.stdout.splitlines()) if script in cmd]
     return sorted(set(ids), key=int)
 
 
@@ -110,27 +115,41 @@ def from_log(path):
 
 
 def status(d):
-    n_tot = len(glob.glob(os.path.join(d, 'task_*.pkl'))) * len(glob.glob(os.path.join(d, 'model_*.pkl')))
+    meta = os.path.join(d, 'sweep.json')
+    if os.path.exists(meta):                      # array task j runs combinations j*per_job, ...
+        with open(meta) as f:
+            meta = json.load(f)
+        n_tot, per_job = meta['n_tot'], meta['per_job']
+    else:                                         # older sweeps: one combination per task
+        n_tot = len(glob.glob(os.path.join(d, 'task_*.pkl'))) * len(glob.glob(os.path.join(d, 'model_*.pkl')))
+        per_job = 1
+    n_jobs = -(-n_tot // per_job)
     script = open(os.path.join(d, 'job_script.sh')).read()
     m = re.search(r'--array=\S*%(\d+)', script)
     ids_file = os.path.join(d, 'jobids')
     job_ids = open(ids_file).read().split() if os.path.exists(ids_file) else []
+    warnings = []
     if not job_ids:                               # a sweep from before job ids were recorded
-        job_ids = find_job_ids(d)
+        job_ids = find_job_ids(d, warnings)
         if job_ids:
             with open(ids_file, 'w') as f:
                 f.write('\n'.join(job_ids) + '\n')
     slurm = sacct(job_ids) if job_ids else {}
 
-    tasks = {}
-    for i in range(n_tot):
+    tasks = {}                                    # by array index
+    for i in range(n_jobs):
         log = os.path.join(d, 'logs', f'{i}.out')
-        t = {'done': os.path.exists(os.path.join(d, 'done', str(i))), 'state': None,
+        combos = range(i * per_job, min((i + 1) * per_job, n_tot))
+        n_done = sum(os.path.exists(os.path.join(d, 'done', str(c))) for c in combos)
+        t = {'done': n_done == len(combos), 'combos': [n_done, len(combos)], 'state': None,
              'node': None, 'start': None, 'exit': None, 'cause': None, 'detail': None}
-        if not t['done'] and os.path.exists(log):      # sweeps from before the markers
+        if not t['done'] and per_job == 1 and os.path.exists(log):   # sweeps from before the markers
             with open(log, errors='replace') as f:
                 t['done'] = any(line.startswith('saved ') for line in f)
         t.update({k: v for k, v in slurm.get(i, {}).items() if v})
+        if t['state'] == 'COMPLETED':             # exit 0 comes only after every result is saved
+            t['done'] = True
+            t['combos'][0] = t['combos'][1]
         if not t['done']:
             t.update({k: v for k, v in from_log(log).items() if v})
             if t['state'] in STATES:                    # Slurm knows best why it ended a job
@@ -144,11 +163,56 @@ def status(d):
         t['transient'] = t['cause'] in TRANSIENT
         if not job_ids and t['cause'] in ('no log', 'ended without an error'):
             t['transient'] = False                    # might be queued or running: don't rerun
-            t['detail'] = 'no Slurm record found: it may still be queued or running'
+            t['detail'] = ('no Slurm record found, so it may still be queued or running '
+                           '(echo the array job id > SWEEP/jobids to fix)')
         tasks[i] = t
-    return {'sweep': d, 'n_tot': n_tot, 'max_parallel': int(m.group(1)) if m else None,
-            'job_ids': job_ids, 'tasks': tasks}
+    return {'sweep': d, 'n_tot': n_tot, 'per_job': per_job, 'n_jobs': n_jobs,
+            'max_parallel': int(m.group(1)) if m else None,
+            'job_ids': job_ids, 'warnings': warnings, 'tasks': tasks}
+
+
+def summary(st):
+    """Readable summary: counts, failures by cause and per node, then each failed task."""
+    tasks = {int(i): t for i, t in st['tasks'].items()}
+    live = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is None}
+    failed = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is not None}
+    per_job = st.get('per_job', 1)
+    n_done = sum(t.get('combos', [t['done']])[0] for t in tasks.values())
+    if per_job == 1:
+        lines = [f"{st['sweep']}: {n_done} of {st['n_tot']} done, "
+                 f"{len(live)} queued or running, {len(failed)} failed"]
+    else:
+        lines = [f"{st['sweep']}: {n_done} of {st['n_tot']} combinations done; of its "
+                 f"{len(tasks)} jobs ({per_job} each), {len(live)} queued or running, "
+                 f"{len(failed)} failed"]
+    if not st.get('job_ids'):
+        lines.append('  (no Slurm job ids for this sweep: states, nodes and times unknown)')
+    lines += [f'  warning: {w}' for w in st.get('warnings', [])]
+    if not failed:
+        return '\n'.join(lines)
+    causes = {}
+    for t in failed.values():
+        causes[t['cause']] = causes.get(t['cause'], 0) + 1
+    lines.append('  by cause: ' + ', '.join(f'{c} {n}' for c, n in sorted(causes.items(), key=lambda x: -x[1])))
+    ran, bad = {}, {}
+    for t in tasks.values():
+        if t['node']:
+            ran[t['node']] = ran.get(t['node'], 0) + 1
+            if not t['done'] and t['cause'] is not None:
+                bad[t['node']] = bad.get(t['node'], 0) + 1
+    if bad:
+        lines.append('  failures per node: ' + ', '.join(f'{n} {bad[n]}/{ran[n]}'
+                                                       for n in sorted(bad, key=lambda n: -bad[n])))
+    for i, t in sorted(failed.items()):
+        part = f"  ({t['combos'][0]}/{t['combos'][1]} done)" if per_job > 1 else ''
+        lines.append(f"  {i:>4}  {t['node'] or '?':<12} {(t['start'] or '?')[:19]:<19}  {t['cause']}"
+                     + ('' if t['transient'] else '  (not transient)') + part)
+        if t['detail']:
+            lines.append(f"        {t['detail'][:110]}")
+    return '\n'.join(lines)
 
 
 if __name__ == '__main__':
-    print(json.dumps(status(sweep_dir(sys.argv[1] if len(sys.argv) > 1 else ''))))
+    args = [a for a in sys.argv[1:] if a != '--text']
+    st = status(sweep_dir(args[0] if args else ''))
+    print(summary(st) if '--text' in sys.argv else json.dumps(st))

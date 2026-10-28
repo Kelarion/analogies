@@ -12,7 +12,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=0-11:59:00
-#SBATCH --array=0-{n_tot}%{max_parallel}
+#SBATCH --array=0-{last}%{max_parallel}
 #SBATCH --output={sweep_dir}/logs/%a.out
 
 # set explicitly rather than relying on the submitting shell's environment
@@ -28,4 +28,4 @@ echo "node: $(hostname)  start: $(date -Is)  job: ${{SLURM_ARRAY_JOB_ID}}_${{SLU
 echo "commit: $(git rev-parse HEAD)"
 env | grep "^HF_" | sort            # where this job looks for weights
 uv sync --check -q || {{ echo "environment out of date: run 'uv sync' on the login node"; exit 1; }}
-uv run --no-sync python jobs/run_experiment.py $SLURM_ARRAY_TASK_ID {n_task} {sweep_dir}
+uv run --no-sync python jobs/run_experiment.py $SLURM_ARRAY_TASK_ID {n_task} {sweep_dir} {per_job} {n_tot}
