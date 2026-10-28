@@ -1,9 +1,11 @@
 """
 What happened to each array task of a sweep (run on the cluster, by server_utils.sweep_status):
 
-    python3 jobs/sweep_status.py [SWEEP] [--text]
+    python3 jobs/sweep_status.py [SWEEP] [--text] [--job-ids=ID,ID]
 
 SWEEP: a folder name in the sweeps folder, a path, or nothing for the most recent sweep.
+--job-ids gives the sweep's array job ids (recorded in SWEEP/jobids for next time), for
+sweeps whose ids weren't recorded and can't be found in Slurm's accounting.
 --text prints a readable summary instead of JSON (no project environment needed, so a lone
 copy of this file works too: python3 ~/sweep_status.py SWEEP --text).
 
@@ -114,7 +116,7 @@ def from_log(path):
     return out
 
 
-def status(d):
+def status(d, given_ids=()):
     meta = os.path.join(d, 'sweep.json')
     if os.path.exists(meta):                      # array task j runs combinations j*per_job, ...
         with open(meta) as f:
@@ -128,6 +130,11 @@ def status(d):
     m = re.search(r'--array=\S*%(\d+)', script)
     ids_file = os.path.join(d, 'jobids')
     job_ids = open(ids_file).read().split() if os.path.exists(ids_file) else []
+    new = [j for j in given_ids if j not in job_ids]
+    if new:                                       # given by hand: remember them
+        job_ids += new
+        with open(ids_file, 'w') as f:
+            f.write('\n'.join(job_ids) + '\n')
     warnings = []
     if not job_ids:                               # a sweep from before job ids were recorded
         job_ids = find_job_ids(d, warnings)
@@ -164,7 +171,7 @@ def status(d):
         if not job_ids and t['cause'] in ('no log', 'ended without an error'):
             t['transient'] = False                    # might be queued or running: don't rerun
             t['detail'] = ('no Slurm record found, so it may still be queued or running '
-                           '(echo the array job id > SWEEP/jobids to fix)')
+                           "(give the array job id: job_ids=[...])")
         tasks[i] = t
     return {'sweep': d, 'n_tot': n_tot, 'per_job': per_job, 'n_jobs': n_jobs,
             'max_parallel': int(m.group(1)) if m else None,
@@ -213,6 +220,8 @@ def summary(st):
 
 
 if __name__ == '__main__':
-    args = [a for a in sys.argv[1:] if a != '--text']
-    st = status(sweep_dir(args[0] if args else ''))
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    ids = [a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--job-ids=')]
+    ids = [j for a in ids for j in a.split(',') if j]
+    st = status(sweep_dir(args[0] if args else ''), ids)
     print(summary(st) if '--text' in sys.argv else json.dumps(st))

@@ -839,7 +839,7 @@ def _cluster_script(args, remote):
                           text=True, check=True).stdout
 
 
-def sweep_status(sweep=None, remote=None, verbose=True):
+def sweep_status(sweep=None, remote=None, verbose=True, job_ids=None):
     """
     What happened to each array task of a sweep: whether its result was saved, Slurm's
     state, the node and start time, and for the ones that didn't finish, why (from Slurm
@@ -848,10 +848,12 @@ def sweep_status(sweep=None, remote=None, verbose=True):
 
     sweep: the folder name send_to_server printed (or name= you gave it), a path, or None
         for the most recent sweep. remote: as in send_to_server (None: decide by whether
-        this machine has sbatch).
+        this machine has sbatch). job_ids: the sweep's array job ids, for sweeps submitted
+        before they were recorded, if they can't be found automatically (remembered after).
     """
     remote = shutil.which('sbatch') is None if remote is None else remote
-    out = _cluster_script([STATUS, sweep or ''], remote)
+    args = [STATUS, sweep or ''] + ([f"--job-ids={','.join(map(str, job_ids))}"] if job_ids else [])
+    out = _cluster_script(args, remote)
     st = json.loads(out.strip().splitlines()[-1])
     st['tasks'] = {int(i): t for i, t in st['tasks'].items()}
     if verbose:
@@ -879,7 +881,8 @@ def _ranges(ix):
     return ','.join(out)
 
 
-def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None, dry_run=False):
+def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None, dry_run=False,
+                     job_ids=None):
     """
     Resubmit the array tasks of a sweep that didn't save all their results and aren't queued
     or running, as a new array job running the sweep's own job script (same pickles, so the
@@ -889,10 +892,16 @@ def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None
     Tasks that failed for reasons a retry won't fix (a Python error, the time limit, running
     out of memory, missing weights, ...) are listed and left out unless include_errors=True,
     so a bug doesn't burn another round of GPU time. exclude: nodes to keep the reruns off,
-    or 'failed' for the nodes where this sweep's tasks failed transiently.
+    or 'failed' for the nodes where this sweep's tasks failed transiently. job_ids: as in
+    sweep_status, for older sweeps whose job ids can't be found automatically.
     """
     remote = shutil.which('sbatch') is None if remote is None else remote
-    st = sweep_status(sweep, remote, verbose=False)
+    st = sweep_status(sweep, remote, verbose=False, job_ids=job_ids)
+    for w in st.get('warnings', []):
+        print('warning:', w)
+    if not st.get('job_ids'):
+        print("no Slurm job ids for this sweep, so tasks without a result can't be told apart from "
+              "ones still queued or running; give them with job_ids=[...] (see sacct)")
     tasks = st['tasks']
     missing = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is not None}
     todo = sorted(i for i, t in missing.items() if t['transient'] or include_errors)
