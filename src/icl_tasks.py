@@ -291,7 +291,7 @@ class RelationTask(AutomatonTask):
     graph_seed: int = 0
 
     def make_grammar(self):
-        G = auto.spatial_relation(self.k, d=self.r, degree=self.degree,
+        G = auto.spatial_relation(self.k, d=self.d, degree=self.degree,
                                  commutes=self.commutes, inverse=self.inverse, 
                                  total=self.total, 
                                  seed=self.graph_seed)

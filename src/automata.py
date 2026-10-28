@@ -1335,7 +1335,7 @@ def spatial_relation(k, d, commutes=0, total=False, degree=None, inverse=False, 
             for B in groups[i + 1:]:
                 properties += [mln.commute(a, b, w=commutes) for a in A for b in B]
     
-    mod = mln.MLN(k, properties, degree=degree)
+    mod = mln.MLN(k, properties, degree=degree, constraint='weak')
     
     return mod.sample(rng=np.random.default_rng(seed), method='tempering')
 
