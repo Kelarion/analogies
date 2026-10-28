@@ -11,6 +11,7 @@ JOB_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'array_template.sh')
 WORKER = os.path.join(REPO_DIR, 'jobs', 'run_experiment.py')
 DOWNLOAD_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'download_template.sh')
 WEIGHTS = 'jobs/weights.py'          # relative to the repo, run on the cluster
+STATUS = 'jobs/sweep_status.py'
 
 # Submitting from elsewhere (e.g. the laptop): the ssh host, and the repo's path there.
 REMOTE_HOST = os.environ.get('ICL_REMOTE_HOST', 'mila')
@@ -766,6 +767,7 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
             print(f'Not cached on the cluster: {m}\n    ({why})')
         print(f'Downloading first (job {after}); the array starts once that succeeds.')
     job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after)
+    _record_job(sweep, job, remote)
     print(f'Submitted batch job {job} ({n_tot} array tasks)')
     return sweep
 
@@ -795,9 +797,10 @@ def _missing_weights(names, scratch, repo, remote):
     return json.loads(out.strip().splitlines()[-1])
 
 
-def _sbatch(script, remote, after=None):
+def _sbatch(script, remote, after=None, extra=()):
     """Submit `script`, optionally to start only once job `after` has succeeded; returns the job id."""
-    args = ['sbatch', '--parsable'] + ([f'--dependency=afterok:{after}'] if after else []) + [script]
+    args = (['sbatch', '--parsable'] + ([f'--dependency=afterok:{after}'] if after else [])
+            + list(extra) + [script])
     if remote:
         out = _remote(' '.join(shlex.quote(a) for a in args))
     else:
@@ -807,6 +810,121 @@ def _sbatch(script, remote, after=None):
         out = res.stdout
     return out.strip().splitlines()[-1].split(';')[0]
 
+
+
+def _record_job(sweep, job, remote):
+    """Append an array job id to the sweep's jobids file (read by jobs/sweep_status.py)."""
+    if remote:
+        _remote(f'echo {job} >> {sweep}/jobids')
+    else:
+        with open(os.path.join(sweep, 'jobids'), 'a') as f:
+            f.write(f'{job}\n')
+
+
+def _cluster_script(args, remote):
+    """Run one of the repo's scripts on the cluster (over ssh if remote); its stdout."""
+    if remote:
+        return _remote(f'cd {REMOTE_REPO} && .venv/bin/python ' + ' '.join(shlex.quote(a) for a in args))
+    return subprocess.run([sys.executable, *args], cwd=REPO_DIR, capture_output=True,
+                          text=True, check=True).stdout
+
+
+def sweep_status(sweep=None, remote=None, verbose=True):
+    """
+    What happened to each array task of a sweep: whether its result was saved, Slurm's
+    state, the node and start time, and for the ones that didn't finish, why (from Slurm
+    and the task's log). Prints a summary, including failures per node, and returns
+    {'sweep', 'n_tot', 'tasks': {index: {...}}, ...}.
+
+    sweep: the folder name send_to_server printed (or name= you gave it), a path, or None
+        for the most recent sweep. remote: as in send_to_server (None: decide by whether
+        this machine has sbatch).
+    """
+    remote = shutil.which('sbatch') is None if remote is None else remote
+    out = _cluster_script([STATUS, sweep or ''], remote)
+    st = json.loads(out.strip().splitlines()[-1])
+    st['tasks'] = {int(i): t for i, t in st['tasks'].items()}
+    if verbose:
+        _print_status(st)
+    return st
+
+
+def _print_status(st):
+    tasks = st['tasks']
+    live = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is None}
+    failed = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is not None}
+    print(f"{st['sweep']}: {sum(t['done'] for t in tasks.values())} of {st['n_tot']} done, "
+          f"{len(live)} queued or running, {len(failed)} failed")
+    if not failed:
+        return
+    causes = {}
+    for t in failed.values():
+        causes[t['cause']] = causes.get(t['cause'], 0) + 1
+    print('  by cause: ' + ', '.join(f'{c} {n}' for c, n in sorted(causes.items(), key=lambda x: -x[1])))
+    ran, bad = {}, {}
+    for t in tasks.values():
+        if t['node']:
+            ran[t['node']] = ran.get(t['node'], 0) + 1
+            if not t['done'] and t['cause'] is not None:
+                bad[t['node']] = bad.get(t['node'], 0) + 1
+    if bad:
+        print('  failures per node: ' + ', '.join(f'{n} {bad[n]}/{ran[n]}'
+                                                 for n in sorted(bad, key=lambda n: -bad[n])))
+    for i, t in sorted(failed.items()):
+        print(f"  {i:>4}  {t['node'] or '?':<12} {(t['start'] or '?')[:19]:<19}  {t['cause']}"
+              + ('' if t['transient'] else '  (not transient)'))
+        if t['detail']:
+            print(f"        {t['detail'][:110]}")
+
+
+def _ranges(ix):
+    """[1, 2, 3, 7] -> '1-3,7' (Slurm's array syntax)"""
+    ix, out, start = sorted(ix), [], None
+    for a, b in zip(ix, ix[1:] + [None]):
+        start = a if start is None else start
+        if b != a + 1:
+            out.append(f'{start}-{a}' if a != start else f'{a}')
+            start = None
+    return ','.join(out)
+
+
+def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None, dry_run=False):
+    """
+    Resubmit the array tasks of a sweep that didn't save a result and aren't queued or
+    running, as a new array job running the sweep's own job script (same pickles, so the
+    results land where the originals' would have).
+
+    Tasks that failed for reasons a retry won't fix (a Python error, the time limit, running
+    out of memory, missing weights, ...) are listed and left out unless include_errors=True,
+    so a bug doesn't burn another round of GPU time. exclude: nodes to keep the reruns off,
+    or 'failed' for the nodes where this sweep's tasks failed transiently.
+    """
+    remote = shutil.which('sbatch') is None if remote is None else remote
+    st = sweep_status(sweep, remote, verbose=False)
+    tasks = st['tasks']
+    missing = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is not None}
+    todo = sorted(i for i, t in missing.items() if t['transient'] or include_errors)
+    skipped = sorted(set(missing) - set(todo))
+    for i in skipped:
+        print(f"leaving out {i}: {tasks[i]['cause']} ({(tasks[i]['detail'] or '')[:90]})")
+    if skipped:
+        print('  (fix the cause, then resubmit_missing(..., include_errors=True))')
+    if not todo:
+        print('nothing to resubmit')
+        return None
+
+    if exclude == 'failed':
+        exclude = sorted({t['node'] for t in missing.values() if t['transient'] and t['node']})
+    spec = _ranges(todo) + (f"%{st['max_parallel']}" if st['max_parallel'] else '')
+    extra = [f'--array={spec}'] + ([f'--exclude={",".join(exclude)}'] if exclude else [])
+    print(f'resubmitting {len(todo)} task(s): {_ranges(todo)}'
+          + (f', not on {",".join(exclude)}' if exclude else ''))
+    if dry_run:
+        return None
+    job = _sbatch(os.path.join(st['sweep'], 'job_script.sh'), remote, extra=extra)
+    _record_job(st['sweep'], job, remote)
+    print(f'Submitted batch job {job}')
+    return job
 
 def fetch_results(dest=None):
     """Copy the cluster's results into SAVE_DIR here (or `dest`), e.g. for plotting on the

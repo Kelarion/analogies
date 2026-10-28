@@ -281,7 +281,7 @@ class RelationTask(AutomatonTask):
     """AutomatonTask on an FSA over a random relation (automata.random_relation)."""
     k: int                       # nodes
     d: int = 2                   # relations
-    degree: int = 0.5
+    degree: float = 0.5
     commutes: float = 0.0
     inverse: bool = False
     total: bool = False

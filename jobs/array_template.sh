@@ -21,7 +21,10 @@ export ICL_RESULTS={results}
 export HF_HOME={scratch}/.cache/huggingface
 export HF_TOKEN_PATH=$HOME/.cache/huggingface/token
 export HF_HUB_OFFLINE=1        # weights must already be downloaded (hf download ...)
+export TQDM_DISABLE=1 HF_HUB_DISABLE_PROGRESS_BARS=1   # progress bars rewrite the log
+                               # file many times a second; nobody watches them in batch
 cd {repo}
+echo "node: $(hostname)  start: $(date -Is)  job: ${{SLURM_ARRAY_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}"
 echo "commit: $(git rev-parse HEAD)"
 env | grep "^HF_" | sort            # where this job looks for weights
 uv sync --check -q || {{ echo "environment out of date: run 'uv sync' on the login node"; exit 1; }}

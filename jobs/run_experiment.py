@@ -27,3 +27,6 @@ print('task: ', task_dict['args'], '\nmodel:', mod_dict['args'], flush=True)
 exp.run()
 exp.save_experiment(su.SAVE_DIR)
 print('saved', exp.file_suffix(), 'to', su.SAVE_DIR, flush=True)
+
+os.makedirs(os.path.join(sweep, 'done'), exist_ok=True)     # for jobs/sweep_status.py
+open(os.path.join(sweep, 'done', str(idx)), 'w').close()
