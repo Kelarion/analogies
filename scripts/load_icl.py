@@ -1,10 +1,6 @@
 # %% Setup
-# CODE_DIR = 'C:/Users/mmall/OneDrive/Documents/github/analogies/src'
 
-import os, sys
 from functools import partial
-
-# sys.path.append(CODE_DIR)
 
 import numpy as np
 import matplotlib.pyplot as plt

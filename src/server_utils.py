@@ -1120,9 +1120,16 @@ def load_experiments(task_args, model_args, SAVE_DIR=None,
     prm = {}
     for k in keys:
         col = [{**r['task_args'], **r['model_args']}.get(k, None) for r in records]
-        arr = np.array(col)
-        if arr.dtype.name == 'object':
-            arr = np.array([stringify(v) for v in col])
+        try:
+            arr = np.array(col)
+            if arr.dtype.name == 'object':
+                arr = np.array([stringify(v) for v in col])
+        except ValueError:
+            # values of different shapes across runs (e.g. a list-valued field that some runs
+            # don't have): numpy>=1.24 won't stack them, so keep one entry per run
+            arr = np.empty(len(col), dtype=object)
+            for i, v in enumerate(col):
+                arr[i] = stringify(v)
         prm[k] = arr
 
     if verbose:
