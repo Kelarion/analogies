@@ -1,10 +1,10 @@
 # %% Setup
-CODE_DIR = 'C:/Users/mmall/OneDrive/Documents/github/analogies/src'
+# CODE_DIR = 'C:/Users/mmall/OneDrive/Documents/github/analogies/src'
 
 import os, sys
 from functools import partial
 
-sys.path.append(CODE_DIR)
+# sys.path.append(CODE_DIR)
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -21,6 +21,7 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 task_args = {'task': RelationTask,
              # 'k': su.Set([8, 16]),
+             'd': 2,
              }
 
 mod_args = {'model': ICLModel,
@@ -35,35 +36,37 @@ isw.varying(prm);         # what differs between the runs, and over what values
 # %% Which runs: fix everything except the grid (and line) dimensions
 
 these = {}
-these |= {'explicitness': 3}
-these |= {'describe_task': True}      # describe_format and answer_only go with it
-# these |= {'hint': False}
-# these |= {'k': 8}
+these |= {'explicitness': [0,1,2,3]}
+# these |= {'describe_task': True}      # describe_format and answer_only go with it
+these |= {'hint': False}
+these |= {'k': 8}
 # these |= {'num_trials': (None, None)}                 # a list-valued field as a tuple
 # these |= {'num_trials': [(64, 64), (128, 128)]}       # a list: any of these
 # these |= {'k': lambda k: k >= 8}
 
-rows = 'k'
-# rows = 'explicitness'
+# rows = 'k'
+rows = 'explicitness'
 # rows = None
 
-cols = 'hint'
-# cols = 'num_trials'
+# cols = 'hint'
+cols = 'num_trials'
 # cols = None
 
-lines = 'num_trials'
+# lines = 'num_trials'
 # lines = 'explicitness'
+lines = 'describe_task'
 # lines = None
 
-refs = {'uniform': uniform_block,
+refs = {
+        'uniform': uniform_block,
         # 'true': true_dist,
-        # 'bigram': partial(ngram, order=1, alpha=0.5),
+        'bigram': partial(ngram, order=2, alpha=0.5),
         }
 
 kl = True                # -KL(Y || model) instead of -cross-entropy (0 = the true distribution)
 # kl = False
 
-# isw.varying(prm, isw.select(prm, these));     # what's left varying after `these`
+isw.varying(prm, isw.select(prm, these));     # what's left varying after `these`
 
 # %% Held-out log-likelihood of each block
 
@@ -75,6 +78,6 @@ plt.show()
 these_icl = these
 # these_icl = these | {lines: (None, None)}
 
-isw.plot_runs(records, prm, rows=rows, cols=cols, where=these_icl, n_trl=50, refs=refs,
+isw.plot_runs(records, prm, rows=rows, cols=cols, where=these_icl, n_trl=4000, refs=refs,
               kl=kl)
 plt.show()
