@@ -57,16 +57,36 @@ def sacct(job_ids):
     info = {}
     for jid in job_ids:
         out = subprocess.run(['sacct', '-j', jid, '-n', '-P', '-X',
-                              '--format=JobID,State,NodeList,Start'],
+                              '--format=JobID,State,NodeList,Start,ExitCode'],
                              capture_output=True, text=True).stdout
         for line in out.splitlines():
-            job, state, node, start = (line.split('|') + [''] * 4)[:4]
+            job, state, node, start, code = (line.split('|') + [''] * 5)[:5]
             if '_' not in job:
                 continue
             for i in expand(job.split('_', 1)[1]):
                 info[i] = {'state': state.split()[0], 'node': None if node in ('', 'None assigned') else node,
-                           'start': None if start in ('', 'Unknown', 'None') else start}
+                           'start': None if start in ('', 'Unknown', 'None') else start,
+                           'exit': code or None}
     return info
+
+
+def find_job_ids(d):
+    """The array jobs that ran this sweep's job script, for sweeps that didn't record them:
+    from Slurm's accounting (the submit command names the script), else from the queue."""
+    script = os.path.join(d, 'job_script.sh')
+    ids = []
+    out = subprocess.run(['sacct', '-u', os.environ.get('USER', ''), '-S', 'now-60days', '-X',
+                          '-n', '-P', '--format=JobID,SubmitLine'],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        job, _, submit = line.partition('|')
+        if script in submit:
+            ids.append(job.split('_')[0])
+    if not ids:                                   # older Slurm without SubmitLine: live jobs only
+        out = subprocess.run(['squeue', '--me', '-h', '-o', '%F|%o'],
+                             capture_output=True, text=True).stdout
+        ids = [job for job, _, cmd in (l.partition('|') for l in out.splitlines()) if script in cmd]
+    return sorted(set(ids), key=int)
 
 
 def from_log(path):
@@ -95,13 +115,18 @@ def status(d):
     m = re.search(r'--array=\S*%(\d+)', script)
     ids_file = os.path.join(d, 'jobids')
     job_ids = open(ids_file).read().split() if os.path.exists(ids_file) else []
+    if not job_ids:                               # a sweep from before job ids were recorded
+        job_ids = find_job_ids(d)
+        if job_ids:
+            with open(ids_file, 'w') as f:
+                f.write('\n'.join(job_ids) + '\n')
     slurm = sacct(job_ids) if job_ids else {}
 
     tasks = {}
     for i in range(n_tot):
         log = os.path.join(d, 'logs', f'{i}.out')
         t = {'done': os.path.exists(os.path.join(d, 'done', str(i))), 'state': None,
-             'node': None, 'start': None, 'cause': None, 'detail': None}
+             'node': None, 'start': None, 'exit': None, 'cause': None, 'detail': None}
         if not t['done'] and os.path.exists(log):      # sweeps from before the markers
             with open(log, errors='replace') as f:
                 t['done'] = any(line.startswith('saved ') for line in f)
@@ -114,7 +139,12 @@ def status(d):
                 t['cause'] = None
             elif t['cause'] is None:
                 t['cause'] = 'no log' if not os.path.exists(log) else 'ended without an error'
+                if t['state']:
+                    t['detail'] = f"Slurm: {t['state']}, exit code {t.get('exit')}"
         t['transient'] = t['cause'] in TRANSIENT
+        if not job_ids and t['cause'] in ('no log', 'ended without an error'):
+            t['transient'] = False                    # might be queued or running: don't rerun
+            t['detail'] = 'no Slurm record found: it may still be queued or running'
         tasks[i] = t
     return {'sweep': d, 'n_tot': n_tot, 'max_parallel': int(m.group(1)) if m else None,
             'job_ids': job_ids, 'tasks': tasks}
@@ -122,4 +152,3 @@ def status(d):
 
 if __name__ == '__main__':
     print(json.dumps(status(sweep_dir(sys.argv[1] if len(sys.argv) > 1 else ''))))
-    
