@@ -572,22 +572,67 @@ class FSA(Automaton):
         probs = probs[:-1] + rows + [eos]
         return (toks, probs, self.decode(toks)) if tree else (toks, probs)
 
-    def sample_holdout(self, rng, unit="pair"):
+    def holdout_edges(self, symmetric=False):
+        """The node pairs (u, v) whose Edge(u, v) -- with Edge(v, u) too if
+        symmetric -- can be held out without splitting a weakly or strongly
+        connected component of the graph (its edges left after forbid). A weak
+        component splits only if {u, v} is a bridge of the undirected graph
+        (nx.bridges) and no edge between u and v is left; a strong one only if
+        a removed edge x -> y inside it leaves no other path from x to y,
+        checked edge by edge (networkx has no directed bridges). Cached."""
+        cache = self.__dict__.setdefault("_holdout_edges", {})
+        if symmetric not in cache:
+            n = len(self.states)
+            pairs = {(i, int(j)) for i in range(n) for j in self.out_j[i]}
+            D = nx.DiGraph()
+            D.add_nodes_from(range(n))
+            D.add_edges_from(pairs)
+            U = nx.Graph()
+            U.add_nodes_from(range(n))
+            U.add_edges_from((i, j) for i, j in pairs if i != j)
+            bridges = {frozenset(e) for e in nx.bridges(U)}
+            scc = {x: k for k, comp in enumerate(nx.strongly_connected_components(D))
+                   for x in comp}
+            safe = set()
+            for i, j in pairs:
+                gone = {(i, j)} | ({(j, i)} & pairs if symmetric else set())
+                if i != j:
+                    if frozenset((i, j)) in bridges and (j, i) not in pairs - gone:
+                        continue                                 # splits a weak component
+                    view = nx.restricted_view(D, [], list(gone))
+                    if any(x != y and scc[x] == scc[y] and not nx.has_path(view, x, y)
+                           for x, y in gone):
+                        continue                                 # splits a strong component
+                safe.add((self.states[i], self.states[j]))
+            cache[symmetric] = safe
+        return cache[symmetric]
+
+    def sample_holdout(self, rng, unit="pair", symmetric=False, keep_connected=False):
         """A random unit to hold out. unit="edge": Edge(u, v), every edge
         u -> v whatever its action, for a transition u -a-> v drawn uniformly
         among those left (so node pairs joined by more actions come up more
-        often). unit="pair": a (node, action) pair, a node uniformly among
-        those with an action left (so never a sink), then one of its actions
-        uniformly."""
+        often). With keep_connected, only among the transitions whose Edge
+        (and its reverse, if symmetric) leaves every weakly and strongly
+        connected component whole (see holdout_edges). unit="pair": a (node,
+        action) pair, a node uniformly among those with an action left (so
+        never a sink), then one of its actions uniformly."""
         if unit == "edge":
             es = list(dict.fromkeys((i, int(a), int(j)) for i in range(len(self.states))
                                     for a, j in zip(self.out_a[i], self.out_j[i])))
+            if keep_connected:
+                safe = self.holdout_edges(symmetric)
+                es = [(i, a, j) for i, a, j in es if (self.states[i], self.states[j]) in safe]
+                if not es:
+                    raise ValueError("every edge's hold-out splits a connected component "
+                                     "(keep_connected=False allows it)")
             if not es:
                 raise ValueError("no edge to hold out")
             i, _, j = es[rng.integers(len(es))]
             return Edge(self.states[i], self.states[j])
         if unit != "pair":
             raise ValueError(f"unit must be 'pair' or 'edge', not {unit!r}")
+        if keep_connected:
+            raise ValueError("keep_connected needs unit='edge'")
         nodes = [i for i in range(len(self.states)) if len(self.out_a[i])]
         if not nodes:
             raise ValueError("no node has an action to hold out")
@@ -1323,7 +1368,8 @@ def random_relation(k, r=1, degree=2, density=None, seed=None, functional=False)
     return mod.sample(rng=np.random.default_rng(seed))
 
 
-def spatial_relation(k, d, commutes=0, total=False, degree=None, inverse=False, seed=None):
+def spatial_relation(k, d, commutes=0, total=False, degree=None, inverse=False, 
+                     connectedness='weak', seed=None):
     
     rels = ['R' + str(i) for i in range(d)]
     items = [(r, 'L' + str(i)) for i, r in enumerate(rels)] if inverse else rels
@@ -1335,7 +1381,7 @@ def spatial_relation(k, d, commutes=0, total=False, degree=None, inverse=False, 
             for B in groups[i + 1:]:
                 properties += [mln.commute(a, b, w=commutes) for a in A for b in B]
     
-    mod = mln.MLN(k, properties, degree=degree, constraint='weak')
+    mod = mln.MLN(k, properties, degree=degree, constraint=connectedness)
     
     return mod.sample(rng=np.random.default_rng(seed), method='tempering')
 

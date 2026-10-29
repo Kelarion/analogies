@@ -33,7 +33,7 @@ isw.varying(prm);         # what differs between the runs, and over what values
 
 these = {}
 these |= {'explicitness': [0,1,2,3]}
-# these |= {'describe_task': True}      # describe_format and answer_only go with it
+these |= {'describe_task': True}      # describe_format and answer_only go with it
 these |= {'hint': False}
 these |= {'k': 8}
 # these |= {'num_trials': (None, None)}                 # a list-valued field as a tuple
@@ -41,16 +41,18 @@ these |= {'k': 8}
 # these |= {'k': lambda k: k >= 8}
 
 # rows = 'k'
-rows = 'explicitness'
-# rows = None
+# rows = 'explicitness'
+rows = None
 
+cols = 'explicitness'
 # cols = 'hint'
-cols = 'num_trials'
+# cols = 'num_trials'
 # cols = None
+# cols = 'describe_task'
 
-# lines = 'num_trials'
+lines = 'num_trials'
 # lines = 'explicitness'
-lines = 'describe_task'
+# lines = 'describe_task'
 # lines = None
 
 refs = {
@@ -62,7 +64,7 @@ refs = {
 kl = True                # -KL(Y || model) instead of -cross-entropy (0 = the true distribution)
 # kl = False
 
-isw.varying(prm, isw.select(prm, these));     # what's left varying after `these`
+# isw.varying(prm, isw.select(prm, these));     # what's left varying after `these`
 
 # %% Held-out log-likelihood of each block
 
