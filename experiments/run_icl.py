@@ -32,20 +32,21 @@ task_args = {'task': RelationTask,
              'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
             #  'num_trials': [2*[4*k**2], 4*[2*k**2], 8*[k**2]],
-             'num_trials': [[1, 1]],
-             'length': 500,
+             'num_trials': [[1, 1, 1, 1, 1, 1]],
+            #  'num_trials': 4*[2*k**2],
+             'length': 100,
              'samps': 20,
              'holdout': True, 
-             'max_tok': np.inf,
+             'max_tok': np.inf, 
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
             #  'explicitness': [0, 1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
-            'explicitness': 0,
+             'explicitness': 3,
              # 'explicitness': 0,
              'describe_format': True,
-            #  'describe_format': (True, False),
+            #  'describe_format': (True, False), 
             #  'describe_task': (True, False),
-            'describe_task': True,
-             'describe_vocab': False,
+             'describe_task': True,
+             'describe_vocab': True,
             #  'hint': [False, True],
             #  'answer_only': False,
              'seed': 0,
@@ -59,14 +60,16 @@ task_args = {'task': RelationTask,
 
 mod_args = {'model': ICLModel,
             'model_name': 'Qwen/Qwen3.8-27B',
-            # 'mode': 'dialogue',
-            'mode': 'raw',
+            'mode': 'dialogue',
+            # 'mode': 'raw',
+            # 'mode': 'single',
             # 'think': [True, False],
             'think': False,
             'k_hide': 1,
             # 'effort': 'low',
-            'seed': 0}
-
+            'seed': 0,
+            'equiv': True,
+            }
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
 # (pickles copied to the cluster over ssh) or on the cluster; push/pull first either way.
@@ -94,4 +97,25 @@ for ax, rec in zip(axs[0], records):
              title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
 plt.tight_layout()
 plt.show()
+
+#%%
+from functools import partial
+from icl_utils import true_dist, uniform_block, ngram
+
+refs = {
+        'uniform': uniform_block,
+        # 'true': true_dist,
+        'bigram': partial(ngram, order=2, alpha=1),
+        }
+
+records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
+fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
+for ax, rec in zip(axs[0], records):
+    m, a = rec['metrics'], rec['model_args']
+    plot_icl(ax, m['logp_ctx'], m['data'], n_trl=1, k_hide=205, kl=True,
+             title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
+plt.tight_layout()
+plt.show()
+
+#%%
 
