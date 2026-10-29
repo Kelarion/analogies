@@ -75,6 +75,8 @@ mod_args = {'model': ICLModel,
 # %% Or: run here, e.g. in an interactive session (each model is loaded once)
 exps, _ = su.get_all_experiments(task_args, mod_args)
 exps.sort(key=lambda e: e['model_args']['args'].get('model_name', ''))
+
+# %%
 for e in exps:
     exp = sxp.Experiment(e['task_args']['task'](**e['task_args']['args']),
                          e['model_args']['model'](**e['model_args']['args']))

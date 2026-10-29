@@ -203,7 +203,7 @@ class AutomatonTask(GrammarTask):
     max_redraws: how many draws to try before giving up."""
 
     holdout: bool = False
-    symmetric: bool = False
+    symmetric: bool = True
     holdout_unit: str = "edge"          # FSA only: "edge" or "pair"
     keep_connected: bool = True         # FSA edges only
     max_redraws: int = 1000
