@@ -89,6 +89,7 @@ class ICLModel(sxp.Model):
     effort_without_thinking: bool = False
     thinking_budget: int = 4000
     tokens: str = 'nouns'
+    delim: str = ','
     equiv: bool = False
     prepend_bos: bool = False
     seed: int = None
@@ -109,7 +110,7 @@ class ICLModel(sxp.Model):
                         'data': dict(data, blocks=blocks, X=X, prompt=prompt)}
         for i, blks in enumerate(blocks):
             task_toks = rng.permutation(pool)[:n_tok]
-            task_toks[0] = lm.bridge.to_single_token(',')
+            task_toks[0] = lm.bridge.to_single_token(self.delim)
 
             system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks)
             lp, a, ids = lm.run_trial(
