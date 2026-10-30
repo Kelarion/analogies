@@ -1,22 +1,34 @@
 """
 The tokens that task symbols are written as.
 
-A Vocabulary is a pool of token ids for one tokenizer, chosen by a spec, together with the
-delimiter and the scoring equivalence (TokenEquivalence) that go with it. ICLModel makes one
-from its `tokens`, `delim` and `equiv` fields and asks it for each sample's assignment of
-symbols to tokens:
+Two objects:
 
-    vocab = get_vocabulary('words+zipf=3:4+noverb', tokenizer)
-    vocab.size, vocab.table           # how many tokens; their features, one row each
-    task_toks = vocab.assign(V, rng)  # ids; task_toks[0] is the delimiter
+  Vocabulary  what to draw: a base pool and filters on it. A plain frozen dataclass that knows
+              nothing of tokenizers, so it is the argument ICLModel takes (as `tokens`), and
+              is saved, hashed and compared like any other value:
+                  Vocabulary('words', content=True, zipf=(3, 4), noverb=True)
+  TokenPool   what that is for one tokenizer: the token ids, the delimiter and the scoring
+              equivalence (TokenEquivalence). ICLModel gets one from get_pool() and asks it for
+              each sample's assignment of symbols to tokens:
+                  pool = get_pool(vocab, tokenizer, delim=',', equiv=True)
+                  pool.size, pool.table            # how many tokens; their features, one row each
+                  task_toks = pool.assign(V, rng)  # ids; task_toks[0] is the delimiter
+              It needs only the tokenizer, so pools can be built and inspected without weights.
 
-It needs only the tokenizer, so pools can be built and inspected without loading weights.
+A Vocabulary puts itself in one canonical form when it is made (ranges as float tuples, a
+space setting that is the pool's own form dropped), so equal vocabularies are equal, hash
+alike and have the same repr, which is what a run's folder digest is made from. Nothing
+rewrites it afterwards, so what a run saves is what was passed. Its repr lists only the
+fields that differ from their defaults, so fields added later (with defaults) leave existing
+runs' digests alone.
 
-A spec is a base pool and modifiers joined by '+', as prompt specs are. Specs are put in a
-canonical form (canonical()), so 'words+noverb+zipf=3:4' and 'words + zipf=3:4 + noverb' are
-the same run.
+A base pool's name alone can also be passed as a string ('nouns', the default, and 'chars'
+are how runs before Vocabulary were saved). So are the '+'-joined spec strings that a few
+runs were saved with ('words+content+space'), but only in the canonical form canonical()
+gives them, the form they were saved in: anything else is rejected, since two spellings of
+one spec would save as two different runs.
 
-  base pools
+  base pools (pool)
     nouns       top-1000-nouns.txt, in file order, as ' word'      [as before, less a duplicate]
     chars       ASCII letters, then digits, as bare characters       [as before]
     words       English words in wordfreq's frequency order, lowercase and alphabetic,
@@ -25,42 +37,41 @@ the same run.
                 or <|im_end|>), nothing that decodes to partial UTF-8, whitespace, control
                 characters or the punctuation in STRUCTURAL, and nothing that fails to
                 re-encode to itself. One token per equivalence class: ' cat' rather than 'cat'
-                (unless nospace). In token id order.
+                (unless space=False). In token id order.
 
   form
-    space       with a leading space (the default for nouns and words)
-    nospace     without (the default for chars)
-                For nouns, words and chars these choose the form each word is written in;
-                for any, they keep only tokens of that form.
+    space       True: with a leading space (the default for nouns and words); False: without
+                (the default for chars). For nouns, words and chars this chooses the form each
+                word is written in; for any, None keeps both and True/False keep only that form.
     ascii       only tokens whose text is ASCII (mostly useful with any)
     content     no function words (NLTK's English stopwords: 'the', 'it', 'there', ...)
 
   frequency (wordfreq's Zipf scale: log10 of occurrences per billion words, so 3 is once
   per million and 6 once per thousand)
-    zipf=lo:hi  Zipf frequency in [lo, hi), so bands like 3:4, 4:5 tile
-    rank=a:b    of the tokens left by everything else, those ranked a..b-1 by frequency
-                (0 the most frequent), e.g. rank=0:200 or rank=500:1000
-                For tokens that are word pieces rather than words (in any), the Zipf
-                frequency is that of the piece read as a word ('ing'), so treat it loosely.
+    zipf=(lo, hi)   Zipf frequency in [lo, hi), so bands like (3, 4), (4, 5) tile
+    rank=(a, b)     of the tokens left by everything else, those ranked a..b-1 by frequency
+                    (0 the most frequent), e.g. rank=(0, 200) or rank=(500, 1000)
+                    For tokens that are word pieces rather than words (in any), the Zipf
+                    frequency is that of the piece read as a word ('ing'), so treat it loosely.
 
   lexical semantics, from WordNet. Each sense of a word is weighted by its SemCor count
   plus one (so with no counts, every sense counts the same); proper names and abbreviations
-  are left out, and words WordNet doesn't know fail these filters. They don't filter on part of speech unless
-  asked (concrete=0.8 alone keeps ' great', whose rare noun sense is a person), so pair
-  them: words+content+ndom=0.8+concrete=0.8 for concrete nouns.
-    noverb          no verb senses at all
-    ndom=lo:hi      noun dominance: the share of the word's weight in noun senses, in
-                    [lo, hi]. ndom=1 is noun-only, ndom=0.8 mostly a noun.
-    concrete=lo:hi  of the noun weight, the share in physical entities (senses under
-                    physical_entity.n.01) rather than abstractions, in [lo, hi].
-                    concrete=0.8 for concrete nouns, concrete=:0.2 for abstract ones.
+  are left out, and words WordNet doesn't know fail these filters. They don't filter on part
+  of speech unless asked (concrete=0.8 alone keeps ' great', whose rare noun sense is a
+  person), so pair them: content=True, ndom=0.8, concrete=0.8 for concrete nouns.
+    noverb             no verb senses at all
+    ndom=(lo, hi)      noun dominance: the share of the word's weight in noun senses, in
+                       [lo, hi]. ndom=1 is noun-only, ndom=0.8 mostly a noun.
+    concrete=(lo, hi)  of the noun weight, the share in physical entities (senses under
+                       physical_entity.n.01) rather than abstractions, in [lo, hi].
+                       concrete=0.8 for concrete nouns, concrete=(None, 0.2) for abstract ones.
 
-  A range is lo:hi with either end left open ('3:', ':0.2'), or one number, meaning that
-  number and up.
+  A range is (lo, hi) with None for an open end, or one number, meaning that number and up.
+  ('lo:hi' strings work too.)
 
-Modifiers filter the base pool but never reorder it, so a draw depends only on which tokens
-survive. 'chars' gives exactly the ids, in the same order, that ICLModel's old TOKEN_POOLS did,
-and assign() draws as before, so seeded runs reproduce. 'nouns' does too, except that the old
+Filters never reorder the base pool, so a draw depends only on which tokens survive.
+'chars' gives exactly the ids, in the same order, that ICLModel's old TOKEN_POOLS did, and
+assign() draws as before, so seeded runs reproduce. 'nouns' does too, except that the old
 pool held ' no' twice (the file lists it twice), which could give two symbols the same word;
 it now holds it once, so a seed draws different nouns than it used to.
 
@@ -74,6 +85,7 @@ different assign(), and the pool and features here are what it would draw from.
 import os
 import string
 import unicodedata
+from dataclasses import dataclass, fields
 from functools import lru_cache
 
 import numpy as np
@@ -116,12 +128,22 @@ def parse(spec):
 
 
 def _range(name, val):
+    """(lo, hi) from 'lo:hi' (either end open), a (lo, hi) pair (None for an open end), or one
+    number (that number and up); ints for rank, floats otherwise."""
     typ = int if name == 'rank' else float
-    lo, sep, hi = val.partition(':')
+    if isinstance(val, str):
+        lo, sep, hi = val.partition(':')
+        lo, hi = lo.strip() or None, (hi.strip() or None) if sep else None
+    elif isinstance(val, (tuple, list)):
+        if len(val) != 2:
+            raise ValueError(f"{name}={val!r}: a range is (lo, hi)")
+        lo, hi = val
+    else:
+        lo, hi = val, None
     try:
-        lo = typ(lo) if lo.strip() else None
-        hi = typ(hi) if sep and hi.strip() else None
-    except ValueError:
+        lo = None if lo is None else typ(lo)
+        hi = None if hi is None else typ(hi)
+    except (TypeError, ValueError):
         raise ValueError(f"bad range {val!r} for {name}") from None
     if lo is None and hi is None:
         raise ValueError(f"{name}={val!r} leaves both ends open")
@@ -131,17 +153,91 @@ def _range(name, val):
 
 
 def canonical(spec):
-    """The spec written one way (modifiers sorted, numbers written alike), so equal specs
-    hash alike. A spec with no modifiers comes back unchanged: canonical('nouns') == 'nouns'."""
+    """A spec string written one way (modifiers sorted, numbers written alike): the form
+    the runs saved with spec strings have. canonical('nouns') == 'nouns'."""
     base, mods = parse(spec)
     num = lambda x: '' if x is None else (str(x) if isinstance(x, int) else f'{x:.10g}')
     fmt = lambda k, v: k if v is True else f'{k}={num(v[0])}:{num(v[1])}'
     return '+'.join([base] + [fmt(k, mods[k]) for k in sorted(mods)])
 
 
-def base_pool(spec):
-    """The spec's base pool, e.g. for prompts that say what the tokens are."""
-    return parse(spec)[0]
+def base_pool(tokens):
+    """The base pool's name, e.g. for prompts that say what the tokens are."""
+    return as_vocabulary(tokens).pool
+
+
+@dataclass(frozen=True, repr=False)
+class Vocabulary:
+    """What to draw task tokens from: a base pool and filters on it (see the module
+    docstring for each field). Knows nothing of tokenizers; get_pool() makes it concrete.
+    Canonical once made, so equal vocabularies are equal, hash alike and have one repr."""
+    pool: str = 'nouns'
+    space: bool = None
+    ascii: bool = False
+    content: bool = False
+    noverb: bool = False
+    zipf: tuple = None
+    rank: tuple = None
+    ndom: tuple = None
+    concrete: tuple = None
+
+    def __post_init__(self):
+        put = lambda k, v: object.__setattr__(self, k, v)
+        if self.pool not in POOLS:
+            raise ValueError(f"unknown token pool {self.pool!r}; pools are {POOLS}")
+        if self.space is not None:
+            space = bool(self.space)
+            if self.pool != 'any' and space == (self.pool != 'chars'):
+                space = None                                # the pool's own form
+            put('space', space)
+        for k in ('ascii', 'content', 'noverb'):
+            put(k, bool(getattr(self, k)))
+        for k in RANGES:
+            if getattr(self, k) is not None:
+                put(k, _range(k, getattr(self, k)))
+
+    def __repr__(self):
+        args = [repr(self.pool)] + [f'{f.name}={getattr(self, f.name)!r}' for f in fields(self)[1:]
+                                    if getattr(self, f.name) != f.default]
+        return f"{type(self).__name__}({', '.join(args)})"
+
+    @classmethod
+    def from_spec(cls, spec):
+        """The Vocabulary a '+'-joined spec string describes ('words+zipf=3:4+noverb')."""
+        base, mods = parse(spec)
+        kw = {k: v for k, v in mods.items() if k not in ('space', 'nospace')}
+        if 'space' in mods or 'nospace' in mods:
+            kw['space'] = 'space' in mods
+        return cls(base, **kw)
+
+    @property
+    def mods(self):
+        """The filters as parse() gives them: {flag: True, range: (lo, hi)}."""
+        out = {k: True for k in ('ascii', 'content', 'noverb') if getattr(self, k)}
+        out.update({k: getattr(self, k) for k in RANGES if getattr(self, k) is not None})
+        if self.space is not None:
+            out['space' if self.space else 'nospace'] = True
+        return out
+
+
+def as_vocabulary(tokens):
+    """A Vocabulary from a Vocabulary, a pool name or a spec string."""
+    if isinstance(tokens, Vocabulary):
+        return tokens
+    if isinstance(tokens, str):
+        return Vocabulary.from_spec(tokens)
+    raise TypeError(f"tokens must be a Vocabulary or a pool name, not {type(tokens).__name__}")
+
+
+def check_tokens(tokens):
+    """Raise unless `tokens` is a valid argument as given: a Vocabulary, a pool name, or a
+    spec string in the canonical form the runs saved with spec strings have (anything else
+    would save under a spelling that loading has to repeat exactly)."""
+    vocab = as_vocabulary(tokens)
+    if isinstance(tokens, str) and '+' in tokens and tokens != canonical(tokens):
+        raise ValueError(f"spec strings are only accepted in their saved form ({canonical(tokens)!r}); "
+                         f"for new runs pass tokens={vocab!r}")
+    return vocab
 
 
 # -- word features --------------------------------------------------------------------
@@ -293,18 +389,19 @@ class TokenEquivalence:
 
 # -- the vocabulary ------------------------------------------------------------------------
 
-class Vocabulary:
+class TokenPool:
     """
-    The pool of token ids a spec picks for a tokenizer (see the module docstring), plus
+    The token ids a Vocabulary picks for a tokenizer (see the module docstring), plus
       delim_id   the delimiter's id (task symbol 0)
       equiv      a TokenEquivalence to score with, or None
     The pool never holds the delimiter or anything equivalent to it, nor two tokens
     equivalent to each other, so any draw from it can be scored with equiv.
     """
 
-    def __init__(self, spec, tokenizer, delim=',', equiv=False):
-        self.spec = canonical(spec)
-        self.base, self.mods = parse(self.spec)
+    def __init__(self, vocab, tokenizer, delim=',', equiv=False):
+        self.vocab = as_vocabulary(vocab)
+        self.spec = repr(self.vocab)
+        self.base, self.mods = self.vocab.pool, self.vocab.mods
         self.tokenizer = tokenizer
         self.strs = decoded(tokenizer)
         self.equiv = TokenEquivalence(tokenizer) if equiv else None
@@ -317,7 +414,7 @@ class Vocabulary:
 
     def __repr__(self):
         show = ', '.join(repr(self.strs[i]) for i in self.ids[:6])
-        return f"Vocabulary({self.spec!r}, {self.size} tokens: {show}, ...)"
+        return f"TokenPool({self.spec}, {self.size} tokens: {show}, ...)"
 
     @property
     def size(self):
@@ -342,7 +439,7 @@ class Vocabulary:
         of the whole pool, its first n kept and the first of those replaced by the
         delimiter), so a seed gives the same assignment as before."""
         if n > self.size:
-            raise ValueError(f"the task needs {n} tokens but {self.spec!r} has only {self.size}")
+            raise ValueError(f"the task needs {n} tokens but {self.spec} has only {self.size}")
         toks = rng.permutation(self.ids)[:n]
         toks[0] = self.delim_id
         return toks
@@ -359,7 +456,7 @@ class Vocabulary:
         ids = self._dedupe(ids)
         ids = self._filter(np.array(ids, dtype=int))
         if not len(ids):
-            raise ValueError(f"no tokens left in {self.spec!r}")
+            raise ValueError(f"no tokens left in {self.spec}")
         return ids
 
     def _space(self, default):
@@ -475,12 +572,14 @@ def _clean(s):
 
 # -- cache ------------------------------------------------------------------------------
 
-_VOCABS = {}
+_POOLS = {}
 
 
-def get_vocabulary(spec, tokenizer, delim=',', equiv=False):
-    """A Vocabulary, built the first time it is asked for with this tokenizer."""
-    key = (tokenizer.name_or_path, len(tokenizer), canonical(spec), delim, bool(equiv))
-    if key not in _VOCABS:
-        _VOCABS[key] = Vocabulary(spec, tokenizer, delim, equiv)
-    return _VOCABS[key]
+def get_pool(tokens, tokenizer, delim=',', equiv=False):
+    """The TokenPool for a Vocabulary (or pool name) and tokenizer, built the first time
+    it is asked for."""
+    vocab = as_vocabulary(tokens)
+    key = (tokenizer.name_or_path, len(tokenizer), vocab, delim, bool(equiv))
+    if key not in _POOLS:
+        _POOLS[key] = TokenPool(vocab, tokenizer, delim, equiv)
+    return _POOLS[key]

@@ -223,7 +223,7 @@ def needs_prefix(spec, facts):
 def render(spec, facts, mode, pool, finals):
     """The text of a prompt for one sample:
         {'system': str or None, 'blocks': [text at the start of each block]}
-    pool    the model's `tokens`: a vocabulary spec, whose base pool keys POOLS
+    pool    the name of the model's base token pool (vocabulary.base_pool), a key of POOLS
     finals  for each block, (the words shown of its final trial, how many are held out)
     """
     facts = derive(facts)
@@ -252,8 +252,7 @@ def _fields(facts, pool, prefix, n_target):
         missing = "next word"
     else:
         missing = f"{'last' if facts['trial_len'] is not None else 'next'} {n_target} words"
-    return dict(facts, pool=POOLS.get(pool.split('+')[0].strip(), 'arbitrary words'),
-                prefix=' '.join(prefix),
+    return dict(facts, pool=POOLS.get(pool, 'arbitrary words'), prefix=' '.join(prefix),
                 target='word' if n_target == 1 else f'{n_target} words', missing=missing)
 
 
@@ -282,4 +281,3 @@ def _ordinal(n):
 def _brief(facts):
     keys = ('structure', 'shows', 'trial_len', 'n_blocks', 'share_toks')
     return ', '.join(f'{k}={facts.get(k)!r}' for k in keys)
-    

@@ -9,7 +9,7 @@ and sweeps are the usual task_args / mod_args dicts. Everything about the run is
 of ICLModel or of the task (so it is hashed into the save name and recorded in the arguments
 sidecar). The prompt belongs to the task, which tailors it (GrammarTask.prompt, prompts.py) and
 passes it on as data['prompt']; the tokens the task's symbols are written as are given by
-a vocabulary.py spec.
+a vocabulary.Vocabulary (also importable from icl_utils).
 """
 import gc
 import os
@@ -62,11 +62,12 @@ class ICLModel(sxp.Model):
     effort           reasoning_effort passed to the chat template, None to leave it out
     effort_without_thinking  add the template's effort instruction even when think=False
     thinking_budget  max reasoning tokens
-    tokens           the tokens the task symbols are written as: a vocabulary.py spec, a
-                     base pool ('nouns', 'chars', 'words', 'any') and '+'-joined modifiers
-                     for frequency and lexical semantics, e.g. 'words+zipf=3:4+noverb'.
-                     Kept in canonical form (vocabulary.canonical). Its base pool also
-                     keys prompts.POOLS, for prompts that say what the words are.
+    tokens           the tokens the task symbols are written as: a vocabulary.Vocabulary,
+                     a base pool and filters on frequency and lexical semantics, e.g.
+                     Vocabulary('words', content=True, zipf=(3, 4)); or just a base pool's
+                     name ('nouns', 'chars', 'words', 'any'). Saved as given (see vocabulary's
+                     docstring for the spec strings some earlier runs used). Its base pool
+                     also keys prompts.POOLS, for prompts that say what the words are.
     delim            the delimiter (task symbol 0); never in the vocabulary
     equiv            score with TokenEquivalence (e.g. ' cat' and 'cat' together)
     prepend_bos      start 'raw' prompts with the BOS token
@@ -80,14 +81,14 @@ class ICLModel(sxp.Model):
     effort: str = None
     effort_without_thinking: bool = False
     thinking_budget: int = 4000
-    tokens: str = 'nouns'
+    tokens: object = 'nouns'
     delim: str = ','
     equiv: bool = False
     prepend_bos: bool = False
     seed: int = None
 
     def __post_init__(self):
-        self.tokens = vocabulary.canonical(self.tokens)   # checks it; before args are recorded
+        vocabulary.check_tokens(self.tokens)     # checked, never rewritten: saved as given
         super().__post_init__()
 
     def fit(self, blocks, X, prompt=None, **data):
@@ -96,16 +97,16 @@ class ICLModel(sxp.Model):
             raise ValueError("the hint names the start of each final trial, so it needs k_show > 0")
         lm = get_lm(self.model_name, self.prepend_bos)
         rng = np.random.default_rng(self.seed)
-        vocab = vocabulary.get_vocabulary(self.tokens, lm.tokenizer, self.delim, self.equiv)
+        pool = vocabulary.get_pool(self.tokens, lm.tokenizer, self.delim, self.equiv)
         n_tok = len(np.unique(np.concatenate(X)))
 
         template_kwargs = {} if self.effort is None else {'reasoning_effort': self.effort}
-        equiv = vocab.equiv
+        equiv = pool.equiv
 
         self.metrics = {'logp_ctx': [], 'ans': [], 'task_tokens': [], 'prompts': [],
                         'data': dict(data, blocks=blocks, X=X, prompt=prompt)}
         for i, blks in enumerate(blocks):
-            task_toks = vocab.assign(n_tok, rng)
+            task_toks = pool.assign(n_tok, rng)
 
             system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks)
             lp, a, ids = lm.run_trial(
@@ -132,7 +133,7 @@ class ICLModel(sxp.Model):
             shown = ctx[cut[-1] + 1:] if len(cut) else ctx
             finals.append(([lm.tokenizer.decode([t]).strip() for t in task_toks[shown]],
                            len(comp)))
-        out = prompts.render(prompt['spec'], prompt['facts'], self.mode, self.tokens, finals)
+        out = prompts.render(prompt['spec'], prompt['facts'], self.mode,
+                             vocabulary.base_pool(self.tokens), finals)
         system = {'role': 'system', 'content': out['system']} if out['system'] else None
         return system, out['blocks']
-        

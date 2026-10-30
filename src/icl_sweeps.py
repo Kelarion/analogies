@@ -134,7 +134,7 @@ def _title(rows, cols, rv, cv):
 # -- plot_icl on a grid ------------------------------------------------------------------
 
 def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
-              perplexity=False, kl=False, size=(5, 4), title=None):
+              perplexity=False, kl=False, size=(5, 4), title=None, k_hide=None):
     """
     plot_icl for each run matching `where`, on a grid of `rows` x `cols` (parameter
     names; leave either out for a single row or column). Empty cells are hidden.
@@ -152,7 +152,8 @@ def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
                 continue
             rec = records[cells[rv, cv]]
             m, a = rec['metrics'], rec['model_args']
-            plot_icl(ax, m['logp_ctx'], m['data'], n_trl=n_trl, k_hide=a.get('k_hide'),
+            plot_icl(ax, m['logp_ctx'], m['data'], n_trl=n_trl, 
+                     k_hide=a.get('k_hide') if k_hide is None else k_hide,
                      title=title(rec) if title else _title(rows, cols, rv, cv),
                      show_assistant=(a.get('mode') != 'raw'), refs=refs,
                      perplexity=perplexity, kl=kl)

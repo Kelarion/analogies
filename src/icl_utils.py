@@ -9,7 +9,7 @@ import scipy.special as spc
 import matplotlib.pyplot as plt
 
 
-from vocabulary import TokenEquivalence    # moved there; still importable from here
+from vocabulary import TokenEquivalence, Vocabulary    # defined there; importable from here too
 
 
 def split_block(trials, k_show=None, k_hide=None):
