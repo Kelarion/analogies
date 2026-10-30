@@ -73,7 +73,7 @@ plt.show()
 
 # %% The trial-by-trial curves (plot_icl), one run per panel
 # Only rows and cols can vary here, so if `lines` is set, fix it to one value:
-these_icl = these
+# these_icl = these
 # these_icl = these | {lines: (None, None)}
 
 isw.plot_runs(records, prm, rows=rows, cols=cols, where=these_icl, n_trl=4000, refs=refs,

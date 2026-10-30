@@ -66,12 +66,14 @@ mod_args = {'model': ICLModel,
             # 'mode': 'raw',
             # 'mode': 'single',
             # 'think': [True, False],
-            'think': True,
+            'think': False,
             'k_hide': 1,
             'effort': 'low',
             'thinking_budget': 10_000,
             'seed': 0,
             'equiv': True,
+            'delim': ['\n', ','],
+            'tokens': ['any+space+ascii+content', 'words+space+content', 'chars+space'],
             }
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
@@ -115,10 +117,18 @@ records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
 fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
 for ax, rec in zip(axs[0], records):
     m, a = rec['metrics'], rec['model_args']
-    plot_icl(ax, m['logp_ctx'], m['data'], n_trl=1, k_hide=205, kl=True,
+    plot_icl(ax, m['logp_ctx'], m['data'], n_trl=15, k_hide=1, kl=True,
              title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
 plt.tight_layout()
 plt.show()
 
 #%%
+refs = {
+        'uniform': uniform_block,
+        # 'true': true_dist,
+        'bigram': partial(ngram, order=1, alpha=1),
+        }
 
+isw.plot_runs(records, prm, rows='tokens', cols='delim', n_trl=15, refs=refs,
+              kl=True)
+plt.show()
