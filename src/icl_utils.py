@@ -9,39 +9,7 @@ import scipy.special as spc
 import matplotlib.pyplot as plt
 
 
-class TokenEquivalence:
-    """Groups the tokenizer's vocabulary into classes of tokens that count as the same
-    output, so that cross-entropy doesn't penalise the model for picking the 'wrong'
-    surface form. Two tokens are equivalent when canon() maps their decoded strings to
-    the same thing; the default ignores leading/trailing whitespace. Pass e.g.
-    canon=lambda s: s.strip().lower() to also ignore case, or canon=lambda s: s.lstrip(' ')
-    to only ignore a leading space."""
- 
-    def __init__(self, tokenizer, canon=str.strip):
-        self.canon = canon
-        # decode each id on its own; clean_up_tokenization_spaces would turn ' ,' into ','
-        self.strs = tokenizer.batch_decode([[i] for i in range(len(tokenizer))],
-                                           clean_up_tokenization_spaces=False)
-        groups = {}
-        for i, s in enumerate(self.strs):
-            groups.setdefault(canon(s), []).append(i)
-        self.groups = {k: np.array(v) for k, v in groups.items()}
- 
-    def members(self, task_toks):
-        """The token ids equivalent to each task token (each list includes the token itself)."""
-        keys = [self.canon(self.strs[t]) for t in task_toks]
-        if len(set(keys)) < len(keys):
-            dup = sorted({repr(self.strs[t]) for t, k in zip(task_toks, keys) if keys.count(k) > 1})
-            raise ValueError(f"task tokens {', '.join(dup)} are equivalent under canon, so the "
-                             f"task would be ambiguous after collapsing; choose other tokens or canon")
-        return [self.groups[k] for k in keys]
- 
-    def logprobs(self, logs, task_toks):
-        """(T, len(task_toks)): log p(next token is in task token j's class), normalised
-        over the full vocabulary. Same layout as logs[:, task_toks] - logsumexp(logs)."""
-        lse = spc.logsumexp(logs, axis=-1, keepdims=True)
-        return np.stack([spc.logsumexp(logs[:, m], axis=-1) for m in self.members(task_toks)],
-                        axis=-1) - lse
+from vocabulary import TokenEquivalence    # moved there; still importable from here
 
 
 def split_block(trials, k_show=None, k_hide=None):
