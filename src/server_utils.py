@@ -997,6 +997,8 @@ def _canon(v):
     arg_digest canonicalizes): callables -> name, numpy scalars/arrays -> native,
     anything unhashable -> repr."""
     v = stringify(v)
+    if isinstance(v, set):
+        return frozenset(v)                  # hashable, and equal whatever its order
     if isinstance(v, np.generic):
         return v.item()
     if isinstance(v, np.ndarray):

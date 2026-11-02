@@ -29,6 +29,25 @@ class GrammarTask(sxp.Task):
     prompt           a spec (see prompts.py), used instead of the fields above when
                      given: e.g. 'one_word', or '' for no prompt
 
+    Which tokens the blocks share. Each block has its own alphabet by default: the grammar's
+    tokens become different task symbols in every block. share_toks shares some of them:
+      False            nothing shared (each block its own symbols)
+      True             everything shared: one alphabet for all blocks
+      {'action'}       only tokens of these kinds, a set of some of the automaton's KINDS
+      {'action', 'push'}  ('action', 'node' for an FSA; 'top', 'action', 'push', 'node' for a
+                       PDA), e.g. the actions shared and the nodes separate per block
+    Each setting has one spelling: a set must name some kinds but not all (those are False
+    and True). Sets are values, not sweeps, so {'action'} needs no brackets in a sweep dict;
+    a sweep over settings is a list, [False, {'action'}, True].
+    shuffle_shared: whether the shared tokens are reassigned at random in each block after the
+    first (True, as share_toks always did), or keep the same symbol in every block (False), so
+    a shared action means the same action everywhere. Reassignment stays within a kind: an
+    action's symbol only ever stands for another action. A grammar that isn't an automaton
+    has one kind, 'token', so for it only True and False mean anything.
+    The task's mapping from grammar tokens to symbols, block by block, is returned as
+    data['code'] (code[b, r]: grammar token r's symbol in block b), and each grammar token's
+    kind as data['kinds']. The model only maps symbols to its own tokens.
+
     The grammar is either given (grammar=..., or a Build of one), or left out and made by
     make_grammar() from the task's own fields, as the subclasses at the end of this file do.
     Either way it is made when the task is, i.e. inside the job. Fields are keyword-only,
@@ -37,7 +56,8 @@ class GrammarTask(sxp.Task):
     grammar: gram.Sequential = None
     num_trials: list
     samps: int
-    share_toks: bool = False    # should train and test sequences share tokens?
+    share_toks: object = False  # False, True, or a set of kinds: {'action'} (see above)
+    shuffle_shared: bool = True # reassign the shared tokens at random in each later block?
     min_tok: int = 2
     max_tok: int = 50
     seed: int = None
@@ -53,6 +73,7 @@ class GrammarTask(sxp.Task):
         super().__post_init__()                           # records .args, builds any Build
         if self.grammar is None:
             self.grammar = self.make_grammar()
+        self._shared_kinds()                              # checks share_toks
         spec = self.prompt_spec                           # checks the fields
         prompts.check(spec, self.prompt_facts())
 
@@ -69,6 +90,62 @@ class GrammarTask(sxp.Task):
         return prompts.spec_from(self.explicitness, self.describe_format, self.describe_vocab,
                                  self.describe_task, self.hint, self.answer_only)
 
+    # -- which tokens are shared ------------------------------------------------
+
+    def _kind_names(self):
+        """The grammar's kinds, in order: an automaton's KINDS, else the one kind 'token'."""
+        kinds = getattr(self.grammar, 'KINDS', None)
+        return tuple(kinds) if kinds and hasattr(self.grammar, '_token_of') else ('token',)
+
+    def _kinds(self):
+        """Each grammar token's kind (None for the delimiter, 0)."""
+        nt = len(self.grammar.vocab)
+        if self._kind_names() == ('token',):
+            return [None] + ['token'] * (nt - 1)
+        out = [None] * nt
+        for kind, table in self.grammar._token_of.items():
+            for t in table.values():
+                out[t] = kind
+        return out
+
+    def _shared_kinds(self):
+        """The kinds share_toks shares, in kind order. Raises unless it is False, True, or a set
+        naming some of the grammar's kinds but not all (so each setting has one spelling)."""
+        s, order = self.share_toks, self._kind_names()
+        if s is False or s is None:
+            return ()
+        if s is True:
+            return order
+        if not isinstance(s, (set, frozenset)):
+            raise TypeError(f"share_toks is False, True or a set of kinds like {{'action'}}, not {s!r}")
+        if set(s) - set(order):
+            raise ValueError(f"share_toks={s!r}: the kinds are {set(order)}")
+        if not s:
+            raise ValueError("share_toks=set() shares nothing: write share_toks=False")
+        if set(s) == set(order):
+            raise ValueError(f"share_toks={s!r} shares every kind: write share_toks=True")
+        return tuple(k for k in order if k in s)
+
+    def _code(self, rng, nblk):
+        """(code, V): code[b, r] is the symbol grammar token r becomes in block b (0 stays 0);
+        V the number of symbols. Shared tokens come first (1..), the same in every block unless
+        shuffle_shared reassigns them within each kind in blocks after the first; then each
+        block's own tokens. With nothing shared this is the disjoint layout as before, and with
+        everything shared in a grammar of one kind the same draws as before."""
+        kinds = self._kinds(); shared = set(self._shared_kinds())
+        nt = len(kinds)
+        sh = np.array([r for r in range(1, nt) if kinds[r] in shared], int)
+        own = np.array([r for r in range(1, nt) if kinds[r] not in shared], int)
+        code = np.zeros((nblk, nt), int)
+        code[:, sh] = 1 + np.arange(len(sh))
+        code[:, own] = 1 + len(sh) + np.arange(len(own)) + len(own) * np.arange(nblk)[:, None]
+        if self.shuffle_shared and len(sh):
+            groups = [sh[[kinds[r] == k for r in sh]] for k in self._kind_names() if k in shared]
+            for b in range(1, nblk):
+                for g in groups:
+                    code[b, g] = code[0, g][rng.permutation(len(g))]
+        return code, 1 + len(sh) + nblk * len(own)
+
     # -- what the prompt can say about the task --------------------------------
 
     def prompt_facts(self):
@@ -79,8 +156,15 @@ class GrammarTask(sxp.Task):
         fixed = isinstance(g, gram.RegularGrammar) and g.length is not None
         return {'structure': 'grammar', 'noun': 'grammar', 'shows': None,
                 'trial_len': g.length if fixed else None,      # tokens per trial, if fixed
-                'n_blocks': len(self.num_trials), 'share_toks': self.share_toks,
+                'n_blocks': len(self.num_trials), **self._share_facts(),
                 'holdout': False, 'listed': False}
+
+    def _share_facts(self):
+        """share_toks: every token shared and reassigned per block (what prompts have always
+        meant by it); shared_kinds: the kinds shared at all; shuffle_shared: as the field."""
+        kinds = self._shared_kinds()
+        return {'share_toks': kinds == self._kind_names() and self.shuffle_shared,
+                'shared_kinds': kinds, 'shuffle_shared': self.shuffle_shared}
 
     # -- what a block is ----------------------------------------------------
 
@@ -117,10 +201,10 @@ class GrammarTask(sxp.Task):
         facts, spec = self.prompt_facts(), self.prompt_spec
         prompts.check(spec, facts)
         rng = np.random.default_rng(self.seed)
-        nt = len(self.grammar.vocab)
         nblk = len(self._block_sizes())
 
         seqs = []
+        codes = []
         Ys = []
         blks = []
         which_block = []
@@ -143,15 +227,7 @@ class GrammarTask(sxp.Task):
             X, Y = np.array(seq), np.array(pr)
             trl_blk = np.repeat(block, trial_len)                 # block of each position
 
-            if self.share_toks:                    # one alphabet, remapped per block
-                V = nt
-                code = np.stack([np.arange(nt)] +
-                                [np.concatenate([[0], rng.permutation(nt - 1) + 1])
-                                for _ in range(nblk - 1)])
-            else:                                  # disjoint alphabet per block
-                V = (nt - 1) * nblk + 1
-                code = np.zeros((nblk, nt), int)
-                code[:, 1:] = np.arange(1, nt) + (nt - 1) * np.arange(nblk)[:, None]
+            code, V = self._code(rng, nblk)        # grammar token -> symbol, per block
 
             rows = np.arange(len(X))[:, None]
             Ynew = np.zeros((len(Y), V))
@@ -165,6 +241,7 @@ class GrammarTask(sxp.Task):
             blocks = [[t for t, b in zip(trials, block) if b == k] for k in range(nblk)]
 
             seqs.append(X)
+            codes.append(code)
             Ys.append(Y)
             blks.append(blocks)
             which_block.append(trl_blk)
@@ -174,6 +251,7 @@ class GrammarTask(sxp.Task):
             assert lens == {facts['trial_len']}, f"trial lengths {lens}, expected {facts['trial_len']}"
 
         return {'X': seqs, 'Y': Ys, 'B': which_block, 'blocks': blks, 'V': V,
+                'code': codes, 'kinds': self._kinds(),
                 'prompt': {'spec': spec, 'facts': facts}}
 
 

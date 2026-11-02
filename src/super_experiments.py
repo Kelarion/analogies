@@ -23,18 +23,19 @@ import scipy.special as spc
 import scipy.linalg as la
 import scipy.special as spc
 from itertools import permutations
+from sklearn import svm, linear_model
 
 # this is my code base, this assumes that you can access it
 import util
 import pt_util
+import students
+import assistants as ta
+import dichotomies as dic
 import server_utils as su
 
+from sklearn.exceptions import ConvergenceWarning
 import warnings # I hate convergence warnings so much never show them to me
-try:
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.simplefilter("ignore", category=ConvergenceWarning)
-except ImportError:
-    pass
+warnings.simplefilter("ignore", category=ConvergenceWarning)
 
 
 #%%%%%%%%%%%%
@@ -79,16 +80,9 @@ def _canon_default(o):
         return str(int(o))          # numpy<2 repr(np.int64(128)) == '128'
     if isinstance(o, np.ndarray):
         return o.tolist()
+    if isinstance(o, (set, frozenset)):  # a set's order (and repr) changes with the hash seed
+        return sorted(o, key=lambda x: json.dumps(x, sort_keys=True, default=_canon_default))
     return repr(o)
-
-
-def _build_fields(obj):
-    """Replace fields holding su.Build specs with what they build. .args keeps the
-    specs, so hashing and matching never trigger (or depend on) the construction."""
-    for f in fields(obj):
-        v = getattr(obj, f.name)
-        if su.contains_build(v):
-            setattr(obj, f.name, su.resolve(v))
 
 
 @dataclass
@@ -101,7 +95,6 @@ class Task:
 
         # full args; the folder hierarchy hashes these (see arg_digest).
         self.args = {f.name: getattr(self, f.name) for f in fields(self)}
-        _build_fields(self)
 
     def sample(self):
         """
@@ -129,7 +122,6 @@ class Model:
 
         # full args; the folder hierarchy hashes these (see arg_digest).
         self.args = {f.name: getattr(self, f.name) for f in fields(self)}
-        _build_fields(self)
 
     def fit(self):
         """
