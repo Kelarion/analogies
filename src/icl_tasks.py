@@ -57,7 +57,7 @@ class GrammarTask(sxp.Task):
     num_trials: list
     samps: int
     share_toks: object = False  # False, True, or a set of kinds: {'action'} (see above)
-    shuffle_shared: bool = True # reassign the shared tokens at random in each later block?
+    shuffle_shared: bool = False # reassign the shared tokens at random in each later block?
     min_tok: int = 2
     max_tok: int = 50
     seed: int = None
