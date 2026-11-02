@@ -3,6 +3,7 @@ The tokens that task symbols are written as.
 
 Two objects:
 
+<<<<<<< HEAD
   Vocabulary  what to draw: a base pool and filters on it. A plain frozen dataclass that knows
               nothing of tokenizers, so it is the argument ICLModel takes (as `tokens`), and
               is saved, hashed and compared like any other value:
@@ -10,13 +11,35 @@ Two objects:
   TokenPool   what that is for one tokenizer: the token ids, the delimiter and the scoring
               equivalence (TokenEquivalence). ICLModel gets one from get_pool() and asks it for
               each sample's assignment of symbols to tokens:
+=======
+  Vocabulary  which tokens to draw: a condition on a token, made of a base pool (what its text
+              must be), a written form (space) and filters. A plain frozen dataclass that
+              knows nothing of tokenizers, so it is the argument ICLModel takes (as `tokens`),
+              and is saved, hashed and compared like any other value:
+                  vocab = Vocabulary('words', content=True, zipf=(3, 4), noverb=True)
+              It applies the condition to any strings, read as tokens' text:
+                  vocab.filter([' dog', 'dog', ' dogs', ' the'])  # [' dog']
+                  vocab.mask(tokens), vocab.table(tokens)          # pass/fail; their features
+                  vocab.words()                                    # its base pool, in its form
+              With a tokenizer, mask and filter also check that each string is one token.
+  TokenPool   the tokens of one tokenizer that pass: every ordinary token (no special or added
+              tokens, clean text, re-encodes to itself) that the vocabulary accepts, one per
+              equivalence class, minus the delimiter; plus the delimiter's id and the scoring
+              equivalence (TokenEquivalence). ICLModel gets one from get_pool() and asks it
+              for each sample's assignment of symbols to tokens:
+>>>>>>> 4e82b3f (new vocab)
                   pool = get_pool(vocab, tokenizer, delim=',', equiv=True)
                   pool.size, pool.table            # how many tokens; their features, one row each
                   task_toks = pool.assign(V, rng)  # ids; task_toks[0] is the delimiter
               It needs only the tokenizer, so pools can be built and inspected without weights.
 
+<<<<<<< HEAD
 A Vocabulary puts itself in one canonical form when it is made (ranges as float tuples, a
 space setting that is the pool's own form dropped), so equal vocabularies are equal, hash
+=======
+A Vocabulary puts itself in one canonical form when it is made (ranges as float tuples,
+excluded words sorted), so equal vocabularies are equal, hash
+>>>>>>> 4e82b3f (new vocab)
 alike and have the same repr, which is what a run's folder digest is made from. Nothing
 rewrites it afterwards, so what a run saves is what was passed. Its repr lists only the
 fields that differ from their defaults, so fields added later (with defaults) leave existing
@@ -28,6 +51,7 @@ runs were saved with ('words+content+space'), but only in the canonical form can
 gives them, the form they were saved in: anything else is rejected, since two spellings of
 one spec would save as two different runs.
 
+<<<<<<< HEAD
   base pools (pool)
     nouns       top-1000-nouns.txt, in file order, as ' word'      [as before, less a duplicate]
     chars       ASCII letters, then digits, as bare characters       [as before]
@@ -43,6 +67,25 @@ one spec would save as two different runs.
     space       True: with a leading space (the default for nouns and words); False: without
                 (the default for chars). For nouns, words and chars this chooses the form each
                 word is written in; for any, None keeps both and True/False keep only that form.
+=======
+  base pools (pool): what a token's text, stripped, must be
+    nouns       a word in top-1000-nouns.txt (pool order: the file's)
+    chars       an ASCII letter or digit (letters, then digits)
+    words       an English word in wordfreq's list, lowercase and alphabetic (its frequency
+                order): all parts of speech, function words included
+    any         anything (token id order)
+  Every pool holds only ordinary tokens: no special or added tokens (so nothing like <think>
+  or <|im_end|>), nothing that decodes to partial UTF-8, whitespace, control characters or
+  the punctuation in STRUCTURAL, nothing that fails to re-encode to itself, and one token per
+  equivalence class (' cat' rather than 'cat', when both pass).
+
+  form
+    space       the token's written form, for every pool: True (the default) only tokens with
+                a single leading space (' king'), False only tokens without (`king`), None
+                both. The right form depends on what precedes the tokens: after ', ' or a
+                space, the spaced form is what the model would see; after a newline, the bare
+                one.
+>>>>>>> 4e82b3f (new vocab)
     ascii       only tokens whose text is ASCII (mostly useful with any)
     content     no function words (NLTK's English stopwords: 'the', 'it', 'there', ...)
 
@@ -60,12 +103,27 @@ one spec would save as two different runs.
   of speech unless asked (concrete=0.8 alone keeps ' great', whose rare noun sense is a
   person), so pair them: content=True, ndom=0.8, concrete=0.8 for concrete nouns.
     noverb             no verb senses at all
+<<<<<<< HEAD
+=======
+    plain=(lo, hi)     the share of the word's weight in plain senses, in [lo, hi]: not the
+                       name of a letter or note (q, phi, sigma, ti, fa) and not a short
+                       abbreviation of a much longer word (kg, cm, mph, rpm: up to 4 letters,
+                       found in order but not contiguously in a head word at least twice as
+                       long; clippings like 'photo' or 'gym' are plain). plain=0.5 drops those
+                       that are mostly symbols or abbreviations, plain=1 any that ever are
+                       (alpha, pi, chi, lime and nun too).
+    lemma              only words in their own base form, for their main part of speech
+                       ('spider', not 'spiders'): inflected forms are near-duplicates of their
+                       base form in the model's representations, and would dominate any
+                       similarity structure
+>>>>>>> 4e82b3f (new vocab)
     ndom=(lo, hi)      noun dominance: the share of the word's weight in noun senses, in
                        [lo, hi]. ndom=1 is noun-only, ndom=0.8 mostly a noun.
     concrete=(lo, hi)  of the noun weight, the share in physical entities (senses under
                        physical_entity.n.01) rather than abstractions, in [lo, hi].
                        concrete=0.8 for concrete nouns, concrete=(None, 0.2) for abstract ones.
 
+<<<<<<< HEAD
   A range is (lo, hi) with None for an open end, or one number, meaning that number and up.
   ('lo:hi' strings work too.)
 
@@ -74,6 +132,27 @@ Filters never reorder the base pool, so a draw depends only on which tokens surv
 assign() draws as before, so seeded runs reproduce. 'nouns' does too, except that the old
 pool held ' no' twice (the file lists it twice), which could give two symbols the same word;
 it now holds it once, so a seed draws different nouns than it used to.
+=======
+  by hand
+    exclude=(...)      words to leave out, whatever the other filters say (case and
+                       surrounding space ignored): for what no rule catches cleanly, like the
+                       odd unit or symbol name ('cc', 'lb', 'xi'), or taboo words
+
+  tokens (the one filter that needs the tokenizer)
+    whole=(lo, hi)     the share of the token's uses, as the start of a word in running text,
+                       in which it is the whole word, in [lo, hi] (see whole_shares). Tokens
+                       like ' comp', ' col' or ' ab' are WordNet lemmas (and frequent), but in
+                       text mostly begin longer words; whole=0.5 drops them. Only for tokens
+                       written with a leading space; others fail it.
+
+  A range is (lo, hi) with None for an open end, or one number, meaning that number and up.
+  ('lo:hi' strings work too.)
+
+Filters never reorder the base pool, so a draw depends only on which tokens survive.
+(Pools before this definition differ a little: 'nouns' and 'words' wrote each listed word in
+one form and kept it if that was one token; 'chars' was bare by default and 'any' took either
+form. Runs made with them won't reproduce exactly.)
+>>>>>>> 4e82b3f (new vocab)
 
 Semantic structure (not yet): assign() draws uniformly from the pool, whatever the task's
 structure. Controlling similarity within a block versus between blocks, or between tokens
@@ -92,14 +171,15 @@ import numpy as np
 import scipy.special as spc
 
 POOLS = ('nouns', 'chars', 'words', 'any')
-FLAGS = ('space', 'nospace', 'ascii', 'content', 'noverb')
-RANGES = ('zipf', 'rank', 'ndom', 'concrete')
+FLAGS = ('space', 'nospace', 'anyspace', 'ascii', 'content', 'noverb', 'lemma')
+RANGES = ('zipf', 'rank', 'ndom', 'concrete', 'whole', 'plain')
 
 # punctuation that structures text, kept out of 'any': sentence ends, separators, brackets
 # and quotes ('!' is also ChatLM's placeholder, which must not turn up in a prompt's text)
 STRUCTURAL = set('.,;:!?()[]{}<>"\'`|\\/')
 
 N_WORDS = 100_000           # how far down wordfreq's list 'words' looks
+N_WHOLE = 300_000           # how far down it whole_shares() looks
 
 
 # -- specs ------------------------------------------------------------------------
@@ -122,8 +202,8 @@ def parse(spec):
         if name in out:
             raise ValueError(f"token spec {spec!r} gives {name!r} twice")
         out[name] = v
-    if 'space' in out and 'nospace' in out:
-        raise ValueError(f"token spec {spec!r} asks for both space and nospace")
+    if sum(k in out for k in ('space', 'nospace', 'anyspace')) > 1:
+        raise ValueError(f"token spec {spec!r} asks for more than one of space, nospace, anyspace")
     return base, out
 
 
@@ -172,7 +252,11 @@ class Vocabulary:
     docstring for each field). Knows nothing of tokenizers; get_pool() makes it concrete.
     Canonical once made, so equal vocabularies are equal, hash alike and have one repr."""
     pool: str = 'nouns'
+<<<<<<< HEAD
     space: bool = None
+=======
+    space: bool = True
+>>>>>>> 4e82b3f (new vocab)
     ascii: bool = False
     content: bool = False
     noverb: bool = False
@@ -180,21 +264,39 @@ class Vocabulary:
     rank: tuple = None
     ndom: tuple = None
     concrete: tuple = None
+<<<<<<< HEAD
+=======
+    lemma: bool = False
+    whole: tuple = None
+    plain: tuple = None
+    exclude: tuple = ()
+>>>>>>> 4e82b3f (new vocab)
 
     def __post_init__(self):
         put = lambda k, v: object.__setattr__(self, k, v)
         if self.pool not in POOLS:
             raise ValueError(f"unknown token pool {self.pool!r}; pools are {POOLS}")
         if self.space is not None:
+<<<<<<< HEAD
             space = bool(self.space)
             if self.pool != 'any' and space == (self.pool != 'chars'):
                 space = None                                # the pool's own form
             put('space', space)
         for k in ('ascii', 'content', 'noverb'):
+=======
+            put('space', bool(self.space))
+        for k in ('ascii', 'content', 'noverb', 'lemma'):
+>>>>>>> 4e82b3f (new vocab)
             put(k, bool(getattr(self, k)))
         for k in RANGES:
             if getattr(self, k) is not None:
                 put(k, _range(k, getattr(self, k)))
+<<<<<<< HEAD
+=======
+        if isinstance(self.exclude, str):
+            raise ValueError("exclude is a list of words, not a string")
+        put('exclude', tuple(sorted({w.strip().lower() for w in self.exclude})))
+>>>>>>> 4e82b3f (new vocab)
 
     def __repr__(self):
         args = [repr(self.pool)] + [f'{f.name}={getattr(self, f.name)!r}' for f in fields(self)[1:]
@@ -205,20 +307,178 @@ class Vocabulary:
     def from_spec(cls, spec):
         """The Vocabulary a '+'-joined spec string describes ('words+zipf=3:4+noverb')."""
         base, mods = parse(spec)
+<<<<<<< HEAD
         kw = {k: v for k, v in mods.items() if k not in ('space', 'nospace')}
         if 'space' in mods or 'nospace' in mods:
             kw['space'] = 'space' in mods
+=======
+        kw = {k: v for k, v in mods.items() if k not in ('space', 'nospace', 'anyspace')}
+        if 'nospace' in mods:
+            kw['space'] = False
+        elif 'anyspace' in mods:
+            kw['space'] = None
+>>>>>>> 4e82b3f (new vocab)
         return cls(base, **kw)
 
     @property
     def mods(self):
         """The filters as parse() gives them: {flag: True, range: (lo, hi)}."""
+<<<<<<< HEAD
         out = {k: True for k in ('ascii', 'content', 'noverb') if getattr(self, k)}
         out.update({k: getattr(self, k) for k in RANGES if getattr(self, k) is not None})
         if self.space is not None:
             out['space' if self.space else 'nospace'] = True
         return out
 
+=======
+        out = {k: True for k in ('ascii', 'content', 'noverb', 'lemma') if getattr(self, k)}
+        out.update({k: getattr(self, k) for k in RANGES if getattr(self, k) is not None})
+        return out
+
+    # -- word-level: everything that doesn't need a tokenizer -------------------------
+
+    def form(self, word):
+        """A word written in this vocabulary's form: ' word' if space is True, 'word' if
+        False, as given if None."""
+        return word if self.space is None else (' ' if self.space else '') + word.strip()
+
+    def in_form(self, token):
+        """Whether a string is written in this vocabulary's form: a single leading space and no
+        other surrounding whitespace if space is True, no surrounding whitespace if False,
+        either of those if None."""
+        bare = token.strip()
+        if not bare:
+            return False
+        return {True: token == ' ' + bare, False: token == bare, None: token in (bare, ' ' + bare)}[self.space]
+
+    def _premask(self, tokens):
+        """The cheap part of the condition: form, clean text, base pool."""
+        base = None if self.pool == 'any' else base_set(self.pool)
+        return np.array([self.in_form(t) and _clean(t) and (base is None or t.strip() in base)
+                         for t in tokens], bool)
+
+    def mask(self, tokens, tokenizer=None):
+        """Whether each string, read as a token's text, passes: written in this vocabulary's
+        form, clean, in its base pool, and through its filters. With a tokenizer, also one
+        token of it, which the token-level filter (whole) needs. rank is taken among the
+        strings that pass the rest, so it depends on the list."""
+        tokens = list(tokens)
+        keep = self._premask(tokens); whole = None
+        if tokenizer is not None:
+            enc = tokenizer(tokens, add_special_tokens=False).input_ids
+            keep &= np.array([len(e) == 1 for e in enc], bool)
+            if 'whole' in self.mods:
+                share = whole_shares(tokenizer)
+                whole = np.array([share.get(e[0], np.nan) if len(e) == 1 else np.nan for e in enc])
+        elif 'whole' in self.mods:
+            raise ValueError(f"{self!r} filters on tokens (whole=...): pass a tokenizer")
+        return self._mask(tokens, whole, keep)
+
+    def _mask(self, words, whole=None, keep=None):
+        """The filters on the words' text (stripped), after `keep` (rank among those kept)."""
+        m = self.mods
+        words = [w.strip() for w in words]
+        keep = np.ones(len(words), bool) if keep is None else keep.copy()
+        if 'whole' in m:
+            keep &= _within(whole, *m['whole'])
+        if 'ascii' in m:
+            keep &= np.array([w.isascii() for w in words], bool)
+        if 'content' in m:
+            keep &= np.array([w.lower() not in function_words() for w in words], bool)
+        if self.exclude:
+            keep &= np.array([w.lower() not in self.exclude for w in words], bool)
+        need = {'zipf', 'rank', 'noverb', 'ndom', 'concrete', 'lemma', 'plain'} & set(m)
+        if need:
+            f = features(words, {'verb' if k == 'noverb' else 'zipf' if k == 'rank' else k
+                                 for k in need})
+            if 'zipf' in m:
+                keep &= _within(f['zipf'], *m['zipf'], closed=False)
+            if 'noverb' in m:
+                keep &= f['verb'] == 0                             # NaN (unknown) fails
+            if 'ndom' in m:
+                keep &= _within(f['ndom'], *m['ndom'])
+            if 'concrete' in m:
+                keep &= _within(f['concrete'], *m['concrete'])
+            if 'lemma' in m:
+                keep &= f['lemma'] == 1                            # NaN (unknown) fails
+            if 'plain' in m:
+                keep &= _within(f['plain'], *m['plain'])
+            if 'rank' in m:                                        # last: rank among the rest
+                lo, hi = m['rank']
+                rest = np.where(keep)[0]
+                order = rest[np.argsort(-f['zipf'][rest], kind='stable')]
+                keep[:] = False
+                keep[order[slice(lo, hi)]] = True
+        return keep
+
+    def filter(self, tokens, tokenizer=None):
+        """The strings that pass mask(), in their order."""
+        tokens = list(tokens)
+        return [t for t, k in zip(tokens, self.mask(tokens, tokenizer)) if k]
+
+    def words(self, tokenizer=None):
+        """The base pool's words written in this vocabulary's form (bare if space is None),
+        filtered, in base order. With a tokenizer (which whole needs), only those that are one
+        token: then they are the pool's tokens, but for equivalence classes and the delimiter
+        (and rank, which is taken within whichever list is filtered). 'any' is defined by a
+        tokenizer's tokens, so it has no word list."""
+        return self.filter([self.form(w) for w in base_words(self.pool)], tokenizer)
+
+    def table(self, tokens=None, tokenizer=None):
+        """One row per string (default: words()), with the features the filters use; with a
+        tokenizer, also each one's whole share (NaN if it isn't one token)."""
+        import pandas as pd
+        tokens = self.words(tokenizer) if tokens is None else list(tokens)
+        t = pd.DataFrame({'token': tokens, **features([w.strip() for w in tokens])})
+        if tokenizer is not None:
+            share = whole_shares(tokenizer)
+            enc = tokenizer(tokens, add_special_tokens=False).input_ids
+            t['whole'] = [share.get(e[0], np.nan) if len(e) == 1 else np.nan for e in enc]
+        return t
+
+
+_SHARES = {}
+
+
+def whole_shares(tokenizer):
+    """{token id: share}: of the times a token starts a word in running text, the share in
+    which it is the whole word. Read off wordfreq's list (N_WHOLE words, by frequency): each
+    word written with a leading space adds its frequency to its first token, as a whole word
+    if that is its only token, as a start otherwise. Ids that start no listed word are
+    absent. Cached per tokenizer."""
+    key = (tokenizer.name_or_path, len(tokenizer))
+    if key not in _SHARES:
+        from wordfreq import top_n_list
+        words = top_n_list('en', N_WHOLE)
+        whole, start = {}, {}
+        for w, t in zip(words, tokenizer([' ' + w for w in words], add_special_tokens=False).input_ids):
+            if t:
+                d = whole if len(t) == 1 else start
+                d[t[0]] = d.get(t[0], 0.0) + 10 ** (zipf(w) - 9)
+        _SHARES[key] = {i: whole.get(i, 0.0) / (whole.get(i, 0.0) + start.get(i, 0.0))
+                        for i in set(whole) | set(start)}
+    return _SHARES[key]
+
+
+@lru_cache(maxsize=None)
+def base_set(pool):
+    """{word: position in base order} for a word-list pool."""
+    return {w: k for k, w in enumerate(base_words(pool))}
+
+
+def base_words(pool):
+    """The words a base pool is made from, in base order (none for 'any')."""
+    if pool == 'nouns':
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'top-1000-nouns.txt')) as f:
+            return list(dict.fromkeys(w.strip() for w in f if w.strip()))
+    if pool == 'chars':
+        return list(string.ascii_letters + string.digits)
+    if pool == 'words':
+        from wordfreq import top_n_list
+        return [w for w in top_n_list('en', N_WORDS) if w.isalpha() and w.islower()]
+    raise ValueError("'any' is made of a tokenizer's tokens, so it has no word list")
+
+>>>>>>> 4e82b3f (new vocab)
 
 def as_vocabulary(tokens):
     """A Vocabulary from a Vocabulary, a pool name or a spec string."""
@@ -315,13 +575,50 @@ def wordnet_profile(word):
     return (weight, phys) if any(weight.values()) else None
 
 
-FEATURES = ('zipf', 'verb', 'ndom', 'concrete')
+FEATURES = ('zipf', 'verb', 'ndom', 'concrete', 'lemma', 'plain')
+
+
+@lru_cache(maxsize=None)
+def _symbolic(synset_name):
+    wn = _wordnet()
+    marks = {wn.synset('letter.n.02'), wn.synset('solfa_syllable.n.01')}
+    return any(marks & set(path) for path in wn.synset(synset_name).hypernym_paths())
+
+
+@lru_cache(maxsize=None)
+def plain_share(word):
+    """Of a word's sense weight (the senses and weights wordnet_profile uses), the share in
+    senses that are neither the name of a letter or note nor a short abbreviation of a much
+    longer word (the word has at most 4 letters, and its letters appear in order, but not
+    contiguously, in the sense's head lemma, which is at least twice as long: kg in kilogram,
+    mph in miles per hour). NaN if WordNet doesn't know the word."""
+    wn = _wordnet()
+    w = word.lower()
+    total = plain = 0.0
+    for s in wn.synsets(w):
+        if s.instance_hypernyms():
+            continue
+        pos = 'a' if s.pos() == 's' else s.pos()
+        lemmas = [l for l in s.lemmas() if l.name() in {w, wn.morphy(w, pos)}]
+        if not lemmas:
+            continue
+        c = 1 + sum(l.count() for l in lemmas)
+        total += c
+        head = s.lemmas()[0].name().lower().replace('_', '').replace('-', '')
+        it = iter(head)
+        abbrev = (head != w and len(w) <= 4 and len(head) >= 2 * len(w)
+                  and all(ch in it for ch in w) and w not in head)
+        if not (abbrev or _symbolic(s.name())):
+            plain += c
+    return plain / total if total else np.nan
 
 
 def features(words, which=FEATURES):
     """Per word, as {name: array}, those of these that are in `which`: zipf, verb (has a
-    verb sense), ndom, concrete. The WordNet ones (all but zipf) are NaN for words WordNet
-    doesn't know, and concrete for words with no noun senses."""
+    verb sense), ndom, concrete, lemma (is its own base form for its main part of speech),
+    plain (see plain_share).
+    The WordNet ones (all but zipf) are NaN for words WordNet doesn't know, and concrete for
+    words with no noun senses."""
     out = {'zipf': np.array([zipf(w) for w in words], float)} if 'zipf' in which else {}
     wordnet = [k for k in FEATURES[1:] if k in which]
     if not wordnet:
@@ -336,6 +633,9 @@ def features(words, which=FEATURES):
         out['ndom'][j] = weight['n'] / sum(weight.values())
         if weight['n']:
             out['concrete'][j] = phys / weight['n']
+        main = max(weight, key=weight.get)
+        out['lemma'][j] = _wordnet().morphy(w.lower(), main) == w.lower()
+        out['plain'][j] = plain_share(w)
     return {k: v for k, v in out.items() if k in which}
 
 
@@ -428,10 +728,12 @@ class TokenPool:
     @property
     def table(self):
         """One row per pool token, in pool order: id, token (as decoded), and the features
-        the modifiers filter on (see features())."""
-        import pandas as pd
-        return pd.DataFrame({'id': self.ids, 'token': [self.strs[i] for i in self.ids],
-                             **features(self.words)})
+        the filters use (see features())."""
+        t = self.vocab.table(self.words)
+        t.insert(0, 'token', [self.strs[i] for i in self.ids]); t.insert(0, 'id', self.ids)
+        share = whole_shares(self.tokenizer)
+        t['whole'] = [share.get(i, np.nan) for i in self.ids]
+        return t
 
     def assign(self, n, rng):
         """Ids for task symbols 0..n-1: symbol 0 the delimiter, the rest distinct tokens
@@ -450,6 +752,7 @@ class TokenPool:
         return self.tokenizer(text, add_special_tokens=False).input_ids
 
     def _build(self):
+<<<<<<< HEAD
         ids = self._base()
         bad = self.canon(self.strs[self.delim_id])
         ids = [i for i in ids if self.canon(self.strs[i]) != bad]
@@ -495,57 +798,31 @@ class TokenPool:
                 if len(t) == 1]
 
     def _any(self):
+=======
+        """Every ordinary token the vocabulary accepts (see the module docstring), the delimiter
+        and its equivalents removed, one per equivalence class (preferring the spaced form,
+        then base order), in base order; then the filters, rank last."""
+>>>>>>> 4e82b3f (new vocab)
         special = set(self.tokenizer.all_special_ids) | set(self.tokenizer.get_added_vocab().values())
-        cand = [i for i, s in enumerate(self.strs) if i not in special and _clean(s)]
-        if 'space' in self.mods:
-            cand = [i for i in cand if self.strs[i].startswith(' ')]
-        elif 'nospace' in self.mods:
-            cand = [i for i in cand if not self.strs[i].startswith(' ')]
+        cand = np.array([i for i in range(len(self.strs)) if i not in special], int)
+        cand = cand[self.vocab._premask([self.strs[i] for i in cand])]
         enc = self.tokenizer([self.strs[i] for i in cand], add_special_tokens=False).input_ids
-        cand = [i for i, e in zip(cand, enc) if e == [i]]          # re-encodes to itself
-        # one per class, preferring the spaced form, then the lower id
+        cand = cand[np.array([e == [i] for i, e in zip(cand, enc)], bool)]       # re-encodes to itself
+        bad = self.canon(self.strs[self.delim_id])
+        cand = [i for i in cand if self.canon(self.strs[i]) != bad]
+        order = (lambda i: i) if self.base == 'any' else (lambda i: base_set(self.base)[self.strs[i].strip()])
         best = {}
-        for i in sorted(cand, key=lambda i: (not self.strs[i].startswith(' '), i)):
+        for i in sorted(cand, key=lambda i: (not self.strs[i].startswith(' '), order(i), i)):
             best.setdefault(self.canon(self.strs[i]), i)
-        return sorted(best.values())
-
-    def _dedupe(self, ids):
-        """The first token of each equivalence class, keeping order."""
-        seen, out = set(), []
-        for i in ids:
-            k = self.canon(self.strs[i])
-            if k not in seen:
-                seen.add(k)
-                out.append(i)
-        return out
-
-    def _filter(self, ids):
-        m = self.mods
-        words = [self.strs[i].strip() for i in ids]
-        keep = np.ones(len(ids), bool)
-        if 'ascii' in m:
-            keep &= np.array([w.isascii() for w in words], bool)
-        if 'content' in m:
-            keep &= np.array([w.lower() not in function_words() for w in words], bool)
-        need = {'zipf', 'rank', 'noverb', 'ndom', 'concrete'} & set(m)
-        if need:
-            f = features(words, {'verb' if k == 'noverb' else 'zipf' if k == 'rank' else k
-                                 for k in need})
-            if 'zipf' in m:
-                keep &= _within(f['zipf'], *m['zipf'], closed=False)
-            if 'noverb' in m:
-                keep &= f['verb'] == 0                             # NaN (unknown) fails
-            if 'ndom' in m:
-                keep &= _within(f['ndom'], *m['ndom'])
-            if 'concrete' in m:
-                keep &= _within(f['concrete'], *m['concrete'])
-            if 'rank' in m:                                        # last: rank among the rest
-                lo, hi = m['rank']
-                rest = np.where(keep)[0]
-                order = rest[np.argsort(-f['zipf'][rest], kind='stable')]
-                keep[:] = False
-                keep[order[slice(lo, hi)]] = True
-        return ids[keep]
+        ids = np.array(sorted(best.values(), key=lambda i: (order(i), i)), int)
+        whole = None
+        if 'whole' in self.mods:
+            share = whole_shares(self.tokenizer)
+            whole = np.array([share.get(i, np.nan) for i in ids])
+        ids = ids[self.vocab._mask([self.strs[i] for i in ids], whole)]
+        if not len(ids):
+            raise ValueError(f"no tokens left in {self.spec}")
+        return ids
 
 
 def _within(x, lo, hi, closed=True):
