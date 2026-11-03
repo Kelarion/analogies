@@ -4,7 +4,7 @@ Compositional prompts, chosen by the task and tailored to it.
 The task chooses with one field per component (see GrammarTask), which spec_from
 turns into a spec: segment names joined with '+', e.g.
 
-    spec_from(explicitness=3, describe_format=True, describe_task=True, hint=True,
+    spec_from(explicitness=3, describe_format=True, describe_task=True, hint=1,
               answer_only=True) == 'explicit+format+task+hint+only'
 
 The spec is what is passed to the model and saved with the data. A task can also
@@ -37,6 +37,7 @@ and per block, from the block's final trial (the one that is cut):
   prefix   its shown words, e.g. 'poodle chair'
   target   'word', or '2 words' when more are held out
   missing  what to provide, as the hint says it: 'third word', 'next word', ...
+  answer   its held-out words, e.g. 'lamp' (what the model should give)
 `block` text gets its own block's; `system` and `transition` text the final block's.
 """
 from dataclasses import dataclass
@@ -103,6 +104,7 @@ free = Part("Sequences can have different lengths, and are separated by commas. 
 vocab = Part("The tokens will be {pool}. ")
 task_desc = Part("Your job is to complete the next {target} in the sequence. ")
 hint = Part(block="The last {unit} will start with '{prefix}' and you should provide the {missing}. ")
+reveal = Part(block="The last {unit} will start with '{prefix}', and the {missing} will be '{answer}'. ")
 only_final = Part("Output ONLY the next {target}. ", chat_only=True)
 
 one_word = Part("You will be presented with a sequence that has a certain pattern. "
@@ -117,7 +119,7 @@ SLOTS = {
     'format': {'format': [triplets, fixed, free], 'triplets': [triplets]},
     'vocab':  {'vocab': [vocab]},
     'task':   {'task': [task_desc]},
-    'hint':   {'hint': [hint]},
+    'hint':   {'hint': [hint], 'reveal': [reveal]},
     'answer': {'only': [only_final]},
 }
 
@@ -125,8 +127,9 @@ PRESETS = {
     'sas': 'vague+task+only',
 }
 
-# explicitness 0..3, as the variant of 'frame' it picks (0: no frame)
+# the levels of explicitness and of hint, as the variant of their slot each picks (0: none)
 EXPLICITNESS = (None, 'vague', 'moderate', 'explicit')
+HINT = (None, 'hint', 'reveal')
 
 # what the words of each of vocabulary.py's base pools are, for {pool}
 POOLS = {'nouns': 'arbitrary nouns', 'chars': 'arbitrary letters and digits',
@@ -142,26 +145,31 @@ for _slot, _variants in SLOTS.items():
 
 
 def spec_from(explicitness=0, describe_format=False, describe_vocab=False,
-              describe_task=False, hint=False, answer_only=False):
+              describe_task=False, hint=0, answer_only=False):
     """The spec for a choice of components:
     explicitness     0 none, 1 vague, 2 moderate, 3 explicit (or the name of the level):
                      what the model is told about where the sequences come from
     describe_format  what a trial looks like (triplets, words, or varying lengths)
     describe_vocab   what the words are (from the model's token pool)
     describe_task    "Your job is to complete the next word ..."
-    hint             open each block with the start of its final trial
+    hint             0 none; 1 open each block with the start of its final trial; 2 and
+                     with its answer too (or the name of the level: 'hint', 'reveal')
     answer_only      "Output ONLY the next word." (left out in 'raw' mode)
     """
-    if explicitness in EXPLICITNESS[1:]:
-        explicitness = EXPLICITNESS.index(explicitness)
-    if explicitness not in range(len(EXPLICITNESS)):
-        raise ValueError(f"explicitness is 0..{len(EXPLICITNESS) - 1} or one of "
-                         f"{EXPLICITNESS[1:]}, not {explicitness!r}")
-    names = [EXPLICITNESS[explicitness],
+    names = [EXPLICITNESS[level(explicitness, EXPLICITNESS, 'explicitness')],
              describe_format and 'format', describe_vocab and 'vocab',
-             describe_task and 'task', hint and 'hint', answer_only and 'only']
+             describe_task and 'task', HINT[level(hint, HINT, 'hint')],
+             answer_only and 'only']
     return '+'.join(n for n in names if n)
 
+
+def level(value, levels, name='level'):
+    """A level 0..len(levels)-1, given as itself (a bool counting as 0 or 1) or by name."""
+    if isinstance(value, str) and value in levels[1:]:
+        return levels.index(value)
+    if not isinstance(value, str) and value in range(len(levels)):
+        return int(value)
+    raise ValueError(f"{name} is 0..{len(levels) - 1} or one of {levels[1:]}, not {value!r}")
 
 
 def parse(spec):
@@ -280,7 +288,7 @@ def render(spec, facts, mode, pool, finals):
     """The text of a prompt for one sample:
         {'system': str or None, 'blocks': [text at the start of each block]}
     pool    the name of the model's base token pool (vocabulary.base_pool), a key of POOLS
-    finals  for each block, (the words shown of its final trial, how many are held out)
+    finals  for each block, (the words shown of its final trial, the words held out)
     """
     facts = derive(facts)
     if len(finals) != facts['n_blocks']:
@@ -289,7 +297,7 @@ def render(spec, facts, mode, pool, finals):
     if (any('{prefix}' in p.system + p.transition + p.block for p in parts)
             and not all(prefix for prefix, _ in finals)):
         raise ValueError("the hint needs part of each block's final trial shown (k_show > 0)")
-    fields = [_fields(facts, pool, prefix, n) for prefix, n in finals]
+    fields = [_fields(facts, pool, prefix, answer) for prefix, answer in finals]
 
     system = ''.join(p.system for p in parts).format_map(fields[-1]).strip()
     trans = ''.join(p.transition for p in parts).format_map(fields[-1])
@@ -298,9 +306,10 @@ def render(spec, facts, mode, pool, finals):
     return {'system': system or None, 'blocks': blocks}
 
 
-def _fields(facts, pool, prefix, n_target):
-    """The template fields for a block whose final trial shows `prefix` and hides
-    n_target words."""
+def _fields(facts, pool, prefix, answer):
+    """The template fields for a block whose final trial shows the words `prefix` and
+    hides the words `answer`."""
+    n_target = len(answer)
     pos = len(prefix) + 1                      # position of the first missing word
     if n_target == 1 and facts['trial_len'] is not None:
         missing = f"{_ordinal(pos)} word"
@@ -309,7 +318,7 @@ def _fields(facts, pool, prefix, n_target):
     else:
         missing = f"{'last' if facts['trial_len'] is not None else 'next'} {n_target} words"
     return dict(facts, pool=POOLS.get(pool, 'arbitrary words'), prefix=' '.join(prefix),
-                target='word' if n_target == 1 else f'{n_target} words', missing=missing)
+                answer=' '.join(answer), target='word' if n_target == 1 else f'{n_target} words', missing=missing)
 
 
 def preview(task, mode='dialogue', pool='nouns', k_hide=1):
@@ -317,8 +326,9 @@ def preview(task, mode='dialogue', pool='nouns', k_hide=1):
     written as w1, w2, ... (the model would put words there). Needs no model."""
     from dataclasses import replace
     data = replace(task, samps=1).sample()
-    finals = [([f'w{t}' for t in trials[-1][:len(trials[-1]) - 1 - k_hide]], k_hide)
-              for trials in data['blocks'][0]]                # each block's final trial
+    w = lambda toks: [f'w{t}' for t in toks]
+    finals = [(w(tr[-1][:-1 - k_hide]), w(tr[-1][-1 - k_hide:-1]))   # each block's final trial
+              for tr in data['blocks'][0]]                         # (shown, held out)
     out = render(data['prompt']['spec'], data['prompt']['facts'], mode, pool, finals)
     print(f"[spec] {data['prompt']['spec']!r}")
     print(f"[system] {out['system']}")

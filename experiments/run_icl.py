@@ -31,6 +31,7 @@ task_args = {'task': RelationTask,
             #  'strong': True,
              'strong': False,
             #  'backtrack': False,
+             'commutes': [0, np.inf],
              'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
             #  'num_trials': [2*[4*k**2], 4*[2*k**2], 8*[k**2]],
@@ -50,7 +51,7 @@ task_args = {'task': RelationTask,
              'describe_task': (True, False),
             #  'describe_task': False,
              'describe_vocab': (True,False),
-            #  'hint': [False, True],
+             'hint': [0, 2],
             #  'answer_only': False,
              'share_toks': [False, {'action'}, {'node'}, True],
              'seed': 0,
@@ -63,8 +64,8 @@ task_args = {'task': RelationTask,
 #                              describe_task=True, hint=True, answer_only=True), mode='dialogue')
 
 mod_args = {'model': ICLModel,
-            # 'model_name': 'Qwen/Qwen3.8-27B',
-            'model_name': 'google/gemma-4-31B',
+            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
+            # 'model_name': 'google/gemma-4-31B',
             # 'mode': ['dialogue', 'raw'],
             'mode': 'raw',
             # 'mode': 'single',
@@ -82,70 +83,70 @@ mod_args = {'model': ICLModel,
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
 # (pickles copied to the cluster over ssh) or on the cluster; push/pull first either way.
-# su.send_to_server(task_args, mod_args, verbose=True)            # or name='my-sweep'
+su.send_to_server(task_args, mod_args, verbose=True)            # or name='my-sweep'
 
-# %% Or: run here, e.g. in an interactive session (each model is loaded once)
-exps, _ = su.get_all_experiments(task_args, mod_args)
-exps.sort(key=lambda e: e['model_args']['args'].get('model_name', ''))
+# # %% Or: run here, e.g. in an interactive session (each model is loaded once)
+# exps, _ = su.get_all_experiments(task_args, mod_args)
+# exps.sort(key=lambda e: e['model_args']['args'].get('model_name', ''))
 
-# %%
-for e in exps:
-    exp = sxp.Experiment(e['task_args']['task'](**e['task_args']['args']),
-                         e['model_args']['model'](**e['model_args']['args']))
-    print(exp.task.args | exp.model.args, flush=True)
-    # print(exp.file_suffix())
-    exp.run()
-    exp.save_experiment(SAVE_DIR)
+# # %%
+# for e in exps:
+#     exp = sxp.Experiment(e['task_args']['task'](**e['task_args']['args']),
+#                          e['model_args']['model'](**e['model_args']['args']))
+#     print(exp.task.args | exp.model.args, flush=True)
+#     # print(exp.file_suffix())
+#     exp.run()
+#     exp.save_experiment(SAVE_DIR)
 
-# %% Load and plot (no model needed; leave keys out of the dicts to match any value)
-# su.fetch_results()      # on the laptop: copy new results over from the cluster first
-records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
-fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
-for ax, rec in zip(axs[0], records): 
-    m, a = rec['metrics'], rec['model_args']
-    plot_icl(ax, m['logp_ctx'], m['data'], n_trl=50, k_hide=a['k_hide'],
-             title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
-plt.tight_layout()
-plt.show()
+# # %% Load and plot (no model needed; leave keys out of the dicts to match any value)
+# # su.fetch_results()      # on the laptop: copy new results over from the cluster first
+# records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
+# fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
+# for ax, rec in zip(axs[0], records): 
+#     m, a = rec['metrics'], rec['model_args']
+#     plot_icl(ax, m['logp_ctx'], m['data'], n_trl=50, k_hide=a['k_hide'],
+#              title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
+# plt.tight_layout()
+# plt.show()
 
-#%%
-from functools import partial
-from icl_utils import true_dist, uniform_block, ngram
+# #%%
+# from functools import partial
+# from icl_utils import true_dist, uniform_block, ngram
 
-refs = {
-        'uniform': uniform_block,
-        # 'true': true_dist,
-        'bigram': partial(ngram, order=2, alpha=1),
-        }
+# refs = {
+#         'uniform': uniform_block,
+#         # 'true': true_dist,
+#         'bigram': partial(ngram, order=2, alpha=1),
+#         }
 
-records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
-fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
-for ax, rec in zip(axs[0], records):
-    m, a = rec['metrics'], rec['model_args']
-    plot_icl(ax, m['logp_ctx'], m['data'], n_trl=100, k_hide=1, kl=True,
-             title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
-plt.tight_layout()
-plt.show()
+# records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
+# fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
+# for ax, rec in zip(axs[0], records):
+#     m, a = rec['metrics'], rec['model_args']
+#     plot_icl(ax, m['logp_ctx'], m['data'], n_trl=100, k_hide=1, kl=True,
+#              title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
+# plt.tight_layout()
+# plt.show()
 
-#%%
-from functools import partial
-from icl_utils import true_dist, uniform_block, ngram
-import icl_sweeps as isw
+# #%%
+# from functools import partial
+# from icl_utils import true_dist, uniform_block, ngram
+# import icl_sweeps as isw
 
-refs = {
-        # 'uniform': uniform_block,
-        # 'true': true_dist,
-        'bigram': partial(ngram, order=2, alpha=1),
-        'unigram': partial(ngram, order=1, alpha=1)
-        }
+# refs = {
+#         # 'uniform': uniform_block,
+#         # 'true': true_dist,
+#         'bigram': partial(ngram, order=2, alpha=1),
+#         'unigram': partial(ngram, order=1, alpha=1)
+#         }
 
-# isw.plot_runs(records, prm, where={'mode':'raw', 'explicitness':0}, 
-#               rows='tokens', cols='share_toks', 
-#               n_trl=100, refs={},
-#               kl=True)
+# # isw.plot_runs(records, prm, where={'mode':'raw', 'explicitness':0}, 
+# #               rows='tokens', cols='share_toks', 
+# #               n_trl=100, refs={},
+# #               kl=True)
 
-isw.plot_heldout(records, prm, hue='explicitness',where={'mode':'raw'},
-                  rows='tokens', cols='share_toks', refs=refs, kl=True)
+# isw.plot_heldout(records, prm, hue='explicitness',where={'mode':'raw'},
+#                   rows='tokens', cols='share_toks', refs=refs, kl=True)
 
-plt.show()
-                 # plain `python script.py`
+# plt.show()
+#                  # plain `python script.py`

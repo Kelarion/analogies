@@ -131,8 +131,8 @@ class ICLModel(sxp.Model):
             ctx, comp = split_block(trials, self.k_show, self.k_hide)
             cut = np.where(ctx == 0)[0]
             shown = ctx[cut[-1] + 1:] if len(cut) else ctx
-            finals.append(([lm.tokenizer.decode([t]).strip() for t in task_toks[shown]],
-                           len(comp)))
+            words = lambda toks: [lm.tokenizer.decode([t]).strip() for t in task_toks[toks]]
+            finals.append((words(shown), words(comp)))    # (shown, held out)
         out = prompts.render(prompt['spec'], prompt['facts'], self.mode,
                              vocabulary.base_pool(self.tokens), finals)
         system = {'role': 'system', 'content': out['system']} if out['system'] else None
