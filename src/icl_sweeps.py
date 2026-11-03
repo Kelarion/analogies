@@ -8,9 +8,11 @@ Choosing runs from a batch by their parameters, and plotting them on a grid.
                  where={'explicitness': 3})
 
 `where` fixes parameters, as {name: condition}, the condition being
-    a value          runs with that value (a list-valued field, e.g. num_trials, as a tuple)
-    a list or set    runs with any of these values
+    a value          runs with that value (a list-valued field, e.g. num_trials, as a tuple;
+                     a set-valued one as a set, e.g. share_toks={'action'})
+    a list           runs with any of these values, e.g. k=[4, 8] or share_toks=[False, {'action'}]
     a function       runs passing the test, e.g. lambda k: k >= 8
+As when sending runs, a list means alternatives and anything else is a value.
 Every grid cell (and every line within it) must then come down to a single run; if it
 doesn't, the error names the parameters still varying, which is the cue to fix them in `where`.
 """
@@ -27,16 +29,19 @@ from icl_utils import xent, plot_icl, split_block, ylabel
 
 def _hashable(v):
     """A parameter value that can be compared and grouped: lists and arrays as tuples,
-    numpy scalars as plain numbers."""
+    sets as frozensets, numpy scalars as plain numbers."""
     if isinstance(v, np.generic):
         return v.item()
     if isinstance(v, (list, tuple, np.ndarray)):
         return tuple(_hashable(x) for x in v)
+    if isinstance(v, (set, frozenset)):
+        return frozenset(_hashable(x) for x in v)
     return v
 
 
 def _key(v):
-    """Sort key putting None first, then numbers, then strings, then anything else."""
+    """Sort key putting None first, then numbers, then strings, then sets (by their sorted
+    elements, so the order doesn't depend on the hash seed), then anything else."""
     if isinstance(v, tuple):
         return (0, tuple(_key(x) for x in v))
     if v is None:
@@ -45,7 +50,16 @@ def _key(v):
         return (2, v)
     if isinstance(v, str):
         return (3, v)
-    return (4, repr(v))
+    if isinstance(v, frozenset):
+        return (4, tuple(sorted(_key(x) for x in v)))
+    return (5, repr(v))
+
+
+def _show(v):
+    """A value as printed in labels and listings: sets in sorted order, as {a, b}."""
+    if isinstance(v, frozenset):
+        return '{' + ', '.join(_show(x) for x in sorted(v, key=_key)) + '}'
+    return str(v)
 
 
 def _order(vals):
@@ -66,10 +80,13 @@ def select(prm, where=None):
         col = _column(prm, name)
         if callable(cond):
             keep &= np.array([bool(cond(v)) for v in col])
-        elif isinstance(cond, (list, set)):
+        elif isinstance(cond, list):
             ok = {_hashable(c) for c in cond}
             keep &= np.array([v in ok for v in col])
         else:
+            if isinstance(cond, (set, frozenset)) and not any(isinstance(v, frozenset) for v in col):
+                raise ValueError(f"where={{{name!r}: {cond!r}}}: a set is a value, and no {name} is a "
+                                 f"set; for runs with any of these values, use a list: {sorted(cond, key=_key)}")
             keep &= np.array([v == _hashable(cond) for v in col])
     return np.where(keep)[0]
 
@@ -85,7 +102,7 @@ def varying(prm, runs=None, show=True):
             out[name] = vals
     if show:
         for k, v in out.items():
-            print(f'{k:>24}: {v}')
+            print(f"{k:>24}: [{', '.join(_show(x) for x in v)}]")
     return out
 
 
@@ -107,7 +124,7 @@ def _grid(prm, where, dims):
     clash = {k: v for k, v in cells.items() if len(v) > 1}
     if clash:
         k, rs = next(iter(clash.items()))
-        where_ = ', '.join(f'{d}={v}' for d, v in zip(dims, k) if d)
+        where_ = ', '.join(_label(d, v) for d, v in zip(dims, k) if d)
         rest = {n: v for n, v in varying(prm, rs, show=False).items() if n not in dims}
         raise ValueError(
             f"{len(rs)} runs at {where_ or 'the one cell'} (and {len(clash) - 1} other "
@@ -117,7 +134,7 @@ def _grid(prm, where, dims):
 
 
 def _label(name, val):
-    return f'{name}={val}'
+    return f'{name}={_show(val)}'
 
 
 def _figure(levels, size, sharey):
@@ -134,7 +151,7 @@ def _title(rows, cols, rv, cv):
 # -- plot_icl on a grid ------------------------------------------------------------------
 
 def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
-              perplexity=False, kl=False, size=(5, 4), title=None, k_hide=None):
+              perplexity=False, kl=False, size=(5, 4), title=None):
     """
     plot_icl for each run matching `where`, on a grid of `rows` x `cols` (parameter
     names; leave either out for a single row or column). Empty cells are hidden.
@@ -152,8 +169,7 @@ def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
                 continue
             rec = records[cells[rv, cv]]
             m, a = rec['metrics'], rec['model_args']
-            plot_icl(ax, m['logp_ctx'], m['data'], n_trl=n_trl, 
-                     k_hide=a.get('k_hide') if k_hide is None else k_hide,
+            plot_icl(ax, m['logp_ctx'], m['data'], n_trl=n_trl, k_hide=a.get('k_hide'),
                      title=title(rec) if title else _title(rows, cols, rv, cv),
                      show_assistant=(a.get('mode') != 'raw'), refs=refs,
                      perplexity=perplexity, kl=kl)
@@ -315,4 +331,3 @@ def trace(record, refs=()):
             df.loc[np.isnan(lp).all(-1), ['ll', 'kl', 'p_valid', 'top', 'p_top', 'task_mass']] = np.nan
             rows.append(df)
     return pd.concat(rows, ignore_index=True)
-    

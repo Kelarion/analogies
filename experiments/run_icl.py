@@ -11,6 +11,7 @@ import super_experiments as sxp
 from icl_tasks import RelationTask
 from icl_model import ICLModel
 from icl_utils import plot_icl
+import icl_utils
 
 SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
@@ -33,24 +34,25 @@ task_args = {'task': RelationTask,
              'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
             #  'num_trials': [2*[4*k**2], 4*[2*k**2], 8*[k**2]],
-             'num_trials': ([1, 1, 1, 1], [100, 100, 100, 100]),
+             'num_trials': [[100, 100, 100, 100]],
             #  'num_trials': 4*[2*k**2],
             #  'num_trials': [[None, None]],
-             'length': (100, 1),
+             'length': 1,
              'samps': 20,
              'holdout': True, 
              'max_tok': np.inf, 
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
             #  'explicitness': [0, 1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
-            #  'explicitness': 3,
-             'explicitness': 0,
-             'describe_format': False,
-            #  'describe_format': (True, False), 
-            #  'describe_task': (True, False),
-             'describe_task': False,
-             'describe_vocab': False,
+            #  'explicitness': 0,
+             'explicitness': (3, 0),
+            #  'describe_format': False,
+             'describe_format': (True, False), 
+             'describe_task': (True, False),
+            #  'describe_task': False,
+             'describe_vocab': (True,False),
             #  'hint': [False, True],
             #  'answer_only': False,
+             'share_toks': [False, {'action'}, {'node'}, True],
              'seed': 0,
              }
 
@@ -61,20 +63,21 @@ task_args = {'task': RelationTask,
 #                              describe_task=True, hint=True, answer_only=True), mode='dialogue')
 
 mod_args = {'model': ICLModel,
-            'model_name': 'Qwen/Qwen3.8-27B',
-            'mode': 'dialogue',
-            # 'mode': 'raw',
+            # 'model_name': 'Qwen/Qwen3.8-27B',
+            'model_name': 'google/gemma-4-31B',
+            # 'mode': ['dialogue', 'raw'],
+            'mode': 'raw',
             # 'mode': 'single',
             # 'think': [True, False],
             'think': False,
             'k_hide': 1,
             'effort': 'low',
-            'thinking_budget': 10_000,
+            'thinking_budget': 6000,
             'seed': 0,
-            'equiv': False,
+            'equiv': (True, False),
             # 'delim': ['\n', ','],
             'delim': ',',
-            'tokens': ['any+ascii+content+space', 'words+content+space', 'chars+space'],
+            'tokens': (icl_utils.Vocabulary('nouns'), icl_utils.Vocabulary('chars')),
             }
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
@@ -97,7 +100,7 @@ for e in exps:
 # %% Load and plot (no model needed; leave keys out of the dicts to match any value)
 # su.fetch_results()      # on the laptop: copy new results over from the cluster first
 records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
-fig, axs = plt.subplots(1, len(records), figsiz`e=(5 * len(records), 4), squeeze=False)
+fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
 for ax, rec in zip(axs[0], records): 
     m, a = rec['metrics'], rec['model_args']
     plot_icl(ax, m['logp_ctx'], m['data'], n_trl=50, k_hide=a['k_hide'],
@@ -119,7 +122,7 @@ records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
 fig, axs = plt.subplots(1, len(records), figsize=(5 * len(records), 4), squeeze=False)
 for ax, rec in zip(axs[0], records):
     m, a = rec['metrics'], rec['model_args']
-    plot_icl(ax, m['logp_ctx'], m['data'], n_trl=1, k_hide=400, kl=True,
+    plot_icl(ax, m['logp_ctx'], m['data'], n_trl=100, k_hide=1, kl=True,
              title=f"{a['mode']}, think={a['think']}", show_assistant=(a['mode'] != 'raw'))
 plt.tight_layout()
 plt.show()
@@ -136,11 +139,13 @@ refs = {
         'unigram': partial(ngram, order=1, alpha=1)
         }
 
-# isw.plot_runs(records, prm, rows='tokens', cols='delim', n_trl=1, k_hide=200, refs=refs,
+# isw.plot_runs(records, prm, where={'mode':'raw', 'explicitness':0}, 
+#               rows='tokens', cols='share_toks', 
+#               n_trl=100, refs={},
 #               kl=True)
 
-isw.plot_heldout(records, prm, hue='num_trials', rows='tokens', cols=None, refs=refs, kl=True)
-
+isw.plot_heldout(records, prm, hue='explicitness',where={'mode':'raw'},
+                  rows='tokens', cols='share_toks', refs=refs, kl=True)
 
 plt.show()
-
+                 # plain `python script.py`
