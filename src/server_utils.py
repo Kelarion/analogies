@@ -28,6 +28,8 @@ import importlib
 import pickle as pkl
 import subprocess
 import copy
+import math
+import functools
 from dataclasses import dataclass, fields, is_dataclass
 
 import numpy as np
@@ -62,11 +64,11 @@ class Build:
         parts += [f'{k}={_build_repr(v)}' for k, v in sorted(self.kwargs.items())]
         return f'{name}({", ".join(parts)})'
 
-    def __eq__(self, other):
-        return isinstance(other, Build) and repr(self) == repr(other)
+    def __eq__(self, other):              # by what it would build: see canon
+        return isinstance(other, Build) and _key(self) == _key(other)
 
     def __hash__(self):
-        return hash(repr(self))
+        return hash(_key(self))
 
 
 def _build_repr(v):
@@ -649,12 +651,14 @@ def parse_params(dictionary, forbidden_keys=None):
         var_v = ()
 
     ## Make experiment dictionaries (iterators yield numpy scalars: hand out plain Python
-    ## numbers, so a swept k=6 gets the same save name as a typed k=6)
+    ## values, swept, matched and fixed alike, so the jobs and the saved args see the
+    ## same types whichever way a value was given)
     out_dicts = []
+    fixed_prms = _plain(fixed_prms)
     for var_vals in ParamIter(*var_v):
         var_vals = tuple(_plain(v) for v in var_vals)
         for mch_vals in tup_vals:
-            out_dicts.append( dict(zip(var_k+tup_keys, var_vals+mch_vals), **fixed_prms) )
+            out_dicts.append( dict(zip(var_k+tup_keys, var_vals+_plain(mch_vals)), **fixed_prms) )
 
     return out_dicts
 
@@ -674,7 +678,7 @@ def _git(*args, cwd=REPO_DIR):
 
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
                    name=None, max_parallel=8, template=None, remote=None, check_commit=True,
-                   ensure_weights=True, per_job=1, exclude=None):
+                   ensure_weights=True, per_job=1):
     """
     Submit every task x model combination as one Slurm job array.
 
@@ -699,7 +703,6 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         can take longer than a short experiment, and many jobs loading at once strain the
         shared filesystem: for short runs, pick per_job so a job lasts tens of minutes.
         Consecutive combinations share a model, so a job loads one (or two, at a boundary).
-    exclude: nodes to keep the jobs off, e.g. ['cn-g028'] for a node with known problems.
     run_remote=False runs the first array task here instead, for debugging.
     max_parallel caps how many array tasks run at once.
     """
@@ -708,6 +711,8 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
 
     tasks = parse_params(task_args, forbidden_keys=['task'])
     models = parse_params(mod_args, forbidden_keys=['model'])
+    for args in tasks + models:         # a value with no stable save name: fail here, not in
+        canon(args)                     # every job when it saves
     n_task, n_tot = len(tasks), len(tasks) * len(models)
     n_jobs = -(-n_tot // per_job)
     name = name or time.strftime('%Y%m%d-%H%M%S')
@@ -777,8 +782,7 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         for m, why in missing.items():
             print(f'Not cached on the cluster: {m}\n    ({why})')
         print(f'Downloading first (job {after}); the array starts once that succeeds.')
-    extra = [f'--exclude={",".join(exclude)}'] if exclude else []
-    job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after, extra=extra)
+    job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after)
     _record_job(sweep, job, remote)
     print(f'Submitted batch job {job} ({n_jobs} array tasks)')
     return sweep
@@ -994,22 +998,71 @@ def stringify(thing):
         return thing
 
 
-def _canon(v):
-    """A hashable, numpy/version-stable key for value comparison (mirrors how
-    arg_digest canonicalizes): callables -> name, numpy scalars/arrays -> native,
-    anything unhashable -> repr."""
-    v = stringify(v)
+def canon(v):
+    """
+    A JSON-able canonical form of an argument value. A run's save name hashes these
+    (super_experiments.arg_digest) and load_experiments matches on them, so two values
+    name the same run exactly when they're the same parameter:
+
+      numbers          by value: False, 0, 0.0, -0.0, np.False_, np.int64(0) are all 0
+      nan, inf         as tags, so nan is equal to itself
+      lists, tuples    alike, and numpy arrays with them
+      sets, dicts      tagged, so neither is confused with a list, and with sorted
+                       elements and keys (int keys stay distinct from str ones)
+      functions, classes   by module and qualified name. Lambdas and functions defined
+                       inside other functions are refused: others can share their name
+      Build, functools.partial   by what they call, with what
+      anything else    by type and repr, if it has its own __eq__. Objects that compare
+                       by identity are refused: nothing about them carries over to the
+                       next process, so pass them as a Build instead
+
+    Tagged forms are JSON objects ({'set': ...}), which nothing else becomes, so they
+    can't collide with a plain value.
+    """
     if isinstance(v, np.generic):
-        return v.item()
-    if isinstance(v, np.ndarray):
-        return tuple(v.tolist())
-    if type(v).__eq__ is object.__eq__ and v is not None:
-        return repr(v)    # identity equality can't match across processes; compare by repr
-    try:
-        hash(v)
+        v = v.item()
+    if v is None or isinstance(v, str):
         return v
-    except TypeError:
-        return repr(v)
+    if isinstance(v, (bool, int)):
+        return int(v)
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return {'float': repr(v)}
+        return int(v) if v.is_integer() else v
+    if isinstance(v, np.ndarray):
+        v = v.tolist()
+    if isinstance(v, (list, tuple)):
+        return [canon(x) for x in v]
+    if isinstance(v, (set, frozenset)):
+        return {'set': sorted((canon(x) for x in v), key=_json)}
+    if isinstance(v, dict):
+        return {'dict': sorted(([canon(k), canon(x)] for k, x in v.items()), key=_json)}
+    if isinstance(v, Build):
+        return {'build': canon(v.func), 'args': canon(v.args), 'kwargs': canon(v.kwargs)}
+    if isinstance(v, functools.partial):
+        return {'partial': canon(v.func), 'args': canon(v.args), 'kwargs': canon(v.keywords)}
+    if isinstance(v, type) or (callable(v) and hasattr(v, '__qualname__')):
+        name = f'{v.__module__}.{v.__qualname__}'
+        if '<lambda>' in name or '<locals>' in name:
+            raise ValueError(f"{name} can't be saved under a stable name (any other lambda or "
+                             "local function could share it): use a module-level function")
+        return {'name': name}
+    if type(v).__eq__ is object.__eq__:
+        raise TypeError(f"a {type(v).__qualname__} compares by identity, so its runs can't be "
+                        f"named or found again: pass it as su.Build(...) instead")
+    return {'repr': f'{type(v).__module__}.{type(v).__qualname__}', 'value': repr(v)}
+
+
+def _json(c):
+    return json.dumps(c, sort_keys=True)
+
+
+def _key(v):
+    """A hashable key for comparing values as canon does."""
+    return _json(canon(v))
+
+
+_canon = _key        # what load_experiments matches on: the same as what names the files
 
 
 def _grid_signatures(param_dict, forbidden):

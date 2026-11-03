@@ -40,48 +40,27 @@ except ImportError:
 #%%%%%%%%%%%%
 
 def arg_digest(args, n=10):
-    """A short, stable content hash of a FULL argument dict, for naming a run's
-    folder as ClassName/<digest> instead of one folder per parameter.
+    """A short, stable content hash of a FULL argument dict, for naming a run's files
+    (<task digest>_<model digest>) in the flat ClassName folder.
 
     Compact (fixed length, whatever the parameter count -> no MAX_PATH blowup on
-    Windows) and generic (any value type, incl. lists/dicts, via su.stringify +
-    json).  Because it hashes the *full* args at their explicit values, a run's
-    path does NOT depend on the current defaults: changing a default later leaves
-    every existing run's digest unchanged (unlike non-default naming, which
-    re-paths them).  The trade-off is opacity -- the folder is not human-readable
-    -- so save_experiment writes an `arguments_*.pkl` decode sidecar alongside it.
+    Windows), and it hashes the *full* args at their explicit values, so a run's name
+    does NOT depend on the current defaults: changing a default later leaves every
+    existing run's name unchanged. The trade-off is opacity, so save_experiment writes an
+    `arguments_*.pkl` decode sidecar alongside it.
 
-    Adding/removing/renaming a dataclass FIELD does change the digest (the field
-    set is part of the content); that is a genuine schema change and orphans old
-    saves in the per-key scheme too.
+    Values are hashed in su.canon's form, so the name depends on what a parameter is, not
+    how it was written: False, 0 and np.int64(0) name the same run, sets don't depend on
+    the hash seed, and nothing depends on the numpy version. Values that can't be named
+    stably (lambdas, objects compared by identity) raise; send_to_server checks this before
+    submitting.
 
-    numpy invariance: values are canonicalized so the digest does NOT depend on
-    the numpy version.  numpy 2.0 changed scalar repr (repr(np.int64(128)) went
-    from '128' to 'np.int64(128)'), which would otherwise re-path every run made
-    under numpy<2 (e.g. all cluster saves) once loaded under numpy>=2.  We pin the
-    numpy<2 behavior: integer scalars stringify to their plain digits, arrays to
-    lists, and float64 stays a native JSON number (as it always did).
+    Adding/removing/renaming a dataclass FIELD does change the digest (the field set is
+    part of the content): rerunning an old sweep after adding a field makes new files
+    beside the old ones, which lack the field.
     """
-    canon = json.dumps({k: su.stringify(v) for k, v in sorted(args.items())},
-                        sort_keys=True, default=_canon_default)
+    canon = json.dumps({k: su.canon(v) for k, v in args.items()}, sort_keys=True)
     return hashlib.md5(canon.encode()).hexdigest()[:n]
-
-
-def _canon_default(o):
-    """json.dumps `default` hook pinning numpy<2 serialization (see arg_digest).
-
-    Only values json can't natively handle reach here.  np.float64 is a float
-    subclass so it never does (stays a native number, as under numpy<2); np.int64
-    is not an int subclass, so under numpy<2 it fell through to repr -> the plain
-    digit string.  We reproduce that instead of numpy>=2's 'np.int64(...)' repr.
-    """
-    if isinstance(o, np.integer):
-        return str(int(o))          # numpy<2 repr(np.int64(128)) == '128'
-    if isinstance(o, np.ndarray):
-        return o.tolist()
-    if isinstance(o, (set, frozenset)):  # a set's order (and repr) changes with the hash seed
-        return sorted(o, key=lambda x: json.dumps(x, sort_keys=True, default=_canon_default))
-    return repr(o)
 
 
 def _build_fields(obj):

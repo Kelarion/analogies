@@ -26,22 +26,27 @@ trials), raised when the task is made (see check), not on the cluster.
 Where a part's text goes:
   system      the system prompt ('raw' mode: the start of the stream)
   transition  at the start of every block after the first
-  block       at the start of every block, the first included, after any transition
-              text, and filled in with that block's own fields (see below)
+  block       at the start of every block, the first included, after any transition text
+Both are filled in with their own block's fields (see below).
 
 Text is a str.format template. Its fields are the task's facts (see
 GrammarTask.prompt_facts, plus the ones derive() adds) and, per sample, the
 ones render() fills in from the model:
   pool     what the words are, from the model's token pool (POOLS)
-and per block, from the block's final trial (the one that is cut):
+and per block (see finals_of), from the block's final trial (the one that is cut):
   prefix   its shown words, e.g. 'poodle chair'
   target   'word', or '2 words' when more are held out
   missing  what to provide, as the hint says it: 'third word', 'next word', ...
   answer   its held-out words, e.g. 'lamp' (what the model should give)
-`block` text gets its own block's; `system` and `transition` text the final block's.
+and from how its words relate to the previous block's:
+  relabel  "Now the labels have been changed as follows: apple -> banana, cup -> cup. ",
+           or '' in the first block (or if no word carries over)
+`system` text gets the final block's.
 """
 from dataclasses import dataclass
 from typing import Callable
+
+import numpy as np
 
 # -- what the parts are made of ------------------------------------------------------
 
@@ -104,7 +109,9 @@ free = Part("Sequences can have different lengths, and are separated by commas. 
 vocab = Part("The tokens will be {pool}. ")
 task_desc = Part("Your job is to complete the next {target} in the sequence. ")
 hint = Part(block="The last {unit} will start with '{prefix}' and you should provide the {missing}. ")
-reveal = Part(block="The last {unit} will start with '{prefix}', and the {missing} will be '{answer}'. ")
+remap = Part(transition="{relabel}", block=hint.block)
+reveal = Part(transition="{relabel}",
+              block="The last {unit} will start with '{prefix}', and the {missing} will be '{answer}'. ")
 only_final = Part("Output ONLY the next {target}. ", chat_only=True)
 
 one_word = Part("You will be presented with a sequence that has a certain pattern. "
@@ -119,7 +126,7 @@ SLOTS = {
     'format': {'format': [triplets, fixed, free], 'triplets': [triplets]},
     'vocab':  {'vocab': [vocab]},
     'task':   {'task': [task_desc]},
-    'hint':   {'hint': [hint], 'reveal': [reveal]},
+    'hint':   {'hint': [hint], 'remap': [remap], 'reveal': [reveal]},   # each adds to the last
     'answer': {'only': [only_final]},
 }
 
@@ -129,7 +136,7 @@ PRESETS = {
 
 # the levels of explicitness and of hint, as the variant of their slot each picks (0: none)
 EXPLICITNESS = (None, 'vague', 'moderate', 'explicit')
-HINT = (None, 'hint', 'reveal')
+HINT = (None, 'hint', 'remap', 'reveal')
 
 # what the words of each of vocabulary.py's base pools are, for {pool}
 POOLS = {'nouns': 'arbitrary nouns', 'chars': 'arbitrary letters and digits',
@@ -152,8 +159,10 @@ def spec_from(explicitness=0, describe_format=False, describe_vocab=False,
     describe_format  what a trial looks like (triplets, words, or varying lengths)
     describe_vocab   what the words are (from the model's token pool)
     describe_task    "Your job is to complete the next word ..."
-    hint             0 none; 1 open each block with the start of its final trial; 2 and
-                     with its answer too (or the name of the level: 'hint', 'reveal')
+    hint             0 none; 1 open each block with the start of its final trial; 2 and,
+                     after the first, with how the previous block's words map onto its
+                     own; 3 and with the final trial's answer too (or the name of the
+                     level: 'hint', 'remap', 'reveal')
     answer_only      "Output ONLY the next word." (left out in 'raw' mode)
     """
     names = [EXPLICITNESS[level(explicitness, EXPLICITNESS, 'explicitness')],
@@ -288,27 +297,56 @@ def render(spec, facts, mode, pool, finals):
     """The text of a prompt for one sample:
         {'system': str or None, 'blocks': [text at the start of each block]}
     pool    the name of the model's base token pool (vocabulary.base_pool), a key of POOLS
-    finals  for each block, (the words shown of its final trial, the words held out)
+    finals  for each block, a dict of its words (see finals_of)
     """
     facts = derive(facts)
     if len(finals) != facts['n_blocks']:
         raise ValueError(f"finals has {len(finals)} blocks, the task {facts['n_blocks']}")
     parts = [p for p in compose(spec, facts) if not (p.chat_only and mode == 'raw')]
-    if (any('{prefix}' in p.system + p.transition + p.block for p in parts)
-            and not all(prefix for prefix, _ in finals)):
+    text = ''.join(p.system + p.transition + p.block for p in parts)
+    if '{prefix}' in text and not all(f['prefix'] for f in finals):
         raise ValueError("the hint needs part of each block's final trial shown (k_show > 0)")
-    fields = [_fields(facts, pool, prefix, answer) for prefix, answer in finals]
+    if '{relabel}' in text and any(f['remap'] is None for f in finals[1:]):
+        raise ValueError("the hint's remapping needs the task's code (data['code'])")
+    fields = [_fields(facts, pool, **f) for f in finals]
 
     system = ''.join(p.system for p in parts).format_map(fields[-1]).strip()
-    trans = ''.join(p.transition for p in parts).format_map(fields[-1])
+    trans = ''.join(p.transition for p in parts)
     lead = ''.join(p.block for p in parts)
-    blocks = [((trans if b else '') + lead.format_map(f)).strip() for b, f in enumerate(fields)]
+    blocks = [((trans if b else '') + lead).format_map(f).strip() for b, f in enumerate(fields)]
     return {'system': system or None, 'blocks': blocks}
 
 
-def _fields(facts, pool, prefix, answer):
-    """The template fields for a block whose final trial shows the words `prefix` and
-    hides the words `answer`."""
+def finals_of(splits, code, word):
+    """For one sample, the words render() needs of each block: a dict per block of
+      prefix  the shown words of its final trial
+      answer  the held-out words of its final trial
+      remap   [(word in the previous block, word in this one)] for each grammar token
+              seen both in the previous block and in this one's context; None in the
+              first block, or without a code
+    splits  for each block, (context, completion), as icl_utils.split_block gives them
+    code    code[b, r]: grammar token r's symbol in block b (data['code'][i]), or None
+    word    a symbol -> the word it is written as
+    The remapping leaves out tokens the model hasn't seen on both sides: one met only in
+    the held-out completion would give the answer away, and one not met at all means
+    nothing to it."""
+    out = []
+    for b, (ctx, comp) in enumerate(splits):
+        cut = np.where(ctx == 0)[0]
+        shown = ctx[cut[-1] + 1:] if len(cut) else ctx
+        remap = None
+        if b and code is not None:
+            before = set(np.concatenate(splits[b - 1]).tolist())    # all of it was shown
+            now = set(ctx.tolist())
+            remap = [(word(code[b - 1, r]), word(code[b, r])) for r in range(1, code.shape[1])
+                     if code[b - 1, r] in before and code[b, r] in now]
+        out.append({'prefix': [word(t) for t in shown], 'answer': [word(t) for t in comp],
+                    'remap': remap})
+    return out
+
+
+def _fields(facts, pool, prefix, answer, remap=None):
+    """The template fields for a block (see finals_of for the arguments)."""
     n_target = len(answer)
     pos = len(prefix) + 1                      # position of the first missing word
     if n_target == 1 and facts['trial_len'] is not None:
@@ -317,18 +355,21 @@ def _fields(facts, pool, prefix, answer):
         missing = "next word"
     else:
         missing = f"{'last' if facts['trial_len'] is not None else 'next'} {n_target} words"
+    relabel = ("Now the labels have been changed as follows: "
+               + ', '.join(f'{a} -> {b}' for a, b in remap) + ". ") if remap else ''
     return dict(facts, pool=POOLS.get(pool, 'arbitrary words'), prefix=' '.join(prefix),
-                answer=' '.join(answer), target='word' if n_target == 1 else f'{n_target} words', missing=missing)
+                answer=' '.join(answer), relabel=relabel,
+                target='word' if n_target == 1 else f'{n_target} words', missing=missing)
 
 
 def preview(task, mode='dialogue', pool='nouns', k_hide=1):
     """Print what the task's prompt makes for its first sample, with the symbols
     written as w1, w2, ... (the model would put words there). Needs no model."""
     from dataclasses import replace
+    from icl_utils import split_block
     data = replace(task, samps=1).sample()
-    w = lambda toks: [f'w{t}' for t in toks]
-    finals = [(w(tr[-1][:-1 - k_hide]), w(tr[-1][-1 - k_hide:-1]))   # each block's final trial
-              for tr in data['blocks'][0]]                         # (shown, held out)
+    splits = [split_block(trials, k_hide=k_hide) for trials in data['blocks'][0]]
+    finals = finals_of(splits, data['code'][0], lambda t: f'w{t}')
     out = render(data['prompt']['spec'], data['prompt']['facts'], mode, pool, finals)
     print(f"[spec] {data['prompt']['spec']!r}")
     print(f"[system] {out['system']}")

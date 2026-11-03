@@ -108,7 +108,8 @@ class ICLModel(sxp.Model):
         for i, blks in enumerate(blocks):
             task_toks = pool.assign(n_tok, rng)
 
-            system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks)
+            code = data['code'][i] if 'code' in data else None
+            system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks, code)
             lp, a, ids = lm.run_trial(
                 self.mode, blks, task_toks, k_show=self.k_show, k_hide=self.k_hide,
                 system_prompt=system_prompt, think=self.think,
@@ -121,19 +122,16 @@ class ICLModel(sxp.Model):
             self.metrics['prompts'].append(lm.tokenizer.decode(ids))
             print(f'[{i + 1}/{len(blocks)}] done', flush=True)
 
-    def _prompt(self, lm, prompt, blks, task_toks):
+    def _prompt(self, lm, prompt, blks, task_toks, code=None):
         """The task's prompt rendered for one sample: (system message or None, text
-        before each block or None)."""
+        before each block or None). code: the sample's data['code'], for the hint's
+        remapping."""
         if prompt is None:
             return None, None
-        finals = []                                   # each block's final trial
-        for trials in blks:
-            ctx, comp = split_block(trials, self.k_show, self.k_hide)
-            cut = np.where(ctx == 0)[0]
-            shown = ctx[cut[-1] + 1:] if len(cut) else ctx
-            words = lambda toks: [lm.tokenizer.decode([t]).strip() for t in task_toks[toks]]
-            finals.append((words(shown), words(comp)))    # (shown, held out)
+        splits = [split_block(trials, self.k_show, self.k_hide) for trials in blks]
+        word = lambda t: lm.tokenizer.decode([task_toks[t]]).strip()
         out = prompts.render(prompt['spec'], prompt['facts'], self.mode,
-                             vocabulary.base_pool(self.tokens), finals)
+                             vocabulary.base_pool(self.tokens),
+                             prompts.finals_of(splits, code, word))
         system = {'role': 'system', 'content': out['system']} if out['system'] else None
         return system, out['blocks']

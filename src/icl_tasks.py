@@ -24,9 +24,11 @@ class GrammarTask(sxp.Task):
     describe_format  say what a trial looks like (triplets, N words, varying lengths)
     describe_vocab   say what the words are (from the model's token pool)
     describe_task    "Your job is to complete the next word in the sequence."
-    hint             0 none; 1 open each block with the start of its final trial; 2 and
-                     with its answer too (the final block's included, so the model is told
-                     the test answer: a ceiling, or a control)
+    hint             0 none; 1 open each block with the start of its final trial; 2 and,
+                     after the first, with how the previous block's words map onto its own
+                     ("apple -> banana, cup -> cup"); 3 and with the final trial's answer
+                     too, the final block's included, so the model is told the test answer:
+                     a ceiling, or a control
     answer_only      "Output ONLY the next word." (left out in 'raw' mode)
     prompt           a spec (see prompts.py), used instead of the fields above when
                      given: e.g. 'one_word', or '' for no prompt
@@ -67,16 +69,14 @@ class GrammarTask(sxp.Task):
     describe_format: bool = False
     describe_vocab: bool = False
     describe_task: bool = False
-    hint: int = False   # levels 0 and 1 are kept as False and True: see __post_init__
+    hint: int = 0
     answer_only: bool = False
     prompt: str = None
 
     def __post_init__(self):
-        # hint was a bool before it had a level 2, and False/True hash differently from 0/1,
-        # so levels 0 and 1 are stored as False/True however they're given: runs saved
-        # before keep their digests, and hint=1 and hint=True are the same run
-        h = prompts.level(self.hint, prompts.HINT, 'hint')
-        self.hint = h if h > 1 else bool(h)
+        # stored as an int however it's given (2, np.int64(2), 'remap'), before .args is
+        # recorded, so the same level is always the same run
+        self.hint = prompts.level(self.hint, prompts.HINT, 'hint')
         super().__post_init__()                           # records .args, builds any Build
         if self.grammar is None:
             self.grammar = self.make_grammar()

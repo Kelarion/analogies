@@ -23,7 +23,7 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 #   'graph_seed': [0, 1, 2]                    three different graphs of each size
 
 # k = su.Set([8, 16])
-k = su.Set([8])
+k = su.Set([3,4,5])
 task_args = {'task': RelationTask,
              'k': k,
              'd': 2,

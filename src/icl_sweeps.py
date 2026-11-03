@@ -16,6 +16,8 @@ As when sending runs, a list means alternatives and anything else is a value.
 Every grid cell (and every line within it) must then come down to a single run; if it
 doesn't, the error names the parameters still varying, which is the cue to fix them in `where`.
 """
+import json
+
 import numpy as np
 import pandas as pd
 import scipy.special as spc
@@ -106,11 +108,65 @@ def varying(prm, runs=None, show=True):
     return out
 
 
-def _grid(prm, where, dims):
+def _digest_form(v):
+    """A value as the save names see it (su.canon), so values that would be saved under
+    different names come out different."""
+    try:
+        import server_utils as su
+    except ImportError:                                     # a rough stand-in
+        return repr(v)
+    try:
+        return su._key(v)
+    except (TypeError, ValueError) as e:                    # can't be named: say why
+        return f'<{e}>'
+
+
+def _type(v):
+    t = type(v)
+    return t.__name__ if t.__module__ == 'builtins' else f'{t.__module__}.{t.__name__}'
+
+
+def compare_runs(records, runs, show=True):
+    """
+    The arguments that differ between `runs` (indices into records) as the saved file
+    names see them, i.e. by how arg_digest serialises each value rather than by ==, side
+    by side for the task and the model (so a name on both sides, like seed, is compared
+    on each). Runs that look identical in prm but were saved as separate files differ
+    here, e.g. in type: hint=False on one, hint=0 or np.False_ on the other.
+    Returns {(side, name): [(value, type name) per run]}.
+    """
+    runs = [int(r) for r in runs]
+    out = {}
+    for side in ['task_args', 'model_args']:
+        args = [records[r][side] for r in runs]
+        for name in sorted(set().union(*args)):
+            missing = object()
+            vals = [a.get(name, missing) for a in args]
+            forms = {'<absent>' if v is missing else _digest_form(v) for v in vals}
+            if len(forms) > 1:
+                out[side[:-5], name] = [('<absent>', '') if v is missing else
+                                        (v, _type(v)) for v in vals]
+    if show:
+        try:
+            from super_experiments import arg_digest
+            print('runs', runs, 'in', [records[r].get('folder') for r in runs])
+            print('  file suffix now:', [arg_digest(records[r]['task_args']) + '_' +
+                                         arg_digest(records[r]['model_args']) for r in runs])
+        except ImportError:
+            pass
+        for (side, name), vals in out.items():
+            print(f'  {side} {name}: ' + ', '.join(f'{v!r} ({t})' for v, t in vals))
+        if not out:
+            print('  no difference in the arguments: the same run saved twice?')
+    return out
+
+
+def _grid(prm, where, dims, records=None):
     """
     The runs matching `where`, arranged by the parameters in `dims` (None for a dimension
     not used): returns ({(value per dim): run}, [values of each dim]). Raises if two runs
-    land in the same place, naming what still varies between them.
+    land in the same place, naming what still varies between them (and, given records,
+    what differs in how they were saved, when nothing differs in prm).
     """
     runs = select(prm, where)
     if len(runs) == 0:
@@ -126,10 +182,17 @@ def _grid(prm, where, dims):
         k, rs = next(iter(clash.items()))
         where_ = ', '.join(_label(d, v) for d, v in zip(dims, k) if d)
         rest = {n: v for n, v in varying(prm, rs, show=False).items() if n not in dims}
-        raise ValueError(
-            f"{len(rs)} runs at {where_ or 'the one cell'} (and {len(clash) - 1} other "
-            f"places), differing in {rest or 'nothing (duplicate runs?)'}; "
-            f"fix these in `where`")
+        if rest:
+            why = f"differing in {rest}; fix these in `where`"
+        else:
+            saved = compare_runs(records, rs, show=False) if records is not None else {}
+            why = ("identical in prm but saved separately, differing in " +
+                   '; '.join(f"{side} {n}: " + ' vs '.join(f'{v!r} ({t})' for v, t in vals)
+                             for (side, n), vals in saved.items())
+                   if saved else "identical in prm (duplicate runs?)")
+            why += f"; see compare_runs(records, {[int(r) for r in rs]})"
+        raise ValueError(f"{len(rs)} runs at {where_ or 'the one cell'} (and "
+                         f"{len(clash) - 1} other places), {why}")
     return {k: v[0] for k, v in cells.items()}, levels
 
 
@@ -159,7 +222,7 @@ def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
     title: f(record) for each panel's title, instead of the cell's parameter values.
     Returns the axes.
     """
-    cells, levels = _grid(prm, where, (rows, cols))
+    cells, levels = _grid(prm, where, (rows, cols), records)
     fig, axs = _figure(levels, size, sharey=False)
     for i, rv in enumerate(levels[0]):
         for j, cv in enumerate(levels[1]):
@@ -215,7 +278,7 @@ def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=
     refs are drawn dashed with hollow markers in the colour of their line.
     Returns the axes.
     """
-    cells, levels = _grid(prm, where, (rows, cols, hue))
+    cells, levels = _grid(prm, where, (rows, cols, hue), records)
     hues = levels[2]
     colors = plt.get_cmap(cmap)(np.linspace(0, 0.9, len(hues))) if hue else ['k']
     fig, axs = _figure(levels, size, sharey)
@@ -331,3 +394,5 @@ def trace(record, refs=()):
             df.loc[np.isnan(lp).all(-1), ['ll', 'kl', 'p_valid', 'top', 'p_top', 'task_mass']] = np.nan
             rows.append(df)
     return pd.concat(rows, ignore_index=True)
+
+    
