@@ -23,10 +23,14 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 #   'graph_seed': [0, 1, 2]                    three different graphs of each size
 
 # k = su.Set([8, 16])
+<<<<<<< HEAD
 k = su.Set([3,4,5])
+=======
+k = su.Set([3,4,5,6,7])
+>>>>>>> 7dca432 (stuff)
 task_args = {'task': RelationTask,
              'k': k,
-             'd': 2,
+             'd': [1,2,3],
              'degree': 0.9,
             #  'strong': True,
              'strong': False,
@@ -34,8 +38,8 @@ task_args = {'task': RelationTask,
              'commutes': [0, np.inf],
              'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
-            #  'num_trials': [2*[4*k**2], 4*[2*k**2], 8*[k**2]],
-             'num_trials': [[100, 100, 100, 100]],
+             'num_trials': [2*[4*k**2], 4*[2*k**2], 8*[k**2]],
+            #  'num_trials': [[100, 100, 100, 100]],
             #  'num_trials': 4*[2*k**2],
             #  'num_trials': [[None, None]],
              'length': 1,
