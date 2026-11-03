@@ -24,21 +24,18 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 # k = su.Set([8, 16])
 
-
-
 k = su.Set([3,4,5,6,7])
 
 task_args = {'task': RelationTask,
              'k': k,
              'd': [1,2,3],
-             'degree': 0.9,
+             'degree': 0.5,
             #  'strong': True,
              'strong': False,
             #  'backtrack': False,
-             'commutes': [0, np.inf],
              'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
-             'num_trials': [2*[4*k**2], 4*[2*k**2], 8*[k**2]],
+             'num_trials': [2*[8*k**2], 4*[4*k**2], 8*[2*k**2], 16*[k**2]],
             #  'num_trials': [[100, 100, 100, 100]],
             #  'num_trials': 4*[2*k**2],
             #  'num_trials': [[None, None]],
@@ -76,13 +73,14 @@ mod_args = {'model': ICLModel,
             # 'think': [True, False],
             'think': False,
             'k_hide': 1,
-            'effort': 'low',
-            'thinking_budget': 6000,
+            # 'effort': 'low',
+            # 'thinking_budget': 6000,
             'seed': 0,
-            'equiv': (True, False),
-            # 'delim': ['\n', ','],
-            'delim': ',',
-            'tokens': (icl_utils.Vocabulary('nouns'), icl_utils.Vocabulary('chars')),
+            # 'equiv': (True, False),
+            'equiv': True,
+            'delim': ['\n', ','],
+            # 'delim': ',',
+            'tokens': icl_utils.Vocabulary('nouns'),
             }
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
