@@ -83,7 +83,7 @@ mod_args = {'model': ICLModel,
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
 # (pickles copied to the cluster over ssh) or on the cluster; push/pull first either way.
-su.send_to_server(task_args, mod_args, per_job=4, verbose=True)            # or name='my-sweep'
+su.send_to_server(task_args, mod_args, per_job=4, exclude=['cn-g028', 'cn-g029'], verbose=True)            # or name='my-sweep'
 
 # # %% Or: run here, e.g. in an interactive session (each model is loaded once)
 # exps, _ = su.get_all_experiments(task_args, mod_args)

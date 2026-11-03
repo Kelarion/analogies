@@ -28,4 +28,21 @@ echo "node: $(hostname)  start: $(date -Is)  job: ${{SLURM_ARRAY_JOB_ID}}_${{SLU
 echo "commit: $(git rev-parse HEAD)"
 env | grep "^HF_" | sort            # where this job looks for weights
 uv sync --check -q || {{ echo "environment out of date: run 'uv sync' on the login node"; exit 1; }}
-uv run --no-sync python jobs/run_experiment.py $SLURM_ARRAY_TASK_ID {n_task} {sweep_dir} {per_job} {n_tot}
+# Python's output goes to the node's local disk, and is appended to this task's log in the
+# sweep folder at the end (retrying), so a flaky connection to scratch can't kill the run
+# by failing its prints. To watch a running task: ssh to its node, tail -f <tmpdir>/run.log
+RUN_LOG=$SLURM_TMPDIR/run.log
+echo "python output: $RUN_LOG on $(hostname), copied here when the task ends"
+save_log() {{
+    [ -n "$LOG_SAVED" ] && return
+    LOG_SAVED=1                   # claimed first: a signal arriving mid-copy mustn't copy again
+    for i in 1 2 3 4 5; do
+        cat "$RUN_LOG" >> {sweep_dir}/logs/$SLURM_ARRAY_TASK_ID.out 2>/dev/null && return
+        sleep 15
+    done
+}}
+trap save_log EXIT TERM
+uv run --no-sync python jobs/run_experiment.py $SLURM_ARRAY_TASK_ID {n_task} {sweep_dir} {per_job} {n_tot} > "$RUN_LOG" 2>&1
+status=$?
+save_log
+exit $status

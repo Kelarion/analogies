@@ -674,7 +674,7 @@ def _git(*args, cwd=REPO_DIR):
 
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
                    name=None, max_parallel=8, template=None, remote=None, check_commit=True,
-                   ensure_weights=True, per_job=1):
+                   ensure_weights=True, per_job=1, exclude=None):
     """
     Submit every task x model combination as one Slurm job array.
 
@@ -699,6 +699,7 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         can take longer than a short experiment, and many jobs loading at once strain the
         shared filesystem: for short runs, pick per_job so a job lasts tens of minutes.
         Consecutive combinations share a model, so a job loads one (or two, at a boundary).
+    exclude: nodes to keep the jobs off, e.g. ['cn-g028'] for a node with known problems.
     run_remote=False runs the first array task here instead, for debugging.
     max_parallel caps how many array tasks run at once.
     """
@@ -776,7 +777,8 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         for m, why in missing.items():
             print(f'Not cached on the cluster: {m}\n    ({why})')
         print(f'Downloading first (job {after}); the array starts once that succeeds.')
-    job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after)
+    extra = [f'--exclude={",".join(exclude)}'] if exclude else []
+    job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after, extra=extra)
     _record_job(sweep, job, remote)
     print(f'Submitted batch job {job} ({n_jobs} array tasks)')
     return sweep
@@ -997,8 +999,6 @@ def _canon(v):
     arg_digest canonicalizes): callables -> name, numpy scalars/arrays -> native,
     anything unhashable -> repr."""
     v = stringify(v)
-    if isinstance(v, set):
-        return frozenset(v)                  # hashable, and equal whatever its order
     if isinstance(v, np.generic):
         return v.item()
     if isinstance(v, np.ndarray):

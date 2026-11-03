@@ -37,7 +37,16 @@ SIGNATURES = [
 ]
 STATES = {'TIMEOUT': 'time limit', 'OUT_OF_MEMORY': 'CPU memory (oom-kill)',
           'NODE_FAIL': 'node failure', 'PREEMPTED': 'preempted', 'CANCELLED': 'cancelled'}
-TRANSIENT = {label for label, _, t in SIGNATURES if t} | {'no log', 'ended without an error'}
+TRANSIENT = {label for label, _, t in SIGNATURES if t} | {'no log', 'ended without an error', 'log writes failed (exit 120)'}
+
+
+def _slurm(cmd):
+    """Run a Slurm command; a clear exit if this machine doesn't have Slurm."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit(f"{cmd[0]} isn't available on this machine: run this on the cluster (from the "
+                 "laptop, server_utils.sweep_status() runs it there over ssh)")
 
 
 def sweep_dir(arg):
@@ -61,9 +70,8 @@ def sacct(job_ids):
     """{index: {'state', 'node', 'start'}} from the recorded array jobs, later ones winning."""
     info = {}
     for jid in job_ids:
-        out = subprocess.run(['sacct', '-j', jid, '-n', '-P', '-X',
-                              '--format=JobID,State,NodeList,Start,ExitCode'],
-                             capture_output=True, text=True).stdout
+        out = _slurm(['sacct', '-j', jid, '-n', '-P', '-X',
+                      '--format=JobID,State,NodeList,Start,ExitCode']).stdout
         for line in out.splitlines():
             job, state, node, start, code = (line.split('|') + [''] * 5)[:5]
             if '_' not in job:
@@ -82,16 +90,15 @@ def find_job_ids(d, warnings):
     Slurm version doesn't have are skipped, and its complaints collected in `warnings`."""
     script, logs = os.path.join(d, 'job_script.sh'), os.path.join(d, 'logs')
     for field, needle in (('SubmitLine', script), ('StdOut', logs)):
-        res = subprocess.run(['sacct', '-u', os.environ.get('USER', ''), '-S', 'now-60days', '-X',
-                              '-n', '-P', f'--format=JobID,{field}'],
-                             capture_output=True, text=True)
+        res = _slurm(['sacct', '-u', os.environ.get('USER', ''), '-S', 'now-60days', '-X',
+                      '-n', '-P', f'--format=JobID,{field}'])
         if res.returncode or res.stderr.strip():
             warnings.append(f'sacct --format=JobID,{field}: ' + (res.stderr.strip() or f'exit {res.returncode}'))
         ids = [line.split('|', 1)[0].split('_')[0] for line in res.stdout.splitlines()
                if needle in line.partition('|')[2]]
         if ids:
             return sorted(set(ids), key=int)
-    res = subprocess.run(['squeue', '--me', '-h', '-o', '%F|%o'], capture_output=True, text=True)
+    res = _slurm(['squeue', '--me', '-h', '-o', '%F|%o'])
     ids = [job for job, _, cmd in (l.partition('|') for l in res.stdout.splitlines()) if script in cmd]
     return sorted(set(ids), key=int)
 
@@ -105,6 +112,7 @@ def from_log(path):
     m = re.search(r'^node: (\S+)\s+start: (\S+)', text, re.M)
     if m:
         out['node'], out['start'] = m.groups()
+        out['node'] = out['node'].split('.')[0]       # cn-g028.server.mila.quebec -> cn-g028, as Slurm names it
     for label, pat, _ in SIGNATURES:
         hit = re.search(f'^.*(?:{pat}).*$', text, re.M)
         if hit:
@@ -163,6 +171,9 @@ def status(d, given_ids=()):
                 t['cause'] = STATES[t['state']]
             if t['state'] in ('PENDING', 'RUNNING', 'REQUEUED'):
                 t['cause'] = None
+            elif t['cause'] is None and (t.get('exit') or '').startswith('120:'):
+                # Python's exit code when it can't write its output at shutdown
+                t['cause'] = 'log writes failed (exit 120)'
             elif t['cause'] is None:
                 t['cause'] = 'no log' if not os.path.exists(log) else 'ended without an error'
                 if t['state']:
