@@ -16,11 +16,16 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 # %% Load: leave keys out to match any value
 
-k = su.Set([8])
+# k = su.Set([8])
+# k = su.Set([3,4,5,6,7])
+k = 4
+
 task_args = {'task': RelationTask,
              'k': k,
-             'd': 2,
-             'degree': 0.9,
+             'd': [1,2,3],
+        #      'd': 2,
+        #      'degree': 0.9,
+             
         }
 
 mod_args = {'model': ICLModel,
@@ -35,27 +40,30 @@ isw.varying(prm);         # what differs between the runs, and over what values
 # %% Which runs: fix everything except the grid (and line) dimensions
 
 these = {}
-these |= {'model_name': 'Qwen/Qwen3.8-27B'}
-# these |= {'model_name': 'google/gemma-4-31B'}
+# these |= {'model_name': 'Qwen/Qwen3.8-27B'}
+these |= {'model_name': 'google/gemma-4-31B'}
 these |= {'mode': 'raw'}
-these |= {'commutes': [0, np.inf]}
+these |= {'commutes': 0}
+these |= {'describe_task': True}
 # these |= {'explicitness': [0,3]}
-these |= {'describe_task': [True, False]}      # describe_format and answer_only go with it
-these |= {'hint': False}
+# these |= {'describe_task': [True, False]}      # describe_format and answer_only go with it
+# these |= {'hint': False}
 these |= {'share_toks': [False, {'action'}, {'node'}, True]}
-these |= {}
-these |= {'k': 8}
+# these |= {'k': 8}
 # these |= {'tokens': [icl_utils.Vocabulary('nouns'), icl_utils.Vocabulary('chars')]}
 these |= {'tokens': icl_utils.Vocabulary('nouns')}
 # these |= {'num_trials': (None, None)}                 # a list-valued field as a tuple
-# these |= {'num_trials': [(64, 64), (128, 128)]}       # a list: any of these
+# these |= {'num_trials': [[72,72]]}       # a list: any of these
 # these |= {'k': lambda k: k >= 8}
+these |= {'delim': ','}
+these |= {'d':2}
 
 # rows = 'k'
 # rows = 'explicitness'
 # rows = 'share_toks'
 # rows = 'tokens'
-rows = 'describe_task'
+# rows = 'describe_task'
+rows = 'hint'
 # rows = None
 
 # cols = 'explicitness'
@@ -66,7 +74,8 @@ cols = 'share_toks'
 # cols = None
 # cols = 'describe_task'
 
-lines = 'commutes'
+lines = 'num_trials'
+# lines = 'commutes'
 # lines = 'num_trials'
 # lines = 'explicitness'
 # lines = 'describe_task'
@@ -97,3 +106,21 @@ these_icl = these
 isw.plot_runs(records, prm, rows=rows, cols=cols, where=these_icl, n_trl=4000, refs=refs,
               kl=kl)
 plt.show()
+
+#%%
+
+deez = {'hint': 0, 'share_toks': False, 'num_trials': [2*[128]]}
+
+idx = isw.select(prm, these | deez)
+
+foo = isw.trace(records[idx[0]])
+
+#%%
+
+heldout = foo['final']*foo['hidden']
+plt.scatter(foo['block'][heldout], foo['ll'][heldout])
+
+#%%
+
+didit = np.where(foo['ll'][heldout][foo['block'][heldout]==1] > -1)[0]
+
