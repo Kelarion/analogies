@@ -1446,7 +1446,7 @@ def random_relation(k, r=1, degree=2, density=None, seed=None, functional=False)
 
 
 def spatial_relation(k, d, commutes=0, total=False, degree=None, inverse=False, 
-                     connectedness='weak', seed=None):
+                     connectedness='weak', n_edge=None, seed=None):
     
     rels = ['R' + str(i) for i in range(d)]
     items = [(r, 'L' + str(i)) for i, r in enumerate(rels)] if inverse else rels
@@ -1458,7 +1458,7 @@ def spatial_relation(k, d, commutes=0, total=False, degree=None, inverse=False,
             for B in groups[i + 1:]:
                 properties += [mln.commute(a, b, w=commutes) for a in A for b in B]
     
-    mod = mln.MLN(k, properties, degree=degree, constraint=connectedness)
+    mod = mln.MLN(k, properties, degree=degree, edges=n_edge, constraint=connectedness)
     
     return mod.sample(rng=np.random.default_rng(seed), method='tempering')
 

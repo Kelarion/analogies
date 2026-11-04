@@ -432,7 +432,8 @@ class RelationTask(AutomatonTask):
     """AutomatonTask on an FSA over a random relation (automata.random_relation)."""
     k: int                       # nodes
     d: int = 2                   # relations
-    degree: float = 0.5
+    edges: int = 1               # edges per relation
+    degree: float = None
     commutes: float = 0.0
     inverse: bool = False
     total: bool = False
@@ -452,6 +453,7 @@ class RelationTask(AutomatonTask):
         G = auto.spatial_relation(self.k, d=self.d, degree=self.degree,
                                  commutes=self.commutes, inverse=self.inverse, 
                                  total=self.total, seed=seed,
+                                 n_edge=self.edges,
                                  connectedness='strong' if self.strong else 'weak',
                                  )
 
