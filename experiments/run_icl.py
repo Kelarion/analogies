@@ -29,9 +29,11 @@ k = su.Set([4,5,6,7])
 task_args = {'task': RelationTask,
              'k': k,
              'd': [1,2],
-             'degree': 0.5,
+            #  'degree': 0.5,
+             'edges': k,
             #  'strong': True,
-             'strong': False,
+            #  'strong': False,
+             'connected': 'weak',
              'keep_connected': False,
             #  'backtrack': False,
              'graph_seed': 0,                  # same graph for every prompt condition below
