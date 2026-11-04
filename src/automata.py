@@ -224,6 +224,34 @@ class Automaton(Sequential):
     def _emit(self, **tok):
         return tuple(int(tok[k]) for k in self._step_kinds)
 
+    def describe(self):
+        """
+        The automaton as plain data (lists, dicts and labels), to save with a run:
+
+            type         'FSA' or 'PDA'
+            nodes        [(node, attrs)], in graph order
+            edges        [(u, v, key, attrs)]: attrs carry action and weight, and a PDA's
+                         pop and push (key is None unless the graph is a multigraph)
+            directed, multigraph   the kind of graph
+            init         the start node(s), as given (None: the class's default)
+            args         a PDA's other settings (bottom, final, ...); {} for an FSA
+            vocab        the label of each grammar token id (None for 0, the delimiter)
+            transitions  [(tokens, probs)], one trial per transition, as transitions()
+
+        as_graph(description) rebuilds the graph, e.g. for plotting.draw_multigraph.
+        """
+        G = self.graph
+        multi = G.is_multigraph()
+        edges = (G.edges(keys=True, data=True) if multi
+                 else ((u, v, None, d) for u, v, d in G.edges(data=True)))
+        return {'type': type(self).__name__,
+                'nodes': [(n, dict(d)) for n, d in G.nodes(data=True)],
+                'edges': [(u, v, k, dict(d)) for u, v, k, d in edges],
+                'directed': G.is_directed(), 'multigraph': multi,
+                'init': self.init, 'args': dict(getattr(self, '_args', {})),
+                'vocab': list(self.vocab),
+                'transitions': self.transitions()}
+
 
 class FSA(Automaton):
     """Walks on a graph whose edges carry actions (attribute `action`, default
@@ -607,7 +635,8 @@ class FSA(Automaton):
             cache[symmetric] = safe
         return cache[symmetric]
 
-    def sample_holdout(self, rng, unit="pair", symmetric=False, keep_connected=False):
+    def sample_holdout(self, rng, unit="pair", symmetric=False, keep_connected=False,
+                       keep_seen=True):
         """A random unit to hold out. unit="edge": Edge(u, v), every edge
         u -> v whatever its action, for a transition u -a-> v drawn uniformly
         among those left (so node pairs joined by more actions come up more
@@ -615,7 +644,10 @@ class FSA(Automaton):
         (and its reverse, if symmetric) leaves every weakly and strongly
         connected component whole (see holdout_edges). unit="pair": a (node,
         action) pair, a node uniformly among those with an action left (so
-        never a sink), then one of its actions uniformly."""
+        never a sink), then one of its actions uniformly. With keep_seen (the
+        default; either unit), only units whose hold-out (and its reverse, if
+        symmetric) leaves every shown node and action on some edge, so none is
+        first seen in the test (see _keeps_seen)."""
         if unit == "edge":
             es = list(dict.fromkeys((i, int(a), int(j)) for i in range(len(self.states))
                                     for a, j in zip(self.out_a[i], self.out_j[i])))
@@ -625,6 +657,12 @@ class FSA(Automaton):
                 if not es:
                     raise ValueError("every edge's hold-out splits a connected component "
                                      "(keep_connected=False allows it)")
+            if keep_seen:
+                units = [Edge(self.states[i], self.states[j]) for i, _, j in es]
+                es = [e for e, ok in zip(es, self._keeps_seen(units, symmetric)) if ok]
+                if not es:
+                    raise ValueError("every edge's hold-out leaves a node or action unseen "
+                                     "(keep_seen=False allows it)")
             if not es:
                 raise ValueError("no edge to hold out")
             i, _, j = es[rng.integers(len(es))]
@@ -633,13 +671,39 @@ class FSA(Automaton):
             raise ValueError(f"unit must be 'pair' or 'edge', not {unit!r}")
         if keep_connected:
             raise ValueError("keep_connected needs unit='edge'")
-        nodes = [i for i in range(len(self.states)) if len(self.out_a[i])]
+        pairs = [(i, a) for i in range(len(self.states)) for a in dict.fromkeys(self.out_a[i])]
+        if keep_seen:
+            units = [(self.states[i], self.actions[a]) for i, a in pairs]
+            pairs = [p for p, ok in zip(pairs, self._keeps_seen(units, symmetric)) if ok]
+        nodes = list(dict.fromkeys(i for i, _ in pairs))
         if not nodes:
-            raise ValueError("no node has an action to hold out")
+            raise ValueError("no node has an action to hold out"
+                             + (" that leaves every node and action seen "
+                                "(keep_seen=False allows it)" if keep_seen else ""))
         i = nodes[rng.integers(len(nodes))]                  # node *index*
-        acts = list(dict.fromkeys(self.out_a[i]))            # each action once
+        acts = [a for ii, a in pairs if ii == i]             # each action once
         a = acts[rng.integers(len(acts))]                    # action index
         return (self.states[i], self.actions[a])             # as *labels*
+
+    def _keeps_seen(self, units, symmetric=False):
+        """For each unit, whether holding it out (with its reverse, if symmetric)
+        leaves every label the walks show -- each node, if nodes are shown, and
+        each action, if actions are -- on some edge left after forbid: no row of
+        the label x edge incidence matrix that has an edge loses all of them."""
+        n = len(self.states)
+        held = lambda fb, i, j, a: ((self.states[i], a) in fb or Edge(self.states[i], self.states[j]) in fb
+                                    or Edge(self.states[i], self.states[j], a) in fb)
+        E = [(i, j, a) for i, j, a in self._edges if not held(self.forbid, i, j, a)]
+        rows = []
+        if "node" in self.show:
+            rows += [[x in (i, j) for i, j, _ in E] for x in range(n)]
+        if "action" in self.show:
+            rows += [[a == b for _, _, a in E] for b in self.actions]
+        M = np.array(rows, int).reshape(len(rows), len(E))          # label x edge
+        gone = [{u} | (self.reverse(u) if symmetric else set()) for u in units]
+        R = np.array([[held(g, *e) for e in E] for g in gone], int).reshape(len(units), len(E))
+        left = M @ (1 - R).T                                         # label x unit: edges left
+        return ((left > 0) | (M.sum(1, keepdims=True) == 0)).all(0)
 
     def can_end_with(self, unit, forbid=()):
         """Whether generate(forbid=forbid, end_with=unit) has any walk to give,
@@ -1302,6 +1366,19 @@ class PDA(Automaton):
                     e = self._emit(top=ttok, action=atok, push=ptok, node=self.node_tok[j])
                     cands.append((p / tot / len(tops) / len(at), e0 + e))
         return _listing(cands, len(self.vocab))
+
+
+def as_graph(desc):
+    """The networkx graph of an Automaton.describe() description."""
+    G = {(True, True): nx.MultiDiGraph, (True, False): nx.DiGraph,
+         (False, True): nx.MultiGraph, (False, False): nx.Graph}[desc['directed'], desc['multigraph']]()
+    G.add_nodes_from(desc['nodes'])
+    for u, v, k, d in desc['edges']:
+        if k is None:
+            G.add_edge(u, v, **d)
+        else:
+            G.add_edge(u, v, key=k, **d)
+    return G
 
 
 # ==========================================================================

@@ -253,18 +253,30 @@ class ChatLM:
 
     # -- scoring --------------------------------------------------------------------
 
+    @cached_property
+    def special_ids(self):
+        """Token ids that aren't text: the tokenizer's special tokens and every added token
+        (for Qwen, the chat and thinking markers: <|im_end|>, <think>, ...). Check
+        tokenizer.get_added_vocab() for a new model, in case it adds ordinary words."""
+        tok = self.tokenizer
+        return sorted(set(tok.all_special_ids) | set(tok.get_added_vocab().values()))
+
     @torch.no_grad()
     def run_trial(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
                   think=True, thinking_budget=4000, equiv=None, block_text=None, **template_kwargs):
         """
         Build the prompt, think if asked (not in 'raw' mode), and score it.
 
-        Returns logp_ctx, ans, input_ids:
+        Returns logp_ctx, ans, input_ids, top:
           logp_ctx  {(role, block): (span length + 1, len(task_toks))} task-token log-probs
                     predicting each token of the span and the one after it; the final
                     block's assistant entry covers the target
           ans       the log-probs at the start of the final completion
           input_ids the full prompt including any reasoning (without the target)
+          top       {'ids': {...}, 'lp': {...}}, keyed and rowed like logp_ctx: the most
+                    likely token at each row, (rows, 2), over the whole vocabulary (column
+                    0) and over text only (column 1: without special_ids), with its
+                    full-vocabulary log-prob. -1 and nan where nothing predicts.
         """
         input_ids, spans, target = self.build_prompt(
             mode, blocks, task_toks, k_show, k_hide, system_prompt, think,
@@ -276,22 +288,29 @@ class ChatLM:
         L = len(input_ids)
         logits = self.bridge(torch.cat([input_ids, target])[None])[0]
         lp = task_logprobs_gpu(logits, task_toks, equiv)
+        not_text = self.special_ids + list(range(len(self.tokenizer), logits.shape[-1]))
+        top_ids, top_lp = top_tokens_gpu(logits, not_text)   # (unused padding rows too)
         del logits
 
-        def rows(s, e):
+        def rows(a, s, e, fill):
             """Predictions for tokens s..e-1, plus the prediction of the token after the span."""
             if s == 0:     # raw stream without BOS: nothing predicts the very first token
-                return np.vstack([np.full((1, lp.shape[1]), np.nan), lp[:e]])
-            return lp[s - 1 : e]
+                return np.concatenate([np.full((1,) + a.shape[1:], fill, a.dtype), a[:e]])
+            return a[s - 1 : e]
 
-        logp_ctx = {(r, b): rows(s, e) for r, b, s, e in spans}
-        logp_ctx[('assistant', len(blocks) - 1)] = lp[L - 1 : L + len(target)]
+        def by_span(a, fill):
+            out = {(r, b): rows(a, s, e, fill) for r, b, s, e in spans}
+            out[('assistant', len(blocks) - 1)] = a[L - 1 : L + len(target)]
+            return out
+
+        logp_ctx = by_span(lp, np.nan)
+        top = {'ids': by_span(top_ids, -1), 'lp': by_span(top_lp, np.nan)}
 
         # generation can leave tensors in reference cycles; collect them, then hand the
         # freed GPU blocks back so memory doesn't creep up across trials
         gc.collect()
         torch.cuda.empty_cache()
-        return logp_ctx, lp[L - 1], input_ids
+        return logp_ctx, lp[L - 1], input_ids, top
 
 
 def test_token_logits(logs, spans, blocks, Y, task_toks, k_show=None, k_hide=None, ans=None):
@@ -345,6 +364,42 @@ def xent(lp, y):
 def mean_sem(a):
     a = np.asarray(a, dtype=float)
     return np.nanmean(a, 0), np.nanstd(a, 0)
+
+
+def spread(a, err='std'):
+    """
+    Centre and error bars of `a` (samples x points), over the samples, by `err`:
+        'std'       the mean, +/- the standard deviation
+        'iqr'       the median, from the 25th to the 75th percentile
+        (lo, hi)    the median, from the lo to the hi quantile, e.g. (0.1, 0.9)
+        None        the mean, and no bars
+    Returns the centre (points,) and yerr (2, points), the distances below and above it,
+    as errorbar takes them (None for no bars).
+    """
+    a = np.asarray(a, float)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)          # all-nan columns: gaps
+        if err is None or err == 'std':
+            mu = np.nanmean(a, 0)
+            if err is None:
+                return mu, None
+            sd = np.nanstd(a, 0)
+            return mu, np.stack([sd, sd])
+        if err == 'iqr':
+            err = (0.25, 0.75)
+        if not (isinstance(err, (tuple, list)) and len(err) == 2):
+            raise ValueError(f"err is 'std', 'iqr', a pair of quantiles or None, not {err!r}")
+        q = np.nanquantile(a, [err[0], 0.5, err[1]], axis=0)
+    return q[1], np.stack([q[1] - q[0], q[2] - q[1]])
+
+
+def draw_traces(ax, x, rows, color, alpha=True):
+    """Each row of `rows` (samples x points) as a thin translucent line over x, joining
+    its scored points across gaps. alpha=True is 0.15; a number sets it."""
+    alpha = 0.15 if alpha is True else alpha
+    for r in np.atleast_2d(np.asarray(rows, float)):
+        ok = np.isfinite(r)
+        ax.plot(np.asarray(x)[ok], r[ok], color=color, lw=0.6, alpha=alpha, zorder=1)
 # Reference predictors: what a simple strategy would predict for each token.
 # Each takes (data, i) and returns P, shape (len(X), V): row t is the predicted
 # distribution of token t of sample i (aligned with data['Y'][i]). Fix any other
@@ -433,7 +488,7 @@ def ylabel(perplexity=False, kl=False):
     return 'perplexity (exp cross-entropy)' if perplexity else 'log-likelihood (−cross-entropy)'
 
 def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title='', cmap='viridis',
-             refs=(), perplexity=False, kl=False):
+             refs=(), perplexity=False, kl=False, err='std', traces=False):
     """
     n_trl:  number of trials (comma-separated segments) per block to show, from the block's start
     k_hide: if given, show only the last k_hide tokens of each trial; otherwise every token
@@ -452,6 +507,11 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
             0 is the true distribution; the references likewise. The same as the
             log-likelihood wherever Y is deterministic. With perplexity, exp(KL): the
             model's perplexity as a multiple of the true distribution's.
+    err:    the error bars, over samples (see spread): 'std' (mean +/- std, the default),
+            'iqr' (median, 25th to 75th percentile), a pair of quantiles around the
+            median, or None. The references' lines follow the same centre.
+    traces: also draw every sample's curve, thin and translucent behind the summary
+            (True, or the opacity to use).
     """
     refs = dict(refs)
     f = (lambda v: np.exp(-v)) if perplexity else (lambda v: v)
@@ -514,11 +574,14 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
 
     style = dict(ls='--', lw=0.8, ms=5, mfc='none')
     for b in range(nblk):
-        mu, se = mean_sem(flat(curves['model'][b]))
-        ax.errorbar(x, mu, se, color=colors[b], marker='o' if k_hide else None, ms=4,
+        F = flat(curves['model'][b])
+        if traces:
+            draw_traces(ax, x, F, colors[b], traces)
+        mu, e = spread(F, err)
+        ax.errorbar(x, mu, e, color=colors[b], marker='o' if k_hide else None, ms=4,
                     label=f'block {b}')
         for m, k in enumerate(refs):
-            mu = np.nanmean(flat(curves[k][b]), 0)
+            mu = spread(flat(curves[k][b]), err)[0]
             mu[~np.isfinite(mu)] = np.nan                           # -inf (unseen n-gram) as a gap too
             ax.plot(x, mu, color=colors[b], alpha=0.8,
                     marker=REF_MARKERS[m % len(REF_MARKERS)], **style)
@@ -533,8 +596,12 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
         ax.axvline(x_side - 1, color='0.8', lw=1)
         offsets = np.linspace(-0.4, 0.4, nblk) if nblk > 1 else [0.0]
         for b in range(nblk):
-            mu, se = mean_sem(stars[b])
-            ax.errorbar([x_side + offsets[b]], [mu], [se], color=colors[b], marker='*', ms=12,
+            s = np.asarray(stars[b], float)
+            if traces:                                              # one dot per sample
+                ax.plot(np.full(len(s), x_side + offsets[b]), s, '.', color=colors[b],
+                        alpha=0.15 if traces is True else traces, zorder=1)
+            mu, e = spread(s[:, None], err)
+            ax.errorbar([x_side + offsets[b]], mu, e, color=colors[b], marker='*', ms=12,
                         ls='none', label='assistant turn' if b == nblk - 1 else None)
         ticks.append(x_side)
         labels.append('asst')
@@ -566,6 +633,24 @@ def task_logprobs_gpu(logits, task_toks, equiv=None, chunk=512):
         else:
             out.append(torch.stack([torch.logsumexp(c[:, g], dim=-1) for g in groups], dim=-1) - lse)
     return torch.cat(out).cpu().numpy()
+
+
+def top_tokens_gpu(logits, exclude=(), chunk=512):
+    """The most likely token at each position, over the whole vocabulary and over all but
+    the ids in `exclude`, computed on the GPU a chunk at a time like task_logprobs_gpu.
+    Returns ids (T, 2) int32 and their full-vocabulary log-probs (T, 2) float32."""
+    ex = torch.as_tensor(list(exclude), dtype=torch.long, device=logits.device)
+    ids, lps = [], []
+    for c in logits.split(chunk):
+        c = c.float()
+        c = c - torch.logsumexp(c, dim=-1, keepdim=True)
+        v0, i0 = c.max(dim=-1)
+        c[:, ex] = -torch.inf
+        v1, i1 = c.max(dim=-1)
+        ids.append(torch.stack([i0, i1], dim=-1))
+        lps.append(torch.stack([v0, v1], dim=-1))
+    return (torch.cat(ids).cpu().numpy().astype(np.int32),
+            torch.cat(lps).cpu().numpy().astype(np.float32))
 
 
 def task_logprobs(logs, task_toks, equiv=None):

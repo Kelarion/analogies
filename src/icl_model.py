@@ -103,14 +103,17 @@ class ICLModel(sxp.Model):
         template_kwargs = {} if self.effort is None else {'reasoning_effort': self.effort}
         equiv = pool.equiv
 
+        # top_ids, top_lp: the most likely token over the whole vocabulary and over text
+        # only, per row of logp_ctx (see ChatLM.run_trial); top_vocab decodes their ids
         self.metrics = {'logp_ctx': [], 'ans': [], 'task_tokens': [], 'prompts': [],
+                        'top_ids': [], 'top_lp': [], 'top_vocab': {},
                         'data': dict(data, blocks=blocks, X=X, prompt=prompt)}
         for i, blks in enumerate(blocks):
             task_toks = pool.assign(n_tok, rng)
 
             code = data['code'][i] if 'code' in data else None
             system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks, code)
-            lp, a, ids = lm.run_trial(
+            lp, a, ids, top = lm.run_trial(
                 self.mode, blks, task_toks, k_show=self.k_show, k_hide=self.k_hide,
                 system_prompt=system_prompt, think=self.think,
                 thinking_budget=self.thinking_budget, equiv=equiv, block_text=block_text,
@@ -118,6 +121,12 @@ class ICLModel(sxp.Model):
 
             self.metrics['logp_ctx'].append(lp)
             self.metrics['ans'].append(a)
+            self.metrics['top_ids'].append(top['ids'])
+            self.metrics['top_lp'].append(top['lp'])
+            seen = np.unique(np.concatenate([v.ravel() for v in top['ids'].values()]))
+            self.metrics['top_vocab'].update(
+                {int(t): lm.tokenizer.decode([int(t)]) for t in seen
+                 if t >= 0 and int(t) not in self.metrics['top_vocab']})
             self.metrics['task_tokens'].append(lm.tokenizer.convert_ids_to_tokens(task_toks))
             self.metrics['prompts'].append(lm.tokenizer.decode(ids))
             print(f'[{i + 1}/{len(blocks)}] done', flush=True)

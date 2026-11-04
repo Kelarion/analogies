@@ -24,7 +24,7 @@ import scipy.special as spc
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-from icl_utils import xent, plot_icl, split_block, ylabel
+from icl_utils import xent, plot_icl, split_block, ylabel, spread, draw_traces
 
 
 # -- choosing runs ---------------------------------------------------------------------
@@ -214,11 +214,11 @@ def _title(rows, cols, rv, cv):
 # -- plot_icl on a grid ------------------------------------------------------------------
 
 def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
-              perplexity=False, kl=False, size=(5, 4), title=None):
+              perplexity=False, kl=False, err='std', traces=False, size=(5, 4), title=None):
     """
     plot_icl for each run matching `where`, on a grid of `rows` x `cols` (parameter
     names; leave either out for a single row or column). Empty cells are hidden.
-    perplexity, kl: as for plot_icl.
+    perplexity, kl, err, traces: as for plot_icl.
     title: f(record) for each panel's title, instead of the cell's parameter values.
     Returns the axes.
     """
@@ -235,7 +235,7 @@ def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
             plot_icl(ax, m['logp_ctx'], m['data'], n_trl=n_trl, k_hide=a.get('k_hide'),
                      title=title(rec) if title else _title(rows, cols, rv, cv),
                      show_assistant=(a.get('mode') != 'raw'), refs=refs,
-                     perplexity=perplexity, kl=kl)
+                     perplexity=perplexity, kl=kl, err=err, traces=traces)
     fig.tight_layout()
     return axs
 
@@ -270,11 +270,13 @@ REF_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X']
 
 
 def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=(),
-                 perplexity=False, kl=False, cmap='viridis', size=(4, 3.5), sharey=True):
+                 perplexity=False, kl=False, err='std', traces=False, cmap='viridis',
+                 size=(4, 3.5), sharey=True):
     """
     Held-out log-likelihood (or perplexity, or -KL; see plot_icl) of each block's test
-    token against the block,
-    mean and std over samples (as plot_icl): one line per value of `hue`, on a grid of `rows` x `cols`.
+    token against the block, summarised over samples as `err` says (see plot_icl: mean
+    and std by default), one line per value of `hue`, on a grid of `rows` x `cols`.
+    traces: also draw each sample's line, thin and translucent (True, or the opacity).
     refs are drawn dashed with hollow markers in the colour of their line.
     Returns the axes.
     """
@@ -295,10 +297,12 @@ def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=
                 s = heldout(records[r], refs, perplexity, kl)
                 x = np.arange(1, s['model'].shape[1] + 1)
                 nmax = max(nmax, len(x))
-                ax.errorbar(x, np.nanmean(s['model'], 0), np.nanstd(s['model'], 0),
-                            color=colors[h], marker='o', ms=6, lw=2, capsize=2)
+                if traces:
+                    draw_traces(ax, x, s['model'], colors[h], traces)
+                mu, e = spread(s['model'], err)
+                ax.errorbar(x, mu, e, color=colors[h], marker='o', ms=6, lw=2, capsize=2)
                 for k, name in enumerate(refs):
-                    ax.plot(x, np.nanmean(s[name], 0), color=colors[h], alpha=0.8,
+                    ax.plot(x, spread(s[name], err)[0], color=colors[h], alpha=0.8,
                             marker=REF_MARKERS[k % len(REF_MARKERS)], **style)
             ax.set_title(_title(rows, cols, rv, cv))
             ax.set_xlabel('block')
@@ -343,6 +347,10 @@ def trace(record, refs=()):
                                of Y, so 0 for the true distribution (plot_icl(kl=True)
                                plots -kl); the same as -ll wherever Y is deterministic
         ll_<ref>, kl_<ref>     each reference predictor's score, as in plot_icl
+        top_any, p_top_any     the most likely token over the whole vocabulary, and its
+                               probability (not renormalised), e.g. '<|im_end|>'
+        top_text, p_top_text   the same over text only, without special tokens (runs
+                               saved before these were recorded leave all four out)
 
     plot_icl's curve for block b is the mean (and std) over samples of ll on the hidden
     rows, by trial: tr[tr.hidden].groupby(['block', 'trial']).ll.agg(['mean', 'std']).
@@ -353,6 +361,7 @@ def trace(record, refs=()):
     m, a = record['metrics'], record['model_args']
     data, refs = m['data'], dict(refs)
     k_show, k_hide = a.get('k_show'), a.get('k_hide')
+    has_top = 'top_ids' in m
     rows = []
     for i, lpc in enumerate(m['logp_ctx']):
         X, Y, B, blocks = data['X'][i], data['Y'][i], data['B'][i], data['blocks'][i]
@@ -366,6 +375,11 @@ def trace(record, refs=()):
             lp = np.full((n, ctx.shape[1]), np.nan)
             lp[:n_ctx] = ctx[:n_ctx]                        # row r of ctx predicts token r
             lp[n_ctx:n_ctx + len(comp)] = asst[:len(comp)]  # the completion; its delimiter unscored
+            if has_top:                                     # the same rows of the top tokens
+                tid, tlp = np.full((n, 2), -1), np.full((n, 2), np.nan)
+                for arr, src in [(tid, m['top_ids'][i]), (tlp, m['top_lp'][i])]:
+                    arr[:n_ctx] = src[('user', b)][:n_ctx]
+                    arr[n_ctx:n_ctx + len(comp)] = src[('assistant', b)][:len(comp)]
             trial = np.repeat(np.arange(len(trials)), [len(tr) for tr in trials])
             pos = np.concatenate([np.arange(len(tr)) for tr in trials])
             real = np.repeat([len(tr) - 1 for tr in trials], [len(tr) for tr in trials])
@@ -385,6 +399,11 @@ def trace(record, refs=()):
                        'p_valid': (p * (Yb > 0)).sum(-1),
                        'top': [words[x] for x in top] if words else top,
                        'p_top': p[np.arange(n), top], 'task_mass': mass}
+                if has_top:
+                    word_of = lambda j: m['top_vocab'].get(int(j)) if j >= 0 else None
+                    for c, name in enumerate(['any', 'text']):
+                        row['top_' + name] = [word_of(j) for j in tid[:, c]]
+                        row['p_top_' + name] = np.exp(tlp[:, c])
                 for k, Pk in P.items():
                     Q = Pk[ts]
                     row['ll_' + k] = spc.xlogy(Yb, Q / Q.sum(-1, keepdims=True)).sum(-1)
@@ -394,5 +413,3 @@ def trace(record, refs=()):
             df.loc[np.isnan(lp).all(-1), ['ll', 'kl', 'p_valid', 'top', 'p_top', 'task_mass']] = np.nan
             rows.append(df)
     return pd.concat(rows, ignore_index=True)
-
-    

@@ -54,8 +54,10 @@ class GrammarTask(sxp.Task):
 
     The grammar is either given (grammar=..., or a Build of one), or left out and made by
     make_grammar() from the task's own fields, as the subclasses at the end of this file do.
-    Either way it is made when the task is, i.e. inside the job. Fields are keyword-only,
-    so subclasses can add required ones."""
+    Either way it is made when the task is, i.e. inside the job. A subclass can replace it
+    between samples (see _new_sample): an AutomatonTask that makes its own grammar makes a
+    fresh one for every sample. Fields are keyword-only, so subclasses can add required
+    ones."""
 
     grammar: gram.Sequential = None
     num_trials: list
@@ -84,9 +86,10 @@ class GrammarTask(sxp.Task):
         spec = self.prompt_spec                           # checks the fields
         prompts.check(spec, self.prompt_facts())
 
-    def make_grammar(self):
-        """The grammar, from the task's fields, when none is given. Subclasses that
-        describe their grammar by fields override this."""
+    def make_grammar(self, sample=0):
+        """The grammar, from the task's fields, when none is given: sample's, for tasks
+        that make one per sample (see AutomatonTask). Subclasses that describe their
+        grammar by fields override this."""
         raise TypeError(f"{type(self).__name__} needs grammar=...")
 
     @property
@@ -175,6 +178,22 @@ class GrammarTask(sxp.Task):
 
     # -- what a block is ----------------------------------------------------
 
+    def _new_sample(self, rng, s):
+        """Called before the first block of sample s. A subclass can replace the grammar
+        here, with _set_grammar."""
+
+    def _set_grammar(self, g):
+        """Use grammar g from now on, e.g. a fresh one for the next sample. Its tokens must
+        match the current grammar's, kind for kind, since the prompt, the symbols and the
+        data's V are set up once for every sample."""
+        before, prev = self._kinds(), self.grammar
+        self.grammar = g
+        if self._kinds() != before:
+            self.grammar = prev
+            raise ValueError(f"the new grammar has {len(g.vocab)} tokens, the old one "
+                             f"{len(prev.vocab)}, or other kinds of token: the samples need "
+                             "the same ones (e.g. every action must have some edge)")
+
     def _block_sizes(self):
         if any(n is None for n in self.num_trials):
             raise ValueError("num_trials=None lists transitions: use AutomatonTask")
@@ -215,7 +234,10 @@ class GrammarTask(sxp.Task):
         Ys = []
         blks = []
         which_block = []
-        for _ in range(self.samps):
+        self._used = []                                    # the grammar of each sample
+        for s in range(self.samps):
+            self._new_sample(rng, s)
+            self._used.append(self.grammar)
 
             seq = []
             pr = []
@@ -283,8 +305,12 @@ class AutomatonTask(GrammarTask):
     every trial, the last included, so u -> v is tested having seen neither
     u -> v nor v -> u. With keep_connected (FSA edges only), the hold-out
     never splits a weakly or strongly connected component of the graph (see
-    holdout_edges). A sampled block only draws hold-outs that some walk can
-    end on with all that held out (see can_end_with), redrawing the rest.
+    holdout_edges). For an FSA (either unit), the hold-out never takes away the
+    last edge of a node or of an action, so every node and action the trials
+    show is still somewhere in the block's context, and only the combination is
+    new in the test (see FSA.sample_holdout). A sampled block only draws
+    hold-outs that some walk can end on with all that held out (see
+    can_end_with), redrawing the rest.
     max_redraws: how many draws to try before giving up."""
 
     holdout: bool = False
@@ -306,6 +332,28 @@ class AutomatonTask(GrammarTask):
                     structure='pda' if pda else 'fsa', noun='automaton' if pda else 'graph',
                     shows=tuple(g._step_kinds), trial_len=lens.pop() if len(lens) == 1 else None,
                     holdout=self.holdout, listed=any(n is None for n in self.num_trials))
+
+    def _new_sample(self, rng, s):
+        """A fresh automaton for each sample, make_grammar(s), when the task makes its own
+        (sample 0's is made with the task). For a random graph (RelationTask) every sample
+        has its own; a fixed one (CycleTask, GridTask) just comes out the same again. A
+        given grammar is kept for every sample."""
+        if s > 0 and self.args['grammar'] is None:
+            self._set_grammar(self.make_grammar(s))
+
+    def sample(self):
+        """GrammarTask.sample, plus the automaton of each sample as data['automaton'][i]
+        (see Automaton.describe), which the model saves with the rest of the data."""
+        data = super().sample()
+        desc = {}
+        for g in self._used:
+            if id(g) not in desc:
+                desc[id(g)] = g.describe()
+        return dict(data, automaton=[desc[id(g)] for g in self._used])
+
+    def _set_grammar(self, g):
+        super()._set_grammar(g)
+        self._listings = {}                                  # listings were the old grammar's
 
     def _block_sizes(self):
         g = self.grammar
@@ -375,8 +423,9 @@ class AutomatonTask(GrammarTask):
 # -- tasks that describe their grammar by fields -------------------------------------------
 # Each field is an ordinary task argument: it can be swept (a list), linked to other fields
 # (tuples, matched 1-1), and matched on its own when loading. The grammar is made inside the
-# job. For random graphs, graph_seed fixes which graph: the same graph_seed gives the same
-# graph in every job (across prompt conditions, models and reruns), None a fresh one per job.
+# job, afresh for each sample (see AutomatonTask._new_sample). For random graphs, graph_seed
+# fixes which graphs: the same graph_seed gives the same graph for each sample in every job
+# (across prompt conditions, models and reruns), None fresh ones.
 
 @dataclass(kw_only=True)
 class RelationTask(AutomatonTask):
@@ -393,10 +442,16 @@ class RelationTask(AutomatonTask):
     mean_length: float = None    # ... or this (see automata.FSA)
     graph_seed: int = 0
 
-    def make_grammar(self):
+    def make_grammar(self, sample=0):
+        """The FSA on sample's own random graph, seeded by (graph_seed, sample): so a
+        graph_seed gives the same graph for each sample in every job, and different
+        graph_seeds share none. graph_seed=None: a fresh graph each time."""
+        seed = self.graph_seed
+        if seed is not None:
+            seed = int(np.random.SeedSequence([seed, sample]).generate_state(1)[0])
         G = auto.spatial_relation(self.k, d=self.d, degree=self.degree,
                                  commutes=self.commutes, inverse=self.inverse, 
-                                 total=self.total, seed=self.graph_seed,
+                                 total=self.total, seed=seed,
                                  connectedness='strong' if self.strong else 'weak',
                                  )
 
@@ -410,7 +465,7 @@ class CycleTask(AutomatonTask):
     k: int
     length: int = 1
 
-    def make_grammar(self):
+    def make_grammar(self, sample=0):
         return auto.FSA(auto.cycle(self.k), length=self.length)
 
 
@@ -423,6 +478,6 @@ class GridTask(AutomatonTask):
     slip: float = 0.0
     length: int = 1
 
-    def make_grammar(self):
+    def make_grammar(self, sample=0):
         return auto.FSA(auto.grid(self.n, self.m, torus=self.torus, slip=self.slip),
                         length=self.length)
