@@ -437,7 +437,7 @@ class RelationTask(AutomatonTask):
     commutes: float = 0.0
     inverse: bool = False
     total: bool = False
-    strong: bool = True
+    connected: str = 'weak'
     backtrack: bool = False
     length: int = None           # steps per walk; sampled blocks with holdout need this
     mean_length: float = None    # ... or this (see automata.FSA)
@@ -454,7 +454,7 @@ class RelationTask(AutomatonTask):
                                  commutes=self.commutes, inverse=self.inverse, 
                                  total=self.total, seed=seed,
                                  n_edge=self.edges,
-                                 connectedness='strong' if self.strong else 'weak',
+                                 connectedness=self.connected,
                                  )
 
         return auto.FSA(G, backtrack=self.backtrack, length=self.length,
