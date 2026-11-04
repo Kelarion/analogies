@@ -408,8 +408,10 @@ class ParamSet:
         Return the set of values which satisfy constraints
         """
 
-        # if self.param.root_instance:
-        if isinstance(self.param, Set):
+        # a parameter derived from others (2 * k, k + 1): its one value, given theirs
+        if not self.param.root_instance and self.lb is None and self.ub is None:
+            values = [self.param()]
+        elif isinstance(self.param, Set):
             values = self.param.generate_values()
 
         else:
@@ -644,6 +646,17 @@ def parse_params(dictionary, forbidden_keys=None):
         tup_keys = ()
         tup_vals = [()]
 
+    ## The same parameter under several keys ('k': k, 'edges': k) takes one value: sweep
+    ## it under the first key, and copy that value to the others
+    alias, first = {}, {}
+    for k, ps in list(variable_prms.items()):
+        p = ps.param
+        if p.root_instance and id(p) in first:
+            alias[k] = first[id(p)]
+            del variable_prms[k]
+        elif p.root_instance:
+            first[id(p)] = k
+
     if len(variable_prms)>0:
         var_k, var_v = zip(*variable_prms.items())
     else:
@@ -658,7 +671,9 @@ def parse_params(dictionary, forbidden_keys=None):
     for var_vals in ParamIter(*var_v):
         var_vals = tuple(_plain(v) for v in var_vals)
         for mch_vals in tup_vals:
-            out_dicts.append( dict(zip(var_k+tup_keys, var_vals+_plain(mch_vals)), **fixed_prms) )
+            d = dict(zip(var_k+tup_keys, var_vals+_plain(mch_vals)), **fixed_prms)
+            d.update({k: d[src] for k, src in alias.items()})
+            out_dicts.append({k: d[k] for k in dictionary if k in d})   # in the given order
 
     return out_dicts
 

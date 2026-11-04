@@ -661,8 +661,9 @@ class FSA(Automaton):
                 units = [Edge(self.states[i], self.states[j]) for i, _, j in es]
                 es = [e for e, ok in zip(es, self._keeps_seen(units, symmetric)) if ok]
                 if not es:
-                    raise ValueError("every edge's hold-out leaves a node or action unseen "
-                                     "(keep_seen=False allows it)")
+                    raise ValueError("no edge can be held out: each one is the last edge of "
+                                     "some node or action, which would then appear first in "
+                                     "the test (the graph is too sparse, e.g. a star)")
             if not es:
                 raise ValueError("no edge to hold out")
             i, _, j = es[rng.integers(len(es))]
@@ -677,9 +678,10 @@ class FSA(Automaton):
             pairs = [p for p, ok in zip(pairs, self._keeps_seen(units, symmetric)) if ok]
         nodes = list(dict.fromkeys(i for i, _ in pairs))
         if not nodes:
-            raise ValueError("no node has an action to hold out"
-                             + (" that leaves every node and action seen "
-                                "(keep_seen=False allows it)" if keep_seen else ""))
+            raise ValueError("no (node, action) pair can be held out"
+                             + (": each one takes the last edge of some node or action, "
+                                "which would then appear first in the test (the graph is "
+                                "too sparse)" if keep_seen else ""))
         i = nodes[rng.integers(len(nodes))]                  # node *index*
         acts = [a for ii, a in pairs if ii == i]             # each action once
         a = acts[rng.integers(len(acts))]                    # action index
