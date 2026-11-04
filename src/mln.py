@@ -330,6 +330,21 @@ def _reach(adj, s, t):
     return bool(seen[t])
 
 
+def _is_dag(adj):
+    """No directed cycle in adjacency matrix adj: peel off nodes with no
+    incoming edges until none are left (or some never free up)."""
+    adj = np.asarray(adj, bool)
+    indeg = adj.sum(0).astype(np.int64)
+    left = np.ones(len(adj), bool)
+    while left.any():
+        free_ = left & (indeg == 0)
+        if not free_.any():
+            return False
+        left &= ~free_
+        indeg -= adj[free_].sum(0)
+    return True
+
+
 def _connected(adj, strong):
     if not strong:
         adj = adj | adj.T
@@ -543,6 +558,7 @@ class _BlockRuntime:
         state, S, Sp, Edges, rng, R = c.state, c.S, c.Sp, c.Edges, c.rng, c.R
         T, W, h, free, shown, constraint = c.T, c.W, c.h, c.free, c.shown, c.constraint
         codes, delta, valid, allowed = c.codes, c.delta, c.valid, c.allowed
+        checking = c.checking
         for j in self.seq[rng.permutation(len(self.seq))]:   # atoms of large Blocks, one at a time
             a = free[j]
             d = delta(j)                                             # rules only
@@ -560,7 +576,7 @@ class _BlockRuntime:
             if not ch.any():
                 continue
             l, u, v = shown[a]
-            if l >= 0 and constraint is not None:
+            if l >= 0 and checking:
                 for i in np.flatnonzero(ch):
                     if not allowed(i, l, (u, v) if new[i] else None,
                                    None if new[i] else (u, v)):
@@ -601,13 +617,12 @@ class _BlockRuntime:
             nxt = P_[new]
             ch = live & (nxt != cur).any(2)
             sc_ = Bt["shown_cols"]
-            if constraint is not None and len(sc_):                   # checked in turn
+            if checking and len(sc_):                                 # checked in turn
                 for i, j in zip(*np.nonzero(ch & (nxt[:, :, sc_] != cur[:, :, sc_]).any(2))):
                     E = Edges[i].copy()
                     for c in sc_:
                         E[Bt["L"][j, c], Bt["U"][j, c], Bt["V"][j, c]] = nxt[i, j, c]
-                    removes = (cur[i, j, sc_] > nxt[i, j, sc_]).any()
-                    if (callable(constraint) or removes) and not valid(E):
+                    if not valid(E):
                         ch[i, j] = False         # keep the current state
                     else:
                         Edges[i] = E
@@ -644,6 +659,21 @@ class _SpatialRuntime:
         self.rel_index = {p: l for l, p in enumerate(c.relations)}
         self.mirror = {a: b for a, b in P.pairs}
         self.single = set(P.singles)
+        base_of = {b: a for a, b in P.pairs}
+        self.count_of = {}                       # sampled relation -> its fixed number of edges
+        for p, m in getattr(c, "edge_counts", {}).items():
+            if p not in P.preds:
+                continue
+            a = base_of.get(p, p)
+            if a in self.count_of and self.count_of[a] != m:
+                raise ValueError(f"{P!r}: {a} and {self.mirror[a]} have the same edges, so the same count")
+            if not 0 <= m <= c.k:
+                raise ValueError(f"{P!r}: {p} can have 0..{c.k} edges (one per node), not {m}")
+            if P.total and m != c.k:
+                raise ValueError(f"{P!r} is total, so {p} has exactly {c.k} edges, not {m}")
+            self.count_of[a] = m
+        if P.total:
+            self.count_of = {}                   # every node has its edge already
 
     def owned(self):
         return self.own
@@ -661,9 +691,11 @@ class _SpatialRuntime:
             C = C + (A_ if a in self.single else A_ + A_.T)   # a pair's mirror holds the other way
         return C
 
-    def valid(self, i, total=None):              # replica i obeys the rules
+    def valid(self, i, total=None, counts=True):  # replica i obeys the rules
         total = self.P.total if total is None else total
         for a, A_ in zip(self.P.base, self.mats(i)):
+            if counts and a in self.count_of and A_.sum() != self.count_of[a]:
+                return False
             pair = a not in self.single
             if A_.trace() or (A_.sum(1) > 1).any() or (pair and (A_.sum(0) > 1).any()):
                 return False
@@ -675,8 +707,28 @@ class _SpatialRuntime:
         c, P = self.c, self.P
         for a in P.base:
             c.state[i, c.offset[a]:c.offset[a] + c.k * c.k] = 0
+        acyclic = getattr(c, "acyclic", set())
         if not P.total:
-            return                               # start with no edges
+            for a, m in self.count_of.items():   # exactly m edges, at random, obeying the rules
+                got, tries = 0, 0
+                while got < m:
+                    tries += 1
+                    if tries > 200 * c.k + 1000:
+                        raise ValueError(f"{P!r}: found no start with {m} {a} edges")
+                    x, y = int(c.rng.integers(c.k)), int(c.rng.integers(c.k))
+                    at = c.offset[a] + x * c.k + y
+                    if x == y or c.state[i, c.offset[a] + x * c.k:c.offset[a] + (x + 1) * c.k].any():
+                        continue
+                    if a in acyclic or self.mirror.get(a) in acyclic:   # no cycle: y mustn't reach x
+                        adj = c.state[i, c.offset[a]:c.offset[a] + c.k * c.k].reshape(c.k, c.k).astype(bool)
+                        if _reach(adj, y, x):
+                            continue
+                    c.state[i, at] = 1
+                    if self.valid(i, total=False, counts=False):
+                        got += 1
+                    else:
+                        c.state[i, at] = 0
+            return                               # (otherwise) start with no edges
         for a in P.base:                         # a random permutation for each pair, obeying the rest
             if a in self.single:
                 continue
@@ -748,6 +800,7 @@ class _SpatialRuntime:
         c, P = self.c, self.P
         state, S, Edges, rng, R, k = c.state, c.S, c.Edges, c.rng, c.R, c.k
         offset, h, delta, pos_of, constraint, valid = c.offset, c.h, c.delta, c.pos_of, c.constraint, c.valid
+        checking = c.checking
         for _ in range(k * len(P.base)):     # each replica proposes its own move
             ai = rng.integers(len(P.base), size=R)
             xs = rng.integers(k, size=R)
@@ -755,12 +808,21 @@ class _SpatialRuntime:
             cs = np.where(cs == xs, -1, cs)  # "none" takes x's own slot: k equal choices
             rot = (rng.random(R) < 0.5) & (k >= 3)
             trio = np.argsort(rng.random((R, k)), axis=1)[:, :3] if k >= 3 else None
+            tr = rng.random(R) < 0.5             # for counted relations: transfer moves
+            gs_ = rng.integers(k, size=R)
             plans = {}
             for i in range(R):
                 a, x, c = P.base[int(ai[i])], int(xs[i]), int(cs[i])
                 ti = int(self.tgt[a][i, x])
                 single = a in self.single
-                if rot[i] and not single:    # rotate three nodes' targets: x <- y's, y <- z's, z <- x's
+                counted = a in self.count_of
+                if counted and tr[i]:        # transfer: g gives up its edge, x gains one to c
+                    g = int(gs_[i])
+                    tg = int(self.tgt[a][i, g])
+                    if c < 0 or ti >= 0 or tg < 0 or g == x:
+                        continue
+                    rem, add = ((g, tg),), ((x, c),)
+                elif rot[i] and not single:  # rotate three nodes' targets: x <- y's, y <- z's, z <- x's
                     x, y, z = (int(v) for v in trio[i])
                     t3 = [int(self.tgt[a][i, v]) for v in (x, y, z)]
                     rem = tuple((u, t) for u, t in zip((x, y, z), t3) if t >= 0)
@@ -784,6 +846,8 @@ class _SpatialRuntime:
                             continue
                         rem = (((x, ti),) if ti >= 0 else ()) + ((pi, c),)
                         add = ((x, c),) + (((pi, ti),) if ti >= 0 else ())
+                if counted and len(rem) != len(add):
+                    continue                 # would change a fixed count
                 if self.plan_ok(a, i, rem, add):
                     plans.setdefault((a, rem, add), []).append(i)
             for (a, rem, add), rows in plans.items():
@@ -798,7 +862,7 @@ class _SpatialRuntime:
                     g_field += h[at] if val else -h[at]
                     state[rows, at] = val
                 ok = np.log(rng.random(len(rows))) < beta_t[rows] * (g_rules + g_field)
-                if constraint is not None and rem:
+                if checking:
                     for q in np.flatnonzero(ok):
                         E = Edges[rows[q]].copy()
                         self.edges(E, a, rem, add)
@@ -1272,6 +1336,11 @@ class Spatial(Structure):
     Moves keep every rule above and are accepted according to the change in
     the other rules' score. With total, nothing is removed.
 
+    MLN(edges={relation: m}) fixes a relation's number of edges (for a pair,
+    give either relation: they have the same edges). Moves that would change
+    it are skipped, and a transfer move -- one node gives up its edge while a
+    node without one gains an edge -- lets the set of nodes with edges change.
+
     Commutation and other geometry are ordinary rules on top, e.g.
     commute("N", "E") (with total, one implies the rest; without, add every
     orientation). Rules may mention all the relations; those about a mirrored
@@ -1320,6 +1389,8 @@ class Spatial(Structure):
         out += [f"inf {a}(x,y) <-> {b}(y,x)" for a, b in self.pairs]
         out += [f"inf ~({a}(x,y) & {b}(x,y))" for i, a in enumerate(self.preds) for b in self.preds[i + 1:]]
         return out
+
+    counts_edges = True                          # MLN(edges=...) on its relations: kept by its moves
 
     def runtime(self, ctx, members):
         return _SpatialRuntime(ctx, self)
@@ -1682,6 +1753,7 @@ def _staged(model, rules, fixed, sampler):
                      field=per_pred(model.field, s_), density=per_pred(model.density, s_),
                      edges=model.edges if last else None,
                      constraint=model.constraint if last else None,
+                     acyclic=model.acyclic if last else None,
                      relations=relations if last else [], normalize=model.normalize,
                      hard=model.hard, distinct=model.distinct, n=1, rng=rng, **sampler)
             info.append(G.graph["mln"])
@@ -1928,6 +2000,13 @@ class MLN:
                 many-variable rules (transitivity) weakly enforced.
     relations   the (node, node) predicates to show as edges; action = position
                 in this list. Default: all of them, sorted. Others are hidden.
+    acyclic     True (every shown relation) or a list of shown relations that
+                must each have no directed cycle. Checked on every change that
+                adds an edge to one of them (removing an edge can't make a
+                cycle), so sampling stays exact for the acyclic graphs; the
+                start keeps only edges going forward in a random node order.
+                Can combine with constraint, but not with totality (a relation
+                where every node has an edge always has a cycle).
     constraint  None, "strong", "weak", or a function of the shown edges (a bool
                 array [relation, u, v]) saying whether they are allowed.
                 Connectivity is of the union of the relations. Moves that would
@@ -1951,11 +2030,13 @@ class MLN:
 
     def __init__(self, k, rules, beta=1.0, fixed=(), latent=None, evidence=None, field=None,
                  density=None, degree=None, edges=None, normalize=False, relations=None, constraint=None,
+                 acyclic=None,
                  hard=20.0, distinct=True, order="hidden_first"):
         if order not in ("joint", "latent_first", "hidden_first"):
             raise ValueError("order must be 'joint', 'latent_first' or 'hidden_first'")
         self.k, self.beta, self.latent = k, beta, latent
         self.density, self.edges, self.normalize, self.constraint = density, edges, normalize, constraint
+        self.acyclic = acyclic
         self.hard, self.distinct, self.order = hard, distinct, order
         listify = lambda x: [x] if isinstance(x, (str, Structure, Component)) else list(x)
         entries, fields, comp_ev, comp_rel, self._node_attrs = [], {}, {}, [], {}
@@ -2150,7 +2231,8 @@ class MLN:
             out = _run(self.k, rules, fixed, beta=self.beta, latent=self.latent,
                        evidence=self.evidence, field=self.field, density=self.density,
                        edges=self.edges, normalize=self.normalize, relations=self.relations,
-                       constraint=self.constraint, hard=self.hard, distinct=self.distinct, **sampler)
+                       constraint=self.constraint, acyclic=self.acyclic, hard=self.hard,
+                       distinct=self.distinct, **sampler)
         for G in ([out] if n == 1 else out):     # attributes components give the nodes
             for a, vals in self._node_attrs.items():
                 nx.set_node_attributes(G, vals, a)
@@ -2158,7 +2240,7 @@ class MLN:
 
 
 _MODEL_ARGS = ("beta", "fixed", "latent", "evidence", "field", "density", "degree", "edges", "normalize",
-               "relations", "constraint", "hard", "distinct", "order")
+               "relations", "constraint", "acyclic", "hard", "distinct", "order")
 
 
 def mln(k, rules, **kwargs):
@@ -2374,7 +2456,7 @@ def gluing_diagram(G, directions=None, root=None, ax=None, max_patches=None):
 
 def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normalize,
          relations, constraint, n, sweeps, method, anneal, temps, beta_min, adapt,
-         block_limit, auto_blocks, couple_min, block_atoms, hard, distinct, rng):
+         block_limit, auto_blocks, couple_min, block_atoms, hard, distinct, rng, acyclic=None):
     """Ground and sample one stage: rules (scaled by beta) and fixed (Block
     objects and rule strings not scaled by beta) as plain lists. See MLN for
     the arguments."""
@@ -2627,6 +2709,7 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
     elif not isinstance(edges, dict):
         edges = {p: edges for p in relations}
     fixed = {}                                   # relation index -> its free atoms
+    owned_counts = {}                            # counts kept by a structure's own moves
     for p, m in edges.items():
         if p not in relations:
             raise ValueError(f"edges given for {p!r}, which is not a relation")
@@ -2635,7 +2718,10 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
         if p in evidence:
             raise ValueError(f"{p!r} is evidence, so its edge count is already fixed")
         if p in covered:
-            raise ValueError(f"{p!r} has a Block (or Spatial), which already shapes its edges; "
+            if getattr(covered[p], "counts_edges", False):
+                owned_counts[p] = int(m)
+                continue
+            raise ValueError(f"{p!r} has a Block, which already shapes its edges; "
                              f"a fixed edge count on it isn't supported")
         l = relations.index(p)
         fa = offset[p] + np.arange(k * k)
@@ -2654,7 +2740,8 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
         k=k, dom=dom, offset=offset, dims=dims, sig=sig, N=N, ONE=ONE, ZERO=ZERO, free=free,
         is_free=is_free, inc_f=inc_f, F=F, M=M, POW=POW, G_all=G_all, rule_of=rule_of, T=T, W=W,
         h=h, rng=rng, relations=relations, mirror_of=mirror_of, shown=shown, fixed=fixed,
-        block_limit=block_limit, constraint=constraint, condition_holds=condition_holds)
+        block_limit=block_limit, constraint=constraint, condition_holds=condition_holds,
+        edge_counts=owned_counts)
     groups = {}
     for P in declared:
         groups.setdefault(P.runtime_group(), []).append(P)
@@ -2765,7 +2852,26 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
                 out[:, l] = state[rows, offset[p]:offset[p] + k * k].reshape(-1, k, k)
         return out
 
+    acyc = [] if not acyclic else (list(range(L)) if acyclic is True else
+                                   [relations.index(p) for p in ([acyclic] if isinstance(acyclic, str) else acyclic)
+                                    if p in relations])
+    if acyclic not in (None, False, True):
+        missing = set([acyclic] if isinstance(acyclic, str) else acyclic) - set(relations)
+        if missing:
+            raise ValueError(f"acyclic: {sorted(missing)} aren't shown relations")
+    for P in declared:                           # totality always makes a cycle
+        tot = [p for p, _ in P.predicates() if relations and p in relations and relations.index(p) in acyc
+               and (getattr(P, "total", False) or (isinstance(P, Categorical) and P.per == 0))]
+        if tot:
+            raise ValueError(f"{P!r} gives every node an edge in {tot}, which then can't be acyclic")
+    ctx.checking = constraint is not None or bool(acyc)   # moves must check the graph
+    ctx.acyclic = {relations[l] for l in acyc}
+    keep_own = {mirror_of.get(p, p) for p in owned_counts}  # structures start these acyclic themselves
+
     def valid(E):
+        for l in acyc:
+            if not _is_dag(E[l]):
+                return False
         if constraint is None:
             return True
         if callable(constraint):
@@ -2776,22 +2882,58 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
         raise ValueError("constraint must be None, 'strong', 'weak' or a function")
     if constraint is not None and L == 0:
         raise ValueError("a constraint needs at least one relation")
+
+    def atoms_for(p, us, vs):                    # atoms of edges u -> v in relation p
+        src = mirror_of.get(p)
+        return offset[src] + vs * k + us if src else offset[p] + us * k + vs
+
+    def orient(i, order):                        # keep only edges going forward in the order
+        rank = np.empty(k, np.int64)
+        rank[order] = np.arange(k)
+        us, vs = np.meshgrid(np.arange(k), np.arange(k), indexing="ij")
+        back = (rank[us] >= rank[vs]).ravel()
+        for l in acyc:
+            if mirror_of.get(relations[l], relations[l]) in keep_own:
+                continue
+            at = atoms_for(relations[l], us.ravel()[back], vs.ravel()[back])
+            state[i, at[is_free[at]]] = 0
     p0 = relations[0] if L else None
     for i in range(R):                           # a random start that satisfies it all
         for _ in range(100):
             state[i, free] = rng.random(len(free)) < 0.5
             for rt in runtimes:
                 rt.init(i)
-            cyc = None
-            if constraint in ("strong", "weak"):  # a cycle (or path) in relation 0
-                c = rng.permutation(k)
-                c2 = np.roll(c, -1) if constraint == "strong" else c[1:]
-                cyc = offset[p0] + c[:len(c2)] * k + c2
-                if not is_free[cyc].all():
-                    raise ValueError(f"{p0} can't hold the edges of a cycle")
+            order = rng.permutation(k)
+            if acyc:
+                orient(i, order)
+            cyc, rep = None, {}                  # repair edges for connectivity: {relation: atoms}
+            if constraint in ("strong", "weak"):
+                ahead = order[:-1], order[1:]    # a path forward in the order: acyclic
+                if constraint == "weak":
+                    rep[0] = atoms_for(p0, *ahead)
+                elif 0 not in acyc:              # a cycle in relation 0
+                    rep[0] = atoms_for(p0, order, np.roll(order, -1))
+                elif any(l not in acyc for l in range(L)):
+                    l2 = next(l for l in range(L) if l not in acyc)
+                    rep[l2] = atoms_for(relations[l2], order, np.roll(order, -1))
+                elif L >= 2:                     # forward in one relation, back in another
+                    rep[0] = atoms_for(p0, *ahead)
+                    rep[1] = atoms_for(relations[1], order[1:], order[:-1])
+                else:
+                    raise ValueError("a strongly connected graph needs a cycle, but every relation is acyclic")
+                for l, at in rep.items():
+                    if not is_free[at].all():
+                        raise ValueError(f"{relations[l]} can't hold the edges of a path or cycle")
+                cyc = rep.get(0)
             for l, fa in fixed.items():          # exactly edges[p] edges, at random
                 m = edges[relations[l]]
                 state[i, fa] = 0
+                if l in acyc:                    # ... going forward in the order
+                    rank = np.empty(k, np.int64)
+                    rank[order] = np.arange(k)
+                    fa = fa[rank[shown[fa, 1]] < rank[shown[fa, 2]]]
+                    if m > len(fa):
+                        raise ValueError(f"{relations[l]} can't have {m} edges and no cycle")
                 if cyc is not None and l == 0:
                     if m < len(cyc):
                         raise ValueError(f"{p0} needs at least {len(cyc)} edges to be "
@@ -2802,16 +2944,19 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
                 else:
                     state[i, rng.choice(fa, m, replace=False)] = 1
             E = edges_of([i])[0]
-            if cyc is not None and 0 not in fixed and not valid(E):
-                rel0 = offset[p0] + np.arange(k * k)
-                if in_declared[rel0].any():
-                    state[i, rel0[is_free[rel0]]] = 0    # under a Block: exactly the cycle
-                state[i, cyc] = 1                # repair
+            if rep and not any(l in fixed for l in rep) and not valid(E):
+                for l, at in rep.items():
+                    src = mirror_of.get(relations[l], relations[l])
+                    rel = offset[src] + np.arange(k * k)
+                    if in_declared[rel].any():
+                        state[i, rel[is_free[rel]]] = 0  # under a structure: exactly the repair
+                    state[i, at] = 1             # repair
                 E = edges_of([i])[0]
             if valid(E) and all(rt.valid(i) for rt in runtimes):
                 break
         else:
-            raise ValueError("found no starting graph that satisfies the constraint and the structures")
+            raise ValueError("found no starting graph that satisfies the constraint, acyclicity "
+                             "and the structures")
     Sp = np.zeros(R)                             # structures' log weights, per replica
     ctx.Sp, ctx.valid, ctx.edges_of = Sp, valid, edges_of
     for rt in runtimes:
@@ -2852,6 +2997,10 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
             E[l][add] = True
         if rem is not None:
             E[l][rem] = False
+        if add is not None and l in acyc and _reach(E[l], add[1], add[0]):
+            return False                         # v already reaches u: u -> v closes a cycle
+        if constraint is None:
+            return True
         if callable(constraint):
             return bool(constraint(E))
         if rem is None:                          # connectivity only fears removals
@@ -2871,7 +3020,7 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
     # no weighted grounding with two sampled atoms: every update is already exact
     coupled = ((G_all < N).sum(1) > 1) & (W[rule_of] != 0)
     independent = (not coupled.any() and not any(rt.active() for rt in runtimes) and not fixed
-                   and constraint is None and not density)
+                   and not ctx.checking and not density)
     if independent:                              # one exact sweep, at beta = 1
         sweeps, anneal = 1, 0.0
     ramp = max(1, round(anneal * sweeps))
@@ -2900,7 +3049,7 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
             if not ch.any():
                 continue
             sh = shown[atoms_c]
-            if constraint is not None and (sh[:, 0] >= 0).any():
+            if ctx.checking and (sh[:, 0] >= 0).any():
                 for i, c in zip(*np.nonzero(ch & (sh[:, 0] >= 0)[None])):   # checked in turn
                     l, u, v = sh[c]
                     if allowed(i, l, (u, v) if new[i, c] else None, None if new[i, c] else (u, v)):
@@ -2930,7 +3079,7 @@ def _run(k, rules, fixed, beta, latent, evidence, field, density, edges, normali
                 fgain = np.where(old == 0, h[a] - h[b], h[b] - h[a])
                 ok = ch & (np.log(rng.random(R)) < beta_t * (gain + fgain))
                 ea, eb = tuple(shown[a][1:]), tuple(shown[b][1:])
-                if constraint is not None:
+                if ctx.checking:
                     for i in np.flatnonzero(ok):
                         add, rem = (ea, eb) if old[i] == 0 else (eb, ea)
                         if not allowed(i, l, add, rem):
