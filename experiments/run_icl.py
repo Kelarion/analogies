@@ -33,7 +33,7 @@ task_args = {'task': RelationTask,
              'edges': k,
             #  'strong': True,
             #  'strong': False,
-             'connected': 'weak',
+             'connected': None, 
              'keep_connected': False,
             #  'backtrack': False,
              'graph_seed': 0,                  # same graph for every prompt condition below
