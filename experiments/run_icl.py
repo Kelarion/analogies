@@ -24,11 +24,11 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 # k = su.Set([8, 16])
 
-k = su.Set([3,4,5,6,7])
+k = su.Set([4,5,6,7])
 
 task_args = {'task': RelationTask,
              'k': k,
-             'd': [1,2,3],
+             'd': [1,2],
              'degree': 0.5,
             #  'strong': True,
              'strong': False,
@@ -79,7 +79,7 @@ mod_args = {'model': ICLModel,
             'seed': 0,
             # 'equiv': (True, False),
             'equiv': True,
-            'delim': ['\n', ','],
+            'delim': ',',
             # 'delim': ',',
             'tokens': icl_utils.Vocabulary('nouns'),
             }
