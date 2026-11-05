@@ -214,11 +214,12 @@ def _title(rows, cols, rv, cv):
 # -- plot_icl on a grid ------------------------------------------------------------------
 
 def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
-              perplexity=False, kl=False, err='std', traces=False, size=(5, 4), title=None):
+              perplexity=False, kl=False, err='std', traces=False, renorm=True, size=(5, 4),
+              title=None):
     """
     plot_icl for each run matching `where`, on a grid of `rows` x `cols` (parameter
     names; leave either out for a single row or column). Empty cells are hidden.
-    perplexity, kl, err, traces: as for plot_icl.
+    perplexity, kl, err, traces, renorm: as for plot_icl.
     title: f(record) for each panel's title, instead of the cell's parameter values.
     Returns the axes.
     """
@@ -235,19 +236,21 @@ def plot_runs(records, prm, rows=None, cols=None, where=None, n_trl=50, refs=(),
             plot_icl(ax, m['logp_ctx'], m['data'], n_trl=n_trl, k_hide=a.get('k_hide'),
                      title=title(rec) if title else _title(rows, cols, rv, cv),
                      show_assistant=(a.get('mode') != 'raw'), refs=refs,
-                     perplexity=perplexity, kl=kl, err=err, traces=traces)
+                     perplexity=perplexity, kl=kl, err=err, traces=traces,
+                     renorm=renorm)
     fig.tight_layout()
     return axs
 
 
 # -- the held-out test, block by block ---------------------------------------------------
 
-def heldout(record, refs=(), perplexity=False, kl=False):
+def heldout(record, refs=(), perplexity=False, kl=False, renorm=True):
     """
     Score of each block's held-out token (the first hidden token of its final trial, the
     star in plot_icl), for each sample: {'model': (samps, n_blocks), <ref>: (same)}.
     refs: {name: predictor}, as for plot_icl, scored at the same tokens.
-    perplexity, kl: as for plot_icl (kl: -KL(Y || model) instead of -cross-entropy).
+    perplexity, kl, renorm: as for plot_icl (kl: -KL(Y || model) instead of
+    -cross-entropy; renorm=False: the model's probabilities over the whole vocabulary).
     """
     m = record['metrics']
     data, refs = m['data'], dict(refs)
@@ -257,7 +260,8 @@ def heldout(record, refs=(), perplexity=False, kl=False):
         P = {k: pred(data, i) for k, pred in refs.items()}
         t = [np.argmax(B == b) + len(lpc[('user', b)]) - 1 for b in range(nblk)]
         best = spc.xlogy(Y[t], Y[t]).sum(-1) if kl else np.zeros(nblk)    # -H(Y)
-        out['model'].append([xent(lpc[('assistant', b)][0], Y[t[b]]) - best[b] for b in range(nblk)])
+        out['model'].append([xent(lpc[('assistant', b)][0], Y[t[b]], renorm) - best[b]
+                             for b in range(nblk)])
         for k, Pk in P.items():
             Q = Pk[t]
             with np.errstate(invalid='ignore', divide='ignore'):
@@ -270,13 +274,14 @@ REF_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X']
 
 
 def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=(),
-                 perplexity=False, kl=False, err='std', traces=False, cmap='viridis',
+                 perplexity=False, kl=False, err='std', traces=False, renorm=True, cmap='viridis',
                  size=(4, 3.5), sharey=True):
     """
     Held-out log-likelihood (or perplexity, or -KL; see plot_icl) of each block's test
     token against the block, summarised over samples as `err` says (see plot_icl: mean
     and std by default), one line per value of `hue`, on a grid of `rows` x `cols`.
     traces: also draw each sample's line, thin and translucent (True, or the opacity).
+    renorm: as for plot_icl (False: the model's probabilities over the whole vocabulary).
     refs are drawn dashed with hollow markers in the colour of their line.
     Returns the axes.
     """
@@ -294,7 +299,7 @@ def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=
                 ax.set_visible(False)
                 continue
             for h, r in here:
-                s = heldout(records[r], refs, perplexity, kl)
+                s = heldout(records[r], refs, perplexity, kl, renorm)
                 x = np.arange(1, s['model'].shape[1] + 1)
                 nmax = max(nmax, len(x))
                 if traces:
@@ -307,7 +312,7 @@ def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=
             ax.set_title(_title(rows, cols, rv, cv))
             ax.set_xlabel('block')
             if j == 0:
-                ax.set_ylabel('held-out ' + ylabel(perplexity, kl))
+                ax.set_ylabel('held-out ' + ylabel(perplexity, kl, renorm))
     for ax in axs.flat:
         ax.set_xticks(np.arange(1, nmax + 1))
     # one legend for the whole grid, in the first panel: every hue, then every reference
@@ -336,24 +341,28 @@ def trace(record, refs=()):
                                k_hide of the trial, or those after the first k_show)
         final                  whether it's in the block's final trial, scored from the
                                completion (the assistant span) rather than the context
-        ll                     the plotted score, -cross-entropy against Y, renormalised
-                               over the task alphabet (as xent does)
+        ll                     -cross-entropy against Y, with the model's probabilities
+                               normalised over the whole vocabulary (not renormalised to
+                               the task alphabet: plot_icl's default is ll - log(task_mass))
         n_valid                number of tokens Y allows
-        p_valid                (renormalised) probability on the tokens Y allows
+        p_valid                probability on the tokens Y allows
         top, p_top             the model's most likely task token and its probability
-        task_mass              probability on the task alphabet at all, before
-                               renormalising: when this is small, ll is a ratio of scraps
-        kl                     KL(Y || model) over the task alphabet: -ll less the entropy
-                               of Y, so 0 for the true distribution (plot_icl(kl=True)
-                               plots -kl); the same as -ll wherever Y is deterministic
+        task_mass              probability on the task alphabet at all; dividing p_valid
+                               or p_top by it renormalises them
+        kl                     KL(Y || model): -ll less the entropy of Y, so 0 for the true
+                               distribution; the same as -ll wherever Y is deterministic.
+                               kl + log(task_mass) is plot_icl(kl=True)'s default
         ll_<ref>, kl_<ref>     each reference predictor's score, as in plot_icl
         top_any, p_top_any     the most likely token over the whole vocabulary, and its
                                probability (not renormalised), e.g. '<|im_end|>'
         top_text, p_top_text   the same over text only, without special tokens (runs
                                saved before these were recorded leave all four out)
 
-    plot_icl's curve for block b is the mean (and std) over samples of ll on the hidden
-    rows, by trial: tr[tr.hidden].groupby(['block', 'trial']).ll.agg(['mean', 'std']).
+    All probabilities are over the whole vocabulary, as plot_icl(renorm=False) scores
+    them. plot_icl's curve for block b is the mean (and std) over samples of ll on the
+    hidden rows, by trial, renormalised or not:
+        tr['ll_task'] = tr.ll - np.log(tr.task_mass)        # plot_icl's default
+        tr[tr.hidden].groupby(['block', 'trial']).ll_task.agg(['mean', 'std'])
     One difference: plot_icl scores the final trial's first hidden token from the last
     context row, this from the completion's first row; they're the same row in 'raw'
     and 'single' mode, but not in 'dialogue', where the context row predicts the template.
@@ -388,13 +397,13 @@ def trace(record, refs=()):
             Yb = Y[ts]
             with np.errstate(invalid='ignore', divide='ignore'):
                 mass = np.exp(spc.logsumexp(lp, -1))
-                p = np.exp(lp - spc.logsumexp(lp, -1, keepdims=True))
+                p = np.exp(lp)                              # over the whole vocabulary
                 top = np.nanargmax(np.nan_to_num(lp, nan=-np.inf), -1)
                 row = {'sample': i, 'block': b, 'trial': trial, 'pos': pos, 't': ts,
                        'word': [words[x] for x in X[ts]] if words else X[ts],
                        'hidden': (pos >= first[trial]) & (pos < real),
                        'final': trial == len(trials) - 1,
-                       'll': xent(lp, Yb), 'best': spc.xlogy(Yb, Yb).sum(-1),
+                       'll': xent(lp, Yb, renorm=False), 'best': spc.xlogy(Yb, Yb).sum(-1),
                        'n_valid': (Yb > 0).sum(-1),
                        'p_valid': (p * (Yb > 0)).sum(-1),
                        'top': [words[x] for x in top] if words else top,
@@ -413,3 +422,4 @@ def trace(record, refs=()):
             df.loc[np.isnan(lp).all(-1), ['ll', 'kl', 'p_valid', 'top', 'p_top', 'task_mass']] = np.nan
             rows.append(df)
     return pd.concat(rows, ignore_index=True)
+    

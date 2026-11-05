@@ -356,10 +356,15 @@ def test_token_logits(logs, spans, blocks, Y, task_toks, k_show=None, k_hide=Non
         blk = np.append(blk, blk[-1])
     return logits, target, blk
 
-def xent(lp, y):
-    """Expected log-prob under Y, after renormalizing over the task alphabet (same as your old perf)."""
-    lp = lp - spc.logsumexp(lp, -1, keepdims=True)
-    return (lp * y).sum(-1)
+def xent(lp, y, renorm=True):
+    """Expected log-prob under Y of the task-token log-probs lp. renorm: after renormalising
+    them over the task alphabet; otherwise as they are, normalised over the whole
+    vocabulary, so probability the model puts on other tokens counts against it. The two
+    differ by log(task mass): xent(lp, y) == xent(lp, y, False) - logsumexp(lp)."""
+    if renorm:
+        lp = lp - spc.logsumexp(lp, -1, keepdims=True)
+    with np.errstate(invalid='ignore'):
+        return np.where(y > 0, lp * y, 0).sum(-1)       # 0 * -inf counts as 0
 
 def mean_sem(a):
     a = np.asarray(a, dtype=float)
@@ -481,14 +486,16 @@ def ngram(data, i, order=1, alpha=1.0):
 
 REF_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X']
 
-def ylabel(perplexity=False, kl=False):
+def ylabel(perplexity=False, kl=False, renorm=True):
     """The y-axis label for a score from plot_icl (or icl_sweeps), given how it's shown."""
     if kl:
-        return 'perplexity / true perplexity (exp KL)' if perplexity else '−KL(Y ‖ model)'
-    return 'perplexity (exp cross-entropy)' if perplexity else 'log-likelihood (−cross-entropy)'
+        out = 'perplexity / true perplexity (exp KL)' if perplexity else '−KL(Y ‖ model)'
+    else:
+        out = 'perplexity (exp cross-entropy)' if perplexity else 'log-likelihood (−cross-entropy)'
+    return out if renorm else out + ', whole vocabulary'
 
 def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title='', cmap='viridis',
-             refs=(), perplexity=False, kl=False, err='std', traces=False):
+             refs=(), perplexity=False, kl=False, err='std', traces=False, renorm=True):
     """
     n_trl:  number of trials (comma-separated segments) per block to show, from the block's start
     k_hide: if given, show only the last k_hide tokens of each trial; otherwise every token
@@ -512,6 +519,10 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
             median, or None. The references' lines follow the same centre.
     traces: also draw every sample's curve, thin and translucent behind the summary
             (True, or the opacity to use).
+    renorm: score the model's probabilities renormalised over the task alphabet (the
+            default); False keeps them normalised over the whole vocabulary, so
+            probability on other tokens (e.g. <|im_end|>) counts against it. The
+            references are distributions over the task alphabet either way.
     """
     refs = dict(refs)
     f = (lambda v: np.exp(-v)) if perplexity else (lambda v: v)
@@ -552,12 +563,12 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
 
             ctx = logp_ctx[i][('user', b)]
             asst = logp_ctx[i][('assistant', b)]
-            vals[:len(ctx)] = xent(ctx, Y[t0:t0 + len(ctx)])
+            vals[:len(ctx)] = xent(ctx, Y[t0:t0 + len(ctx)], renorm)
             rest, s = asst[1:-1], len(ctx)                          # completion tokens after the first
             if len(rest):
-                vals[s:s + len(rest)] = xent(rest, Y[t0 + s:t0 + s + len(rest)])
+                vals[s:s + len(rest)] = xent(rest, Y[t0 + s:t0 + s + len(rest)], renorm)
             vals -= best[t0:t0 + len(vals)]
-            stars[b].append(f(xent(asst[0], Y[t0 + len(ctx) - 1])    # first completion token, assistant turn
+            stars[b].append(f(xent(asst[0], Y[t0 + len(ctx) - 1], renorm)    # first completion token, assistant turn
                               - best[t0 + len(ctx) - 1]))
 
             curves['model'][b].append(to_grid(f(vals), blocks[b]))
@@ -609,7 +620,7 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
     # ax.set_xticks(ticks, labels)
     ax.set_title(title)
     ax.set_xlabel('trial')
-    ax.set_ylabel(ylabel(perplexity, kl))
+    ax.set_ylabel(ylabel(perplexity, kl, renorm))
     ax.legend(loc='upper right' if perplexity else 'lower right', fontsize='small')
 
 
