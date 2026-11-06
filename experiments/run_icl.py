@@ -69,7 +69,8 @@ task_args = {'task': RelationTask,
 #                              describe_task=True, hint=True, answer_only=True), mode='dialogue')
 
 mod_args = {'model': ICLModel,
-            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
+            # 'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
+            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
             # 'model_name': 'google/gemma-4-31B',
             # 'mode': ['dialogue', 'raw'],
             'mode': ('raw', 'dialogue'),
@@ -77,8 +78,9 @@ mod_args = {'model': ICLModel,
             # 'think': [True, False],
             'think': (False, True),
             'k_hide': 1,
-            'effort': 'low',
-            'thinking_budget': 6000,
+            # 'effort': 'low',
+            'effort': None,
+            'thinking_budget': 10000,
             'seed': 0,
             # 'equiv': (True, False),
             'equiv': True,
@@ -89,7 +91,7 @@ mod_args = {'model': ICLModel,
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
 # (pickles copied to the cluster over ssh) or on the cluster; push/pull first either way.
-su.send_to_server(task_args, mod_args, per_job=8, exclude=['cn-g028', 'cn-g029'], verbose=True)            # or name='my-sweep'
+su.send_to_server(task_args, mod_args, per_job=4, exclude=['cn-g028', 'cn-g029'], verbose=True)            # or name='my-sweep'
 
 # # %% Or: run here, e.g. in an interactive session (each model is loaded once)
 # exps, _ = su.get_all_experiments(task_args, mod_args)

@@ -483,3 +483,93 @@ class GridTask(AutomatonTask):
     def make_grammar(self, sample=0):
         return auto.FSA(auto.grid(self.n, self.m, torus=self.torus, slip=self.slip),
                         length=self.length)
+
+@dataclass(kw_only=True)
+class ExhaustiveRelationTask(AutomatonTask):
+    """AutomatonTask that sweeps every distinct hold-out on small relation graphs
+    (automata.relation_holdout): k nodes, d relations, each a function without
+    self-loops on `edges` of the nodes, exclusive (no two relations join the same
+    x -> y, as RelationTask's graphs) unless exclusive=False, and connected as
+    RelationTask's `connected`. Each graph comes with the edge u -a-> v to hold
+    out, and every block of a sample holds out that one edge: its trials avoid it
+    and the last ends with it, as with holdout=True, but the edge is the sweep's
+    rather than a random draw. With num_trials None a block lists every other
+    transition once, so it shows exactly the training set.
+
+    Which hold-out each sample gets:
+      index and target given    that one, in every sample (sweep both fields)
+      index given, target None  sample s gets that training set's answer s mod n
+      both None                 sample s gets the s-th (index, target) pair, in
+                                order (wrapping): samps=self.n_holdouts covers them all
+    data['holdout'][i] records sample i's (index, target, edge u-v-a, count); the
+    held-out edge is also marked holdout=True in data['automaton'][i]."""
+    k: int = 4
+    d: int = 1
+    edges: int = 4
+    index: int = None
+    target: int = None
+    exclusive: bool = True
+    connected: str = None
+    holdout: bool = True
+    keep_connected: bool = False         # here: which hold-outs the sweep includes
+    backtrack: bool = False
+    length: int = 1
+    mean_length: float = None
+
+    def __post_init__(self):
+        if not self.holdout:
+            raise ValueError("ExhaustiveRelationTask always holds out its edge: holdout=True")
+        if self.symmetric:
+            raise ValueError("ExhaustiveRelationTask doesn't hold out reverses (symmetric=False)")
+        if self.holdout_unit != "edge":
+            raise ValueError("ExhaustiveRelationTask holds out one transition: holdout_unit='edge'")
+        if self.index is None and self.target is not None:
+            raise ValueError("target needs index")
+        super().__post_init__()
+
+    def _graph(self, index, target=0):
+        return auto.relation_holdout(self.k, self.d, self.edges, index, target,
+                                     exclusive=self.exclusive, connected=self.connected,
+                                     keep_connected=self.keep_connected)
+
+    def _holdouts(self):
+        """The (index, target) pairs the samples go through, in order."""
+        if self.index is not None:
+            n = self._graph(self.index).graph['n_targets']
+            return [(self.index, t) for t in range(n)] if self.target is None else [(self.index, self.target)]
+        n = self._graph(0).graph['n_sets']
+        return [(i, t) for i in range(n) for t in range(self._graph(i).graph['n_targets'])]
+
+    @property
+    def n_holdouts(self):
+        """How many distinct hold-outs the samples cycle through."""
+        return len(self._holdouts())
+
+    def make_grammar(self, sample=0):
+        pairs = self._holdouts()
+        G = self._graph(*pairs[sample % len(pairs)])
+        return auto.FSA(G, backtrack=self.backtrack, length=self.length,
+                        mean_length=self.mean_length)
+
+    def _new_block(self, rng, b):
+        g = self.grammar
+        h = g.graph.graph['holdout']
+        forbid = {h}
+        if self.num_trials[b] is None:                       # every other transition, then h
+            trans = self._listing(forbid)
+            trials = [trans[j] for j in rng.permutation(len(trans))]
+            trials.append(self._test_trial(rng, h, forbid))
+            return trials
+        if not g.can_end_with(h, forbid):
+            raise ValueError(f"no walk avoiding {h} can end with it (length={self.length})")
+        return h, forbid
+
+    def sample(self):
+        data = super().sample()
+        info = []
+        for g in self._used:
+            a = g.graph.graph
+            h = a['holdout']
+            info.append({'index': a['index'], 'target': a['target'], 'edge': (h.u, h.v, h.action),
+                         'count': a['count'], 'n_sets': a['n_sets'], 'n_targets': a['n_targets']})
+        return dict(data, holdout=info)
