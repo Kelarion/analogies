@@ -1479,130 +1479,150 @@ def block_relation(k, n, r=1, density=0.1, seed=None):
     return mod.sample(rng=np.random.default_rng(seed))
 
 
-def relation_holdout(k, d, edges, index, target=0, exclusive=True, connected=None,
+def indexed_relation(k, d, edges, index, holdout=True, exclusive=True, connected=None,
                      keep_connected=False):
-    """One graph of an exhaustive sweep over hold-outs, with its held-out edge.
+    """One graph, or one hold-out training set, of an exhaustive list of small relations.
 
     The family is every graph on k nodes with d relations, each a function
     without self-loops on `edges` of the nodes (edges=k: every node has one
     edge per relation; any number may point to the same node). exclusive: no
     two relations join the same x -> y, as Spatial always imposes. connected:
-    None, "weak" or "strong", as spatial_relation's connectedness, for the
-    whole graph. A hold-out removes one edge u -a-> v such that, as in
-    FSA.sample_holdout, every node and action on an edge is still on one
-    (keep_seen), and with keep_connected no weakly or strongly connected
-    component splits.
+    None, "weak" or "strong", as spatial_relation's connectedness. Everything
+    is up to relabelling the nodes and permuting the relations, in
+    lexicographic order of a canonical form (the smallest over relabellings of
+    each relation's targets of nodes 0..k-1, -1 for none; then, for training
+    sets, the query). Brute force over every labelled graph and k! d!
+    relabellings, cached: for k <= 5.
 
-    What a block shows is a training set: the graph without u -a-> v, and the
-    query (u, a). Training sets are taken up to relabelling the nodes and
-    permuting the relations, and put in lexicographic order of their canonical
-    form (the smallest over relabellings of: each relation's targets of nodes
-    0..k-1, -1 for none, then the query). `index` picks one; `target` picks
-    one of its distinct answers -- the v that complete it into a graph of the
-    family with an allowed hold-out, one per class of answers a symmetry of the
-    training set exchanges -- in increasing order. Brute force over every
-    labelled graph and k! d! relabellings, cached: for k <= 5.
+    holdout=False: the index-th graph of the family.
+    holdout=True: the index-th training set: a graph of the family without one
+    edge u -a-> v, with the query (u, a). As in FSA.sample_holdout, every node
+    and action on an edge must still be on one, and with keep_connected no
+    weakly or strongly connected component may split. Its answers are the v
+    that complete it into a graph of the family with an allowed hold-out, one
+    per class of answers that a symmetry of the training set exchanges, in
+    increasing order. Adding u -a-> answers[t] back gives the full graph of
+    hold-out t (as ExhaustiveRelationTask does).
 
-    Returns the whole graph (MultiDiGraph, nodes 0..k-1, `action` on each edge)
-    in the training set's canonical labels, the held-out edge marked holdout=True
-    (so describe() keeps it), and in G.graph:
-        holdout     Edge(u, v, a), to forbid and end with
-        index, target, n_sets, n_targets   where this is in the sweep
-        count       labelled (graph, held-out edge) pairs it stands for: weight
-                    by it to give each labelled graph and hold-out equal weight
+    Returns a MultiDiGraph (nodes 0..k-1, `action` on each edge), with in G.graph
+        index, n   which this is, of how many
+        count      (holdout=False) labelled graphs in its class
+        query      (holdout=True) (u, a)
+        answers    (holdout=True) the distinct answers v
+        counts     (holdout=True) for each answer, the labelled (graph, held-out
+                   edge) pairs it stands for: weight by these to give each
+                   labelled graph and hold-out equal weight
     """
-    sets = _holdout_sets(k, d, edges, exclusive, connected, keep_connected)
-    if not sets:
-        raise ValueError(f"no graph with k={k}, d={d}, edges={edges} has an allowed hold-out")
-    if not 0 <= index < len(sets):
-        raise IndexError(f"index {index}: there are {len(sets)} training sets")
-    key, answers = sets[index]
-    if not 0 <= target < len(answers):
-        raise IndexError(f"target {target}: training set {index} has {len(answers)} answers")
-    v, count = answers[target]
-    rows, (u, a) = key[:-2], key[-2:]
-    G = nx.MultiDiGraph(holdout=Edge(u, v, a), index=index, target=target, n_sets=len(sets),
-                        n_targets=len(answers), count=count)
+    items = (_relation_holdouts(k, d, edges, exclusive, connected, keep_connected) if holdout
+             else _relation_graphs(k, d, edges, exclusive, connected))
+    if not items:
+        raise ValueError(f"no graph with k={k}, d={d}, edges={edges}"
+                         + (" has an allowed hold-out" if holdout else ""))
+    if not 0 <= index < len(items):
+        raise IndexError(f"index {index}: there are {len(items)} "
+                         + ("training sets" if holdout else "graphs"))
+    key, extra = items[index]
+    G = nx.MultiDiGraph(index=index, n=len(items))
     G.add_nodes_from(range(k))
     for r in range(d):
         for x in range(k):
-            y = rows[r * k + x]
-            if y >= 0:
-                G.add_edge(x, y, action=r)
-    G.add_edge(u, v, action=a, holdout=True)
+            if key[r * k + x] >= 0:
+                G.add_edge(x, key[r * k + x], action=r)
+    if holdout:
+        G.graph.update(query=tuple(key[d * k:]), answers=tuple(v for v, _ in extra),
+                       counts=tuple(c for _, c in extra))
+    else:
+        G.graph['count'] = extra
     return G
 
 
 @lru_cache(maxsize=None)
-def _holdout_sets(k, d, edges, exclusive, connected, keep_connected):
-    """[(key, [(v, count), ...])] for relation_holdout, keys sorted. key is the
-    canonical training set: d*k targets (-1 for none) then the query (u, a)."""
+def _relabellings(k, d):
+    """Every (node, relation) relabelling as arrays, for _canon."""
     sym = [(p, q) for p in itertools.permutations(range(k))
            for q in itertools.permutations(range(d))]
     P = np.array([p for p, _ in sym], int)                       # (S, k)
     Q = np.array([q for _, q in sym], int)                       # (S, d)
-    Pinv, Qinv = np.argsort(P, 1), np.argsort(Q, 1)
-    Pext = np.c_[P, -np.ones(len(P), int)]                       # p[-1] = -1: "no edge"
-    S = np.arange(len(sym))[:, None, None]                       # (S, 1, 1)
+    return P, Q, np.argsort(P, 1), np.argsort(Q, 1), np.c_[P, -np.ones(len(P), int)]
 
-    def canon(F, u, a, v):
-        """Canonical key of (F, query (u, a)), and the smallest image of v
-        among the relabellings that reach it."""
-        g = Pext[S, F[None]]                                     # p[f[a][x]] at [s, a, x]
-        g = g[S, Qinv[:, :, None], Pinv[:, None, :]]             # moved to [s, q[a], p[x]]
-        rows = np.c_[g.reshape(len(sym), -1), P[:, u], Q[:, a]]
-        best = rows[np.lexsort(rows.T[::-1])[0]]
-        hit = (rows == best).all(1)
-        return tuple(int(x) for x in best), int(P[hit, v].min())
 
-    def links(F):
-        return [(x, int(F[r, x]), r) for r in range(d) for x in range(k) if F[r, x] >= 0]
+def _canon(F, query=None, v=None):
+    """Canonical key of partial functions F (d x k, -1 = no edge), with the query
+    (u, a) if given, and the smallest image of node v among the relabellings that
+    reach it."""
+    d, k = F.shape
+    P, Q, Pinv, Qinv, Pext = _relabellings(k, d)
+    S = np.arange(len(P))[:, None, None]
+    g = Pext[S, F[None]]                                         # p[f[a][x]] at [s, a, x]
+    g = g[S, Qinv[:, :, None], Pinv[:, None, :]]                 # moved to [s, q[a], p[x]]
+    rows = g.reshape(len(P), -1)
+    if query is not None:
+        rows = np.c_[rows, P[:, query[0]], Q[:, query[1]]]
+    best = rows[np.lexsort(rows.T[::-1])[0]]
+    key = tuple(int(x) for x in best)
+    if v is None:
+        return key
+    return key, int(P[(rows == best).all(1), v].min())
 
-    def is_connected(E, how):
-        if how is None:
-            return True
-        D = nx.DiGraph()
-        D.add_nodes_from(range(k))
-        D.add_edges_from((x, y) for x, y, _ in E)
-        if how == "weak":
-            return nx.is_weakly_connected(D)
-        if how == "strong":
-            return nx.is_strongly_connected(D)
-        raise ValueError(f"connected is None, 'weak' or 'strong', not {how!r}")
 
-    def components(E):
-        D = nx.DiGraph()
-        D.add_nodes_from(range(k))
-        D.add_edges_from((x, y) for x, y, _ in E)
-        return nx.number_weakly_connected_components(D), nx.number_strongly_connected_components(D)
+def _relation_links(F):
+    d, k = F.shape
+    return [(x, int(F[r, x]), r) for r in range(d) for x in range(k) if F[r, x] >= 0]
 
-    # every labelled relation: `edges` nodes with a target, none its own
-    one = []
+
+def _components(E, k):
+    D = nx.DiGraph()
+    D.add_nodes_from(range(k))
+    D.add_edges_from((x, y) for x, y, _ in E)
+    return nx.number_weakly_connected_components(D), nx.number_strongly_connected_components(D)
+
+
+def _labelled_relations(k, d, edges, exclusive, connected):
+    """Every labelled graph of indexed_relation's family, as (F, its edges)."""
+    if connected not in (None, "weak", "strong"):
+        raise ValueError(f"connected is None, 'weak' or 'strong', not {connected!r}")
+    one = []                           # one relation: `edges` nodes with a target, none its own
     for srcs in itertools.combinations(range(k), edges):
         for tgts in itertools.product(*[[y for y in range(k) if y != x] for x in srcs]):
             f = -np.ones(k, int)
             f[list(srcs)] = tgts
             one.append(f)
-
-    found = defaultdict(lambda: defaultdict(float))              # key -> v -> count
     for fs in itertools.product(one, repeat=d):
         F = np.array(fs)
         if exclusive and any(F[r, x] >= 0 and F[r, x] == F[s, x]
                              for x in range(k) for r in range(d) for s in range(r + 1, d)):
             continue
-        E = links(F)
-        if not is_connected(E, connected):
+        E = _relation_links(F)
+        if connected is not None and _components(E, k)[0 if connected == "weak" else 1] != 1:
             continue
+        yield F, E
+
+
+@lru_cache(maxsize=None)
+def _relation_graphs(k, d, edges, exclusive, connected):
+    """[(key, labelled count)] for indexed_relation(holdout=False), keys sorted."""
+    found = defaultdict(int)
+    for F, _ in _labelled_relations(k, d, edges, exclusive, connected):
+        found[_canon(F)] += 1
+    return [(key, found[key]) for key in sorted(found)]
+
+
+@lru_cache(maxsize=None)
+def _relation_holdouts(k, d, edges, exclusive, connected, keep_connected):
+    """[(key, [(v, count), ...])] for indexed_relation(holdout=True), keys sorted.
+    key: the canonical training set, d*k targets (-1 for none) then the query (u, a)."""
+    found = defaultdict(lambda: defaultdict(int))                # key -> answer -> count
+    for F, E in _labelled_relations(k, d, edges, exclusive, connected):
         shown = {x for e in E for x in e[:2]}, {e[2] for e in E}
-        comps = components(E) if keep_connected else None
+        comps = _components(E, k) if keep_connected else None
         for u, v, a in E:
             rest = [e for e in E if e != (u, v, a)]
             if ({x for e in rest for x in e[:2]}, {e[2] for e in rest}) != shown:
-                continue                                             # a node or action only in the test
-            if keep_connected and components(rest) != comps:
-                continue                                             # splits a component
+                continue                                         # a node or action only in the test
+            if keep_connected and _components(rest, k) != comps:
+                continue                                         # splits a component
             Fr = F.copy()
             Fr[a, u] = -1
-            key, vv = canon(Fr, u, a, v)
+            key, vv = _canon(Fr, (u, a), v)
             found[key][vv] += 1
     return [(key, sorted(found[key].items())) for key in sorted(found)]

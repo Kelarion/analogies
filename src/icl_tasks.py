@@ -487,13 +487,13 @@ class GridTask(AutomatonTask):
 @dataclass(kw_only=True)
 class ExhaustiveRelationTask(AutomatonTask):
     """AutomatonTask that sweeps every distinct hold-out on small relation graphs
-    (automata.relation_holdout): k nodes, d relations, each a function without
+    (automata.indexed_relation): k nodes, d relations, each a function without
     self-loops on `edges` of the nodes, exclusive (no two relations join the same
     x -> y, as RelationTask's graphs) unless exclusive=False, and connected as
-    RelationTask's `connected`. Each graph comes with the edge u -a-> v to hold
-    out, and every block of a sample holds out that one edge: its trials avoid it
-    and the last ends with it, as with holdout=True, but the edge is the sweep's
-    rather than a random draw. With num_trials None a block lists every other
+    RelationTask's `connected`. A sample's graph is training set `index` with its
+    answer `target` put back as the held-out edge u -a-> v, and every block holds
+    out that one edge: its trials avoid it and the last ends with it, as with
+    holdout=True, but the edge is the sweep's rather than a random draw. With num_trials None a block lists every other
     transition once, so it shows exactly the training set.
 
     Which hold-out each sample gets:
@@ -527,18 +527,30 @@ class ExhaustiveRelationTask(AutomatonTask):
             raise ValueError("target needs index")
         super().__post_init__()
 
-    def _graph(self, index, target=0):
-        return auto.relation_holdout(self.k, self.d, self.edges, index, target,
+    def _training_set(self, index):
+        return auto.indexed_relation(self.k, self.d, self.edges, index, holdout=True,
                                      exclusive=self.exclusive, connected=self.connected,
                                      keep_connected=self.keep_connected)
 
+    def _graph(self, index, target):
+        """Training set `index` with its answer `target` put back, marked holdout=True."""
+        G = self._training_set(index)
+        (u, a), answers = G.graph['query'], G.graph['answers']
+        if not 0 <= target < len(answers):
+            raise IndexError(f"target {target}: training set {index} has {len(answers)} answers")
+        G.add_edge(u, answers[target], action=a, holdout=True)
+        G.graph.update(holdout=auto.Edge(u, answers[target], a), target=target,
+                       count=G.graph['counts'][target])
+        return G
+
     def _holdouts(self):
         """The (index, target) pairs the samples go through, in order."""
+        n_t = lambda i: len(self._training_set(i).graph['answers'])
         if self.index is not None:
-            n = self._graph(self.index).graph['n_targets']
-            return [(self.index, t) for t in range(n)] if self.target is None else [(self.index, self.target)]
-        n = self._graph(0).graph['n_sets']
-        return [(i, t) for i in range(n) for t in range(self._graph(i).graph['n_targets'])]
+            if self.target is not None:
+                return [(self.index, self.target)]
+            return [(self.index, t) for t in range(n_t(self.index))]
+        return [(i, t) for i in range(self._training_set(0).graph['n']) for t in range(n_t(i))]
 
     @property
     def n_holdouts(self):
@@ -571,5 +583,5 @@ class ExhaustiveRelationTask(AutomatonTask):
             a = g.graph.graph
             h = a['holdout']
             info.append({'index': a['index'], 'target': a['target'], 'edge': (h.u, h.v, h.action),
-                         'count': a['count'], 'n_sets': a['n_sets'], 'n_targets': a['n_targets']})
+                         'count': a['count'], 'n_sets': a['n'], 'n_targets': len(a['answers'])})
         return dict(data, holdout=info)
