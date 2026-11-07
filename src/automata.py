@@ -1496,9 +1496,12 @@ def indexed_relation(k, d, edges, index, holdout=True, exclusive=True, connected
 
     holdout=False: the index-th graph of the family.
     holdout=True: the index-th training set: a graph of the family without one
-    edge u -a-> v, with the query (u, a). As in FSA.sample_holdout, every node
-    and action on an edge must still be on one, and with keep_connected no
-    weakly or strongly connected component may split. Its answers are the v
+    edge u -a-> v, with the query (u, a). Every one of the k nodes and d
+    relations must be on some edge of the training set -- stricter than
+    FSA.sample_holdout, which only keeps what the whole graph shows, so graphs
+    with an isolated node (possible for edges < k with connected=None) give no
+    training sets -- and with keep_connected no weakly or strongly connected
+    component may split. Its answers are the v
     that complete it into a graph of the family with an allowed hold-out, one
     per class of answers that a symmetry of the training set exchanges, in
     increasing order. Adding u -a-> answers[t] back gives the full graph of
@@ -1613,12 +1616,12 @@ def _relation_holdouts(k, d, edges, exclusive, connected, keep_connected):
     key: the canonical training set, d*k targets (-1 for none) then the query (u, a)."""
     found = defaultdict(lambda: defaultdict(int))                # key -> answer -> count
     for F, E in _labelled_relations(k, d, edges, exclusive, connected):
-        shown = {x for e in E for x in e[:2]}, {e[2] for e in E}
+        everything = set(range(k)), set(range(d))
         comps = _components(E, k) if keep_connected else None
         for u, v, a in E:
             rest = [e for e in E if e != (u, v, a)]
-            if ({x for e in rest for x in e[:2]}, {e[2] for e in rest}) != shown:
-                continue                                         # a node or action only in the test
+            if ({x for e in rest for x in e[:2]}, {e[2] for e in rest}) != everything:
+                continue                                         # a node or action not in the training set
             if keep_connected and _components(rest, k) != comps:
                 continue                                         # splits a component
             Fr = F.copy()

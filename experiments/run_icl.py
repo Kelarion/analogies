@@ -8,7 +8,7 @@ import automata as auto
 import server_utils as su
 from server_utils import Build
 import super_experiments as sxp
-from icl_tasks import RelationTask
+import icl_tasks
 from icl_model import ICLModel
 from icl_utils import plot_icl
 import icl_utils
@@ -24,15 +24,17 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 # k = su.Set([8, 16])
 
-k = su.Set([4,5,6,7])
+# k = su.Set([4,5,6,7])
 
-task_args = {'task': RelationTask,
-             'k': k,
-             'd': [1,2],
+task_args = {
+             # 'task': icl_tasks.RelationTask,
+             'task': icl_tasks.ExclusiveRelationTask,
+             'k': 4,
+             'd': 1,
             #  'degree': 0.5,
-             'edges': k,
-            #  'strong': True,
-            #  'strong': False,
+             'edges': 4,
+             'index': [0,1,2,3,4],
+             'hold'
              'connected': None, 
              'keep_connected': False,
             #  'backtrack': False,
@@ -50,7 +52,7 @@ task_args = {'task': RelationTask,
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
             #  'explicitness': [0, 1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
             #  'explicitness': 0,
-             'explicitness': (3, 0),
+             'explicitness': (2, 0),
             #  'describe_format': False,
              'describe_format': (True, False), 
              'describe_task': (True, False),
@@ -70,13 +72,13 @@ task_args = {'task': RelationTask,
 
 mod_args = {'model': ICLModel,
             # 'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
-            # 'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
-            'model_name': 'google/gemma-4-31B-it',
-            # 'mode': ['dialogue', 'raw'],
-            'mode': ('raw', 'dialogue'),
+            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it', 'google/gemma-4-31B'],
+            # 'model_name': 'google/gemma-4-31B-it',
+            'mode': ['dialogue', 'raw'],
+            # 'mode': ('raw', 'dialogue'),
             # 'mode': 'single',
-            # 'think': [True, False],
-            'think': (False, True),
+            'think': False,
+            # 'think': (False, True),
             'k_hide': 1,
             # 'effort': 'low',
             'effort': None,
