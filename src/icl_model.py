@@ -38,16 +38,20 @@ def get_lm(model_name, prepend_bos=False):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from transformer_lens.model_bridge import TransformerBridge
 
-        _BRIDGES.clear()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        hf_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16,
-                                                        device_map="cuda")
+        _BRIDGES.clear(); _HF.clear()
+        gc.collect(); torch.cuda.empty_cache()
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.bfloat16, device_map="cuda",
+            attn_implementation="sdpa")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         _BRIDGES[model_name] = TransformerBridge.boot_transformers(
             model_name, hf_model=hf_model, tokenizer=tokenizer, device="cuda")
-    return ChatLM(_BRIDGES[model_name], prepend_bos=prepend_bos)
+        _HF[model_name] = hf_model
+        # the bridge may switch this back to eager; check:
+        print(hf_model.config.get_text_config()._attn_implementation)
+    lm = ChatLM(_BRIDGES[model_name], prepend_bos=prepend_bos)
+    lm.hf_model = _HF[model_name]
+    return lm
 
 
 # -- the model ----------------------------------------------------------------------------
