@@ -1,10 +1,12 @@
 import gc
 import os
 import warnings
+from contextlib import contextmanager, nullcontext
 from functools import partial, cached_property
 
 import numpy as np
 import torch
+from torch.nn.attention import sdpa_kernel, SDPBackend
 import scipy.special as spc
 import matplotlib.pyplot as plt
 
@@ -37,11 +39,30 @@ class ChatLM:
         Leave as None to read it off the template (see think_tokens); pass it explicitly for
         templates where that fails.
     The model itself is still at self.bridge, for hooks, caching, etc.
+
+    hf_model: the Hugging Face model under the bridge. Given, trials are scored with
+        memory-efficient attention and the unembedding applied a chunk of positions at a
+        time (see score), which long reasoning traces need; None scores through the bridge
+        as before (eager attention, full-vocabulary logits for every position at once).
+    Scoring settings, as attributes (not ICLModel fields, so save names don't change):
+      chunked_scoring  False to score through the bridge even when hf_model is given
+      score_chunk      positions unembedded at a time
+      strict_kernels   allow only SDPA's flash / memory-efficient kernels, so an
+                       unsupported shape raises instead of silently falling back to the
+                       'math' kernel, which builds the full attention matrix again
+      bypass_bridge    score with the bridge's wrappers swapped out for the HF modules they
+                       wrap (see plain_hf). Some bridge components compute attention
+                       themselves, eager-style, ignoring the HF attention setting.
     """
     placeholder = '!'    # message content that splice_template replaces with token ids
+    chunked_scoring = True
+    score_chunk = 512
+    strict_kernels = True
+    bypass_bridge = True
 
-    def __init__(self, bridge, prepend_bos=False, end_of_reasoning=None):
+    def __init__(self, bridge, prepend_bos=False, end_of_reasoning=None, hf_model=None):
         self.bridge = bridge
+        self.hf_model = hf_model
         self.tokenizer = bridge.tokenizer
         self.device = bridge.device
         self.bos = bridge.to_tokens('', prepend_bos=True)[0][0].item() if prepend_bos else None
@@ -261,6 +282,136 @@ class ChatLM:
         tok = self.tokenizer
         return sorted(set(tok.all_special_ids) | set(tok.get_added_vocab().values()))
 
+    def not_text(self, vocab_size):
+        """special_ids plus the padding rows of the unembedding past the tokenizer's vocab."""
+        return self.special_ids + list(range(len(self.tokenizer), vocab_size))
+
+    # -- attention backend ----------------------------------------------------------
+
+    def _attn_configs(self):
+        """Every distinct HF config in the model: a multimodal model like Gemma 4 nests a
+        text config inside the top one, and each attention layer reads its own config's
+        _attn_implementation when it runs."""
+        found = {}
+        for m in self.hf_model.modules():
+            c = getattr(m, 'config', None)
+            if c is not None and hasattr(c, '_attn_implementation'):
+                found[id(c)] = c
+        return list(found.values())
+
+    @property
+    def attn_implementation(self):
+        """The attention implementation(s) the HF model's configs currently name."""
+        return sorted({str(c._attn_implementation) for c in self._attn_configs()})
+
+    @contextmanager
+    def attention(self, impl):
+        """Run the HF model with attention implementation `impl` ('sdpa', 'eager', ...)
+        inside the block, restoring what was there after. Generation and anything hooked
+        through the bridge keep whatever the bridge set up (eager, so hook_pattern works)."""
+        configs = self._attn_configs()
+        old = [c._attn_implementation for c in configs]
+        try:
+            for c in configs:
+                c._attn_implementation = impl
+            yield
+        finally:
+            for c, o in zip(configs, old):
+                c._attn_implementation = o
+
+    @staticmethod
+    def _wrapper_swaps(module):
+        """(parent, name, wrapper, original) for every bridge component under `module`: a
+        module with an `original_component`, which it stands in for. Recurses into the
+        originals, where the bridge also nests its wrappers (a block's attention, ...)."""
+        swaps = []
+        for name, child in list(module.named_children()):
+            orig = child
+            while isinstance(getattr(orig, 'original_component', None), torch.nn.Module):
+                orig = orig.original_component
+            if orig is not child:
+                swaps.append((module, name, child, orig))
+            swaps += ChatLM._wrapper_swaps(orig)
+        return swaps
+
+    @contextmanager
+    def plain_hf(self):
+        """Inside the block, hf_model is plain transformers code: every bridge wrapper is
+        replaced by the module it wraps, and put back after. No hooks fire inside."""
+        swaps = self._wrapper_swaps(self.hf_model)
+        try:
+            for parent, name, _, orig in swaps:
+                setattr(parent, name, orig)
+            yield len(swaps)
+        finally:
+            for parent, name, wrapper, _ in reversed(swaps):
+                setattr(parent, name, wrapper)
+
+    def _kernels(self):
+        if not self.strict_kernels:
+            return nullcontext()
+        return sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+
+    # -- scoring a sequence -----------------------------------------------------------
+
+    @cached_property
+    def _unembed(self):
+        """The output layer and the final logit soft-cap, if the model has one (Gemma)."""
+        cfg = self.hf_model.config
+        text_cfg = cfg.get_text_config() if hasattr(cfg, 'get_text_config') else cfg
+        cap = getattr(text_cfg, 'final_logit_softcapping', None) or \
+            getattr(cfg, 'final_logit_softcapping', None)
+        return self.hf_model.get_output_embeddings(), cap
+
+    def logits_from_hidden(self, h):
+        """Logits for final hidden states h (already final-normed), as the HF forward
+        computes them."""
+        head, cap = self._unembed
+        z = head(h)
+        if cap:
+            z = torch.tanh(z / cap) * cap
+        return z
+
+    @torch.no_grad()
+    def hidden_states(self, ids):
+        """Final hidden states (T, d_model) for a 1-d sequence of ids, with SDPA attention
+        and no KV cache: memory linear in T rather than quadratic."""
+        with (self.plain_hf() if self.bypass_bridge else nullcontext()), \
+                self.attention('sdpa'), self._kernels():
+            out = self.hf_model.model(input_ids=ids[None], use_cache=False)
+        return out.last_hidden_state[0]
+
+    @torch.no_grad()
+    def score(self, ids, task_toks, equiv=None):
+        """
+        Task-token log-probs and top tokens at every position of a 1-d sequence of ids:
+        lp (T, n_task), top_ids (T, 2), top_lp (T, 2), as task_logprobs_gpu and
+        top_tokens_gpu. The full (T, vocab) logits are never held at once.
+        """
+        if self.hf_model is None or not self.chunked_scoring:
+            return self.score_bridge(ids, task_toks, equiv)
+        h = self.hidden_states(ids)
+        lps, tids, tlps = [], [], []
+        for hc in h.split(self.score_chunk):
+            z = self.logits_from_hidden(hc)
+            lps.append(task_logprobs_gpu(z, task_toks, equiv, chunk=len(z)))
+            i, v = top_tokens_gpu(z, self.not_text(z.shape[-1]), chunk=len(z))
+            tids.append(i)
+            tlps.append(v)
+            del z
+        del h
+        return np.concatenate(lps), np.concatenate(tids), np.concatenate(tlps)
+
+    @torch.no_grad()
+    def score_bridge(self, ids, task_toks, equiv=None):
+        """score through the bridge, the old way: one forward with the bridge's own
+        attention (eager), full logits in memory. For short checks against score."""
+        logits = self.bridge(ids[None])[0]
+        lp = task_logprobs_gpu(logits, task_toks, equiv)
+        top_ids, top_lp = top_tokens_gpu(logits, self.not_text(logits.shape[-1]))
+        del logits
+        return lp, top_ids, top_lp
+
     @torch.no_grad()
     def run_trial(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
                   think=True, thinking_budget=4000, equiv=None, block_text=None, **template_kwargs):
@@ -286,11 +437,7 @@ class ChatLM:
             input_ids = self.reason(input_ids, thinking_budget)
 
         L = len(input_ids)
-        logits = self.bridge(torch.cat([input_ids, target])[None])[0]
-        lp = task_logprobs_gpu(logits, task_toks, equiv)
-        not_text = self.special_ids + list(range(len(self.tokenizer), logits.shape[-1]))
-        top_ids, top_lp = top_tokens_gpu(logits, not_text)   # (unused padding rows too)
-        del logits
+        lp, top_ids, top_lp = self.score(torch.cat([input_ids, target]), task_toks, equiv)
 
         def rows(a, s, e, fill):
             """Predictions for tokens s..e-1, plus the prediction of the token after the span."""
