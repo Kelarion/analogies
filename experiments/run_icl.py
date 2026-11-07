@@ -28,7 +28,7 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
 task_args = {
              # 'task': icl_tasks.RelationTask,
-             'task': icl_tasks.ExclusiveRelationTask,
+             'task': icl_tasks.ExhaustiveRelationTask,
              'k': 4,
              'd': 1,
             #  'degree': 0.5,
