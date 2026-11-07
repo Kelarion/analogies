@@ -28,7 +28,7 @@ import vocabulary
 # -- model cache ------------------------------------------------------------------------
 
 _BRIDGES = {}
-
+_HF = {}
 
 def get_lm(model_name, prepend_bos=False):
     """A ChatLM for `model_name`, loading the weights only the first time. Loading a
