@@ -34,11 +34,10 @@ task_args = {
             #  'degree': 0.5,
              'edges': 4,
              'index': [0,1,2,3,4],
-             'hold'
              'connected': None, 
              'keep_connected': False,
             #  'backtrack': False,
-             'graph_seed': 0,                  # same graph for every prompt condition below
+             # 'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
              # 'num_trials': [2*[8*k**2], 4*[4*k**2], 8*[2*k**2], 16*[k**2]],
              'num_trials': [16*[None]],
