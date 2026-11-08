@@ -21,6 +21,7 @@ import socket
 import sys
 import time
 import json
+import re
 import shlex
 import shutil
 import glob
@@ -905,7 +906,7 @@ def _ranges(ix):
 
 
 def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None, dry_run=False,
-                     job_ids=None):
+                     job_ids=None, per_job=None, max_parallel=None):
     """
     Resubmit the array tasks of a sweep that didn't save all their results and aren't queued
     or running, as a new array job running the sweep's own job script (same pickles, so the
@@ -917,9 +918,19 @@ def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None
     so a bug doesn't burn another round of GPU time. exclude: nodes to keep the reruns off,
     or 'failed' for the nodes where this sweep's tasks failed transiently. job_ids: as in
     sweep_status, for older sweeps whose job ids can't be found automatically.
+
+    per_job: rechunk. With a chunk size different from the sweep's, the combinations that
+    never finished (those of tasks that timed out included, since smaller chunks are the fix
+    for that) go to a new continuation sweep, <sweep>-r1 (-r2, ...), chunked per_job at a
+    time; its name is returned. It is a sweep like any other for sweep_status and
+    resubmit_missing, and saves its results to the same place. max_parallel defaults to the
+    original sweep's.
     """
     remote = shutil.which('sbatch') is None if remote is None else remote
     st = sweep_status(sweep, remote, verbose=False, job_ids=job_ids)
+    if per_job is not None and per_job != st.get('per_job', 1):
+        return _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run,
+                               max_parallel or st['max_parallel'] or 8)
     for w in st.get('warnings', []):
         print('warning:', w)
     if not st.get('job_ids'):
@@ -949,6 +960,78 @@ def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None
     _record_job(st['sweep'], job, remote)
     print(f'Submitted batch job {job}')
     return job
+
+
+def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_parallel):
+    """resubmit_missing with a new chunk size: the unfinished combinations of sweep `st` as a
+    new sweep, which lists its (task, model) pairs in combos.json and reuses the pickles."""
+    tasks = st['tasks']
+    failed = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is not None}
+    todo = sorted(i for i, t in failed.items()
+                  if t['transient'] or t['cause'] == 'time limit' or include_errors)
+    for i in sorted(set(failed) - set(todo)):
+        print(f"leaving out {i}: {tasks[i]['cause']} ({(tasks[i]['detail'] or '')[:90]})")
+    live = [i for i, t in tasks.items() if not t['done'] and t['cause'] is None]
+    if live:
+        print(f'left alone, still queued or running: {_ranges(live)}')
+    pairs = []
+    for i in todo:
+        for c in tasks[i]['missing']:
+            pairs.append(st['combos'][c] if st['combos'] else [c % st['n_task'], c // st['n_task']])
+    pairs.sort(key=lambda p: (p[1], p[0]))              # by model, so chunks share one
+    if not pairs:
+        print('nothing to resubmit')
+        return None
+    n_tot = len(pairs)
+    n_jobs = -(-n_tot // per_job)
+
+    # where things are on the cluster, and the continuation's name there: <sweep>-r1, -r2, ...
+    old = st['sweep']
+    base = re.sub(r'-r\d+$', '', old)               # a continuation's continuation counts on
+    if remote:
+        info = _remote('echo $SCRATCH; echo ${ICL_RESULTS:-$SCRATCH/icl_results}; '
+                       f'cd {REMOTE_REPO} && pwd; '
+                       f'for k in $(seq 1 99); do [ -e {base}-r$k ] || {{ echo {base}-r$k; break; }}; done'
+                       ).splitlines()
+        scratch, results, repo, sweep = info[-4:]
+    else:
+        scratch, results, repo = _BASE, SAVE_DIR.rstrip('/'), REPO_DIR
+        sweep = next(f'{base}-r{k}' for k in range(1, 100) if not os.path.exists(f'{base}-r{k}'))
+    name = os.path.basename(sweep)
+    print(f'{n_tot} unfinished combination(s) from {len(todo)} task(s) of {os.path.basename(old)}: '
+          f'resubmitting as {name}, {n_jobs} job(s) of up to {per_job}'
+          + (f', not on {",".join(exclude)}' if exclude else ''))
+    if dry_run:
+        return None
+
+    local = os.path.join(SWEEP_DIR, name)          # written here, as in send_to_server
+    os.makedirs(os.path.join(local, 'logs'), exist_ok=True)
+    with open(os.path.join(local, 'combos.json'), 'w') as f:
+        json.dump(pairs, f)
+    with open(os.path.join(local, 'sweep.json'), 'w') as f:
+        json.dump({'n_task': st['n_task'], 'n_tot': n_tot, 'per_job': per_job,
+                   'continues': os.path.basename(old)}, f)
+    fill = dict(last=n_jobs - 1, n_tot=n_tot, per_job=per_job, n_task=st['n_task'], sweep_dir=sweep,
+                repo=repo, scratch=scratch, results=results, max_parallel=max_parallel)
+    with open(JOB_TEMPLATE) as f:
+        script = f.read().format(**fill)
+    with open(os.path.join(local, 'job_script.sh'), 'w') as f:
+        f.write(script)
+
+    copy = f'cp {old}/task_*.pkl {old}/model_*.pkl {sweep}/ && echo {name} >> {old}/continued_in'
+    if remote:
+        _remote(f'mkdir -p {sweep}')
+        subprocess.run(['rsync', '-a', local + '/', f'{REMOTE_HOST}:{sweep}/'], check=True)
+        _remote(copy)
+    else:
+        subprocess.run(['bash', '-c', copy], check=True)
+    if exclude == 'failed':
+        exclude = sorted({t['node'] for t in failed.values() if t['transient'] and t['node']})
+    extra = [f'--exclude={",".join(exclude)}'] if exclude else []
+    job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, extra=extra)
+    _record_job(sweep, job, remote)
+    print(f'Submitted batch job {job} ({n_jobs} array tasks); follow it with sweep_status({name!r})')
+    return name
 
 def fetch_results(dest=None):
     """Copy the cluster's results into SAVE_DIR here (or `dest`), e.g. for plotting on the

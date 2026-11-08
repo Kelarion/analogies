@@ -27,6 +27,7 @@ SIGNATURES = [
     ('filesystem I/O error', r'Remote I/O error|Input/output error|Stale file handle', True),
     ('GPU error', r'CUDA error|uncorrectable ECC|Xid|NVML|unspecified launch failure', True),
     ('node failure', r'NODE_FAIL|DUE TO NODE FAILURE', True),
+    ("Slurm's node setup failed (cluster-side)", r'TaskProlog failed|task_prolog|[Pp]rolog failed', True),
     ('preempted', r'DUE TO PREEMPTION', True),
     ('time limit', r'DUE TO TIME LIMIT', False),
     ('CPU memory (oom-kill)', r'oom[-_]kill|Out Of Memory|OUT_OF_MEMORY', False),
@@ -126,13 +127,16 @@ def from_log(path):
 
 def status(d, given_ids=()):
     meta = os.path.join(d, 'sweep.json')
+    n_task = len(glob.glob(os.path.join(d, 'task_*.pkl')))
     if os.path.exists(meta):                      # array task j runs combinations j*per_job, ...
         with open(meta) as f:
             meta = json.load(f)
-        n_tot, per_job = meta['n_tot'], meta['per_job']
+        n_tot, per_job, n_task = meta['n_tot'], meta['per_job'], meta.get('n_task', n_task)
     else:                                         # older sweeps: one combination per task
-        n_tot = len(glob.glob(os.path.join(d, 'task_*.pkl'))) * len(glob.glob(os.path.join(d, 'model_*.pkl')))
+        n_tot = n_task * len(glob.glob(os.path.join(d, 'model_*.pkl')))
         per_job = 1
+    combos_file = os.path.join(d, 'combos.json')  # continuation sweeps: (task, model) per combination
+    combos = json.load(open(combos_file)) if os.path.exists(combos_file) else None
     n_jobs = -(-n_tot // per_job)
     script = open(os.path.join(d, 'job_script.sh')).read()
     m = re.search(r'--array=\S*%(\d+)', script)
@@ -154,9 +158,10 @@ def status(d, given_ids=()):
     tasks = {}                                    # by array index
     for i in range(n_jobs):
         log = os.path.join(d, 'logs', f'{i}.out')
-        combos = range(i * per_job, min((i + 1) * per_job, n_tot))
-        n_done = sum(os.path.exists(os.path.join(d, 'done', str(c))) for c in combos)
-        t = {'done': n_done == len(combos), 'combos': [n_done, len(combos)], 'state': None,
+        chunk = range(i * per_job, min((i + 1) * per_job, n_tot))
+        missing = [c for c in chunk if not os.path.exists(os.path.join(d, 'done', str(c)))]
+        n_done = len(chunk) - len(missing)
+        t = {'done': n_done == len(chunk), 'combos': [n_done, len(chunk)], 'missing': missing, 'state': None,
              'node': None, 'start': None, 'exit': None, 'cause': None, 'detail': None}
         if not t['done'] and per_job == 1 and os.path.exists(log):   # sweeps from before the markers
             with open(log, errors='replace') as f:
@@ -165,6 +170,7 @@ def status(d, given_ids=()):
         if t['state'] == 'COMPLETED':             # exit 0 comes only after every result is saved
             t['done'] = True
             t['combos'][0] = t['combos'][1]
+            t['missing'] = []
         if not t['done']:
             t.update({k: v for k, v in from_log(log).items() if v})
             if t['state'] in STATES:                    # Slurm knows best why it ended a job
@@ -184,7 +190,10 @@ def status(d, given_ids=()):
             t['detail'] = ('no Slurm record found, so it may still be queued or running '
                            "(give the array job id: job_ids=[...])")
         tasks[i] = t
-    return {'sweep': d, 'n_tot': n_tot, 'per_job': per_job, 'n_jobs': n_jobs,
+    cont = os.path.join(d, 'continued_in')
+    return {'sweep': d, 'n_tot': n_tot, 'n_task': n_task, 'combos': combos,
+            'continued_in': open(cont).read().split() if os.path.exists(cont) else [],
+            'per_job': per_job, 'n_jobs': n_jobs,
             'max_parallel': int(m.group(1)) if m else None,
             'job_ids': job_ids, 'warnings': warnings, 'tasks': tasks}
 
@@ -206,6 +215,8 @@ def summary(st):
     if not st.get('job_ids'):
         lines.append('  (no Slurm job ids for this sweep: states, nodes and times unknown)')
     lines += [f'  warning: {w}' for w in st.get('warnings', [])]
+    if st.get('continued_in'):
+        lines.append(f"  continued in: {', '.join(st['continued_in'])} (its unfinished combinations were resubmitted there)")
     if not failed:
         return '\n'.join(lines)
     causes = {}

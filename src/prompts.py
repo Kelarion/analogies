@@ -103,7 +103,7 @@ free = Part("Sequences can have different lengths, and are separated by commas. 
 
 ## The rest
 vocab = Part("The tokens will be {pool}. ")
-task_desc = Part("Your job is to complete the next {target} in the sequence. ")
+task_desc = Part("The final sequence will be incomplete. Your job is to complete the next {target} in the sequence. ")
 hint = Part(block="The last {unit} will start with '{prefix}' and you should provide the {missing}. ")
 remap = Part(transition="{relabel}", block=hint.block)
 reveal = Part(transition="{relabel}",

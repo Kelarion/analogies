@@ -5,14 +5,16 @@ One array task of a sweep submitted with server_utils.send_to_server:
 
 runs combinations ARRAY_INDEX * PER_JOB ... (up to N_TOT), one after another in this
 process, so a model is loaded once and reused (icl_model.get_lm caches it). Combination c
-is task (c % N_TASK) with model (c // N_TASK), from SWEEP_DIR's pickles; consecutive
-combinations share a model. Each result is saved to server_utils.SAVE_DIR and marked in
+is task (c % N_TASK) with model (c // N_TASK), from SWEEP_DIR's pickles (or the pair listed
+for it in SWEEP_DIR/combos.json, for continuation sweeps); consecutive combinations share a
+model. Each result is saved to server_utils.SAVE_DIR and marked in
 SWEEP_DIR/done/<c>; combinations already marked are skipped, so rerunning an array task
 (resubmit_missing, a requeue after preemption) only redoes what's missing. A combination
 that fails is reported and the rest still run; the exit code is 1 if any failed.
 """
 import os
 import sys
+import json
 import pickle as pkl
 import traceback
 
@@ -24,6 +26,8 @@ per_job = int(sys.argv[4]) if len(sys.argv) > 4 else 1
 n_tot = int(sys.argv[5]) if len(sys.argv) > 5 else (idx + 1) * per_job
 done_dir = os.path.join(sweep, 'done')
 os.makedirs(done_dir, exist_ok=True)
+combos_file = os.path.join(sweep, 'combos.json')     # continuation sweeps list (task, model) pairs
+combos = json.load(open(combos_file)) if os.path.exists(combos_file) else None
 
 failed = []
 for c in range(idx * per_job, min((idx + 1) * per_job, n_tot)):
@@ -31,9 +35,10 @@ for c in range(idx * per_job, min((idx + 1) * per_job, n_tot)):
         print(f'[{c}] already done, skipping', flush=True)
         continue
     try:
-        with open(os.path.join(sweep, 'task_%d.pkl' % (c % n_task)), 'rb') as f:
+        ti, mi = combos[c] if combos else (c % n_task, c // n_task)
+        with open(os.path.join(sweep, 'task_%d.pkl' % ti), 'rb') as f:
             task_dict = pkl.load(f)
-        with open(os.path.join(sweep, 'model_%d.pkl' % (c // n_task)), 'rb') as f:
+        with open(os.path.join(sweep, 'model_%d.pkl' % mi), 'rb') as f:
             mod_dict = pkl.load(f)
         print(f'[{c}] task: ', task_dict['args'], f'\n[{c}] model:', mod_dict['args'], flush=True)
 
