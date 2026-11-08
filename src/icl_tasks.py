@@ -330,7 +330,8 @@ class AutomatonTask(GrammarTask):
         pda = isinstance(g, auto.PDA)
         return dict(super().prompt_facts(),
                     structure='pda' if pda else 'fsa', noun='automaton' if pda else 'graph',
-                    shows=tuple(g._step_kinds), trial_len=lens.pop() if len(lens) == 1 else None,
+                    shows=tuple(g._step_kinds), starts=tuple(g._start_kinds),
+                    trial_len=lens.pop() if len(lens) == 1 else None,
                     holdout=self.holdout, listed=any(n is None for n in self.num_trials))
 
     def _new_sample(self, rng, s):

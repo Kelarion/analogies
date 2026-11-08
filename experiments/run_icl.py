@@ -40,7 +40,7 @@ task_args = {
              # 'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
              # 'num_trials': [2*[8*k**2], 4*[4*k**2], 8*[2*k**2], 16*[k**2]],
-             'num_trials': [16*[None]],
+             'num_trials': [2*[None]],
             #  'num_trials': [[100, 100, 100, 100]],
             #  'num_trials': 4*[2*k**2],
             #  'num_trials': [[None, None]],
@@ -71,13 +71,13 @@ task_args = {
 
 mod_args = {'model': ICLModel,
             # 'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
-            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it', 'google/gemma-4-31B'],
+            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
             # 'model_name': 'google/gemma-4-31B-it',
-            'mode': ['dialogue', 'raw'],
-            # 'mode': ('raw', 'dialogue'),
-            # 'mode': 'single',
-            'think': False,
-            # 'think': (False, True),
+            # 'mode': ['dialogue', 'raw'],
+            'mode': ('raw', 'dialogue'),
+            # 'mode': 'dialogue',
+            # 'think': True,
+            'think': (False, True),
             'k_hide': 1,
             # 'effort': 'low',
             'effort': None,
