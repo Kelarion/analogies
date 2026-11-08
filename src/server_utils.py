@@ -859,8 +859,11 @@ def _cluster_script(args, remote):
     """Run one of the repo's scripts on the cluster (over ssh if remote); its stdout."""
     if remote:
         return _remote(f'cd {REMOTE_REPO} && .venv/bin/python ' + ' '.join(shlex.quote(a) for a in args))
-    return subprocess.run([sys.executable, *args], cwd=REPO_DIR, capture_output=True,
-                          text=True, check=True).stdout
+    res = subprocess.run([sys.executable, *args], cwd=REPO_DIR, capture_output=True, text=True)
+    if res.returncode:
+        raise RuntimeError(res.stderr.strip().splitlines()[-1] if res.stderr.strip()
+                           else f'{args[0]} exited with {res.returncode}')
+    return res.stdout
 
 
 def sweep_status(sweep=None, remote=None, verbose=True, job_ids=None):
@@ -870,13 +873,13 @@ def sweep_status(sweep=None, remote=None, verbose=True, job_ids=None):
     and the task's log). Prints a summary, including failures per node, and returns
     {'sweep', 'n_tot', 'tasks': {index: {...}}, ...}.
 
-    sweep: the folder name send_to_server printed (or name= you gave it), a path, or None
-        for the most recent sweep. remote: as in send_to_server (None: decide by whether
+    sweep: the folder name send_to_server printed (or name= you gave it), a path, one of the
+        sweep's array job ids, or None for the most recent sweep. remote: as in send_to_server (None: decide by whether
         this machine has sbatch). job_ids: the sweep's array job ids, for sweeps submitted
         before they were recorded, if they can't be found automatically (remembered after).
     """
     remote = shutil.which('sbatch') is None if remote is None else remote
-    args = [STATUS, sweep or ''] + ([f"--job-ids={','.join(map(str, job_ids))}"] if job_ids else [])
+    args = [STATUS, str(sweep) if sweep else ''] + ([f"--job-ids={','.join(map(str, job_ids))}"] if job_ids else [])
     out = _cluster_script(args, remote)
     st = json.loads(out.strip().splitlines()[-1])
     st['tasks'] = {int(i): t for i, t in st['tasks'].items()}

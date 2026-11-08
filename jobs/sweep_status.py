@@ -55,7 +55,23 @@ def sweep_dir(arg):
     if not arg:
         dirs = [d for d in glob.glob(os.path.join(root, '*')) if os.path.isdir(d)]
         return max(dirs, key=os.path.getmtime)
-    return arg if os.path.isabs(arg) else os.path.join(root, arg)
+    path = arg if os.path.isabs(arg) else os.path.join(root, arg)
+    if os.path.isdir(path):
+        return path
+    job = arg.split('_')[0]                       # an array job id (or id_task) instead of a name
+    if job.isdigit():
+        for f in glob.glob(os.path.join(root, '*', 'jobids')):   # the sweep that recorded it
+            if job in open(f).read().split():
+                return os.path.dirname(f)
+        for field in ('StdOut', 'SubmitLine'):   # an older sweep: where Slurm says its logs went
+            out = _slurm(['sacct', '-j', job, '-X', '-n', '-P', f'--format={field}']).stdout
+            m = re.search(re.escape(root.rstrip('/')) + r'/([^/\s]+)/', out)
+            if m:
+                return os.path.join(root, m.group(1))
+    recent = sorted((d for d in glob.glob(os.path.join(root, '*')) if os.path.isdir(d)),
+                    key=os.path.getmtime)[-5:]
+    sys.exit(f"no sweep {arg!r} in {root}, as a folder name or a job id; recent sweeps: "
+             + ', '.join(os.path.basename(d) for d in reversed(recent)))
 
 
 def expand(spec):
