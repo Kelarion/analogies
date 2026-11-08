@@ -226,8 +226,13 @@ class GrammarTask(sxp.Task):
 
         facts, spec = self.prompt_facts(), self.prompt_spec
         prompts.check(spec, facts)
-        rng = np.random.default_rng(self.seed)
+        
         nblk = len(self._block_sizes())
+
+        root = np.random.SeedSequence(self.seed)
+        def stream(s, k):                       # k = 0 for the code, b + 1 for block b
+            return np.random.default_rng(np.random.SeedSequence(root.entropy, spawn_key=(s, k)))
+
 
         seqs = []
         codes = []
@@ -236,7 +241,7 @@ class GrammarTask(sxp.Task):
         which_block = []
         self._used = []                                    # the grammar of each sample
         for s in range(self.samps):
-            self._new_sample(rng, s)
+            self._new_sample(stream(s,0), s)
             self._used.append(self.grammar)
 
             seq = []
@@ -244,6 +249,7 @@ class GrammarTask(sxp.Task):
             trial_len = []
             block = []                                     # block of each trial
             for b in range(nblk):
+                rng = stream(s, b + 1)
                 ctx = self._new_block(rng, b)
                 n = self._block_len(b, ctx)
                 for j in range(n):
@@ -256,7 +262,7 @@ class GrammarTask(sxp.Task):
             X, Y = np.array(seq), np.array(pr)
             trl_blk = np.repeat(block, trial_len)                 # block of each position
 
-            code, V = self._code(rng, nblk)        # grammar token -> symbol, per block
+            code, V = self._code(stream(s, 0), nblk)        # grammar token -> symbol, per block
 
             rows = np.arange(len(X))[:, None]
             Ynew = np.zeros((len(Y), V))

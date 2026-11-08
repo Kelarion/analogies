@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import server_utils as su
-from icl_tasks import RelationTask
+import icl_tasks
 from icl_model import ICLModel
 from icl_utils import true_dist, uniform_block, ngram
 import icl_sweeps as isw
@@ -23,19 +23,83 @@ SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 # k = su.Set([3,4,5,6,7])
 k = [4]
 
-task_args = {'task': RelationTask,
-             'k': k,
-             'd': [1,2],
-             'edges': k,
-        #      'd': 2,
-        #      'degree': 0.9,
-              'connected': None,
-        }
+# task_args = {'task': RelationTask,
+#              'k': k,
+#              'd': [1,2],
+#              'edges': k,
+#         #      'd': 2,
+#         #      'degree': 0.9,
+#               'connected': None,
+#         }
+
+# mod_args = {'model': ICLModel,
+#             'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
+        
+#         }
+
+task_args = {
+             # 'task': icl_tasks.RelationTask,
+             'task': icl_tasks.ExhaustiveRelationTask,
+             'k': 4,
+             'd': 1,
+            #  'degree': 0.5,
+             'edges': 4,
+            #  'index': [0,1,2,3,4],
+            'index': 0,
+             'connected': None, 
+             'keep_connected': False,
+            #  'backtrack': False,
+             # 'graph_seed': 0,                  # same graph for every prompt condition below
+             # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
+             # 'num_trials': [2*[8*k**2], 4*[4*k**2], 8*[2*k**2], 16*[k**2]],
+            #  'num_trials': [i*[None] for i in [1,2,4,8]],
+            #  'num_trials': [[100, 100, 100, 100]],
+            #  'num_trials': 4*[2*k**2],
+             'num_trials': [1*[None], 2*[None]],
+             # 'length': 1,
+             'samps': 1,
+             'holdout': True, 
+             'max_tok': np.inf, 
+             # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
+            #  'explicitness': [0, 1, 2, 3],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             'explicitness': 2,
+            #  'explicitness': (2, 0),
+             'describe_format': True,
+            #  'describe_format': (True, False), 
+            #  'describe_task': (True, False),
+             'describe_task': True,
+            #  'describe_vocab': (True,False),
+            #  'hint': [0, 1, 2],
+            'hint': 0,
+            #  'answer_only': (True, False),
+            'answer_only': True,
+            #  'share_toks': [False, {'action'}, {'node'}],
+             'share_toks': False,
+             'seed': 0,
+             }
 
 mod_args = {'model': ICLModel,
-            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
-        
-        }
+            # 'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B'],
+            # 'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
+            'model_name': 'google/gemma-4-31B-it',
+            # 'mode': ['dialogue', 'raw'],
+            # 'mode': ('raw', 'dialogue'),
+            'mode': 'dialogue',
+            'think': True,
+            # 'think': (False, True),
+            'k_hide': 1,
+            # 'effort': 'low',
+            'effort': None,
+            'thinking_budget': 10000,
+            'seed': 0,
+            # 'equiv': (True, False),
+            'equiv': True,
+            'delim': ',',
+            # 'delim': ',',
+            'tokens': icl_utils.Vocabulary('nouns'),
+            }
+
+# %% Check what a prompt says for a task, without a model (symbols shown as w1, w2, ...)
 
 # su.fetch_results()      # on the laptop: copy new results over from the cluster first
 records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
