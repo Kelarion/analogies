@@ -36,3 +36,6 @@ dev = [
     "ipykernel>=7.4.0",
     "ipython>=9.17.1",
 ]
+
+[project.scripts]
+sweeps = "sweep_cli:main"
