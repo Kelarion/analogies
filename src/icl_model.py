@@ -48,7 +48,7 @@ def get_lm(model_name, prepend_bos=False):
             model_name, hf_model=hf_model, tokenizer=tokenizer, device="cuda")
         _HF[model_name] = hf_model
         # the bridge may switch this back to eager; check:
-        print(hf_model.config.get_text_config()._attn_implementation)
+        # print(hf_model.config.get_text_config()._attn_implementation)
     lm = ChatLM(_BRIDGES[model_name], prepend_bos=prepend_bos)
     lm.hf_model = _HF[model_name]
     return lm

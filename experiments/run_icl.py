@@ -40,10 +40,10 @@ task_args = {
              # 'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
              # 'num_trials': [2*[8*k**2], 4*[4*k**2], 8*[2*k**2], 16*[k**2]],
-             'num_trials': [2*[None]],
+             'num_trials': [i*[None] for i in [1,2,4,8]],
             #  'num_trials': [[100, 100, 100, 100]],
             #  'num_trials': 4*[2*k**2],
-            #  'num_trials': [[None, None]],
+            #  'num_trials': [8*[None]],
              # 'length': 1,
              'samps': 20,
              'holdout': True, 
@@ -74,10 +74,10 @@ mod_args = {'model': ICLModel,
             'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
             # 'model_name': 'google/gemma-4-31B-it',
             # 'mode': ['dialogue', 'raw'],
-            'mode': ('raw', 'dialogue'),
-            # 'mode': 'dialogue',
-            # 'think': True,
-            'think': (False, True),
+            # 'mode': ('raw', 'dialogue'),
+            'mode': 'dialogue',
+            'think': True,
+            # 'think': (False, True),
             'k_hide': 1,
             # 'effort': 'low',
             'effort': None,
@@ -94,11 +94,11 @@ mod_args = {'model': ICLModel,
 # (pickles copied to the cluster over ssh) or on the cluster; push/pull first either way.
 su.send_to_server(task_args, mod_args, per_job=4, exclude=['cn-g028', 'cn-g029'], verbose=True)            # or name='my-sweep'
 
-# # %% Or: run here, e.g. in an interactive session (each model is loaded once)
-# exps, _ = su.get_all_experiments(task_args, mod_args)
+# %% Or: run here, e.g. in an interactive session (each model is loaded once)
+# exps, prm = su.get_all_experiments(task_args, mod_args)
 # exps.sort(key=lambda e: e['model_args']['args'].get('model_name', ''))
 
-# # %%
+# %%
 # for e in exps:
 #     exp = sxp.Experiment(e['task_args']['task'](**e['task_args']['args']),
 #                          e['model_args']['model'](**e['model_args']['args']))

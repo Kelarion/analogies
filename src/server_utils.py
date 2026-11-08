@@ -985,16 +985,26 @@ def get_all_experiments(task_args, model_args, bool_friendly=True):
                 params[k].append(v)
 
     for k,v in params.items():
-        # if bool_friendly:
-        #     params[k] = np.array([stringify(vv) for vv in v])
-        # else:
-        arr_v = np.array(v)
-        if arr_v.dtype.name == 'object':
-            arr_v = np.array([stringify(vv) for vv in arr_v])
-        
-        params[k] = arr_v
+        params[k] = _param_array(v)
 
     return exps, params
+
+
+def _param_array(col):
+    """One parameter's values over a list of runs, as an array (for isw.varying, select, ...).
+    Values of different shapes across runs (num_trials [None] in some, [None, None] in
+    others; a field some runs don't have) can't be stacked, which numpy>=1.24 refuses
+    outright: those get a 1-d object array, one entry per run."""
+    try:
+        arr = np.array(col)
+        if arr.dtype.name == 'object':
+            arr = np.array([stringify(v) for v in col])
+        return arr
+    except ValueError:
+        arr = np.empty(len(col), dtype=object)
+        for i, v in enumerate(col):
+            arr[i] = stringify(v)
+        return arr
 
 
 def stringify(thing):
@@ -1192,17 +1202,7 @@ def load_experiments(task_args, model_args, SAVE_DIR=None,
     prm = {}
     for k in keys:
         col = [{**r['task_args'], **r['model_args']}.get(k, None) for r in records]
-        try:
-            arr = np.array(col)
-            if arr.dtype.name == 'object':
-                arr = np.array([stringify(v) for v in col])
-        except ValueError:
-            # values of different shapes across runs (e.g. a list-valued field that some runs
-            # don't have): numpy>=1.24 won't stack them, so keep one entry per run
-            arr = np.empty(len(col), dtype=object)
-            for i, v in enumerate(col):
-                arr[i] = stringify(v)
-        prm[k] = arr
+        prm[k] = _param_array(col)
 
     if verbose:
         print(f'loaded {len(records)} / {len(sidecars)} runs '
