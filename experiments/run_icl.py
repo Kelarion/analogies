@@ -33,24 +33,24 @@ task_args = {
              'd': 1,
             #  'degree': 0.5,
              'edges': 4,
-            #  'index': [0,1,2,3,4],
-            'index': 0,
+             'index': [0,1,2,3,4],
+            # 'index': 0,
              'connected': None, 
              'keep_connected': False,
             #  'backtrack': False,
              # 'graph_seed': 0,                  # same graph for every prompt condition below
              # 'num_trials': [[None, None], [k**2, k**2], [2*k**2, 2*k**2]],       # a list-valued field needs wrapping: [[...]]
              # 'num_trials': [2*[8*k**2], 4*[4*k**2], 8*[2*k**2], 16*[k**2]],
-            #  'num_trials': [i*[None] for i in [1,2,4,8]],
+             'num_trials': [i*[None] for i in [1,2,4,8]],
             #  'num_trials': [[100, 100, 100, 100]],
             #  'num_trials': 4*[2*k**2],
-             'num_trials': [1*[None], 2*[None]],
+            #  'num_trials': [1*[None], 2*[None]],
              # 'length': 1,
-             'samps': 1,
+             'samps': 24,
              'holdout': True, 
              'max_tok': np.inf, 
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
-             'explicitness': [0, 1, 2],        # 0 none, 1 vague, 2 moderate, 3 explicit
+             'explicitness': [0, 2],        # 0 none, 1 vague, 2 moderate, 3 explicit
             #  'explicitness': 2,
             #  'explicitness': (2, 0),
              'describe_format': True,
@@ -59,11 +59,11 @@ task_args = {
              'describe_task': True,
             #  'describe_vocab': (True,False),
             #  'hint': [0, 1, 2],
-            'hint': 0,
+             'hint': 0,
             #  'answer_only': (True, False),
-            'answer_only': True,
-            #  'share_toks': [False, {'action'}, {'node'}],
-             'share_toks': False,
+             'answer_only': True,
+             'share_toks': [False, {'action'}, {'node'}],
+            #  'share_toks': False,
              'seed': 0,
              }
 
