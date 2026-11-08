@@ -46,7 +46,7 @@ task_args = {
             #  'num_trials': 4*[2*k**2],
             #  'num_trials': [1*[None], 2*[None]],
              # 'length': 1,
-             'samps': 24,
+             'samps': 18,
              'holdout': True, 
              'max_tok': np.inf, 
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
