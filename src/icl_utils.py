@@ -435,6 +435,7 @@ class ChatLM:
         input_ids, target = input_ids.to(self.device), target.to(self.device)
         if mode != 'raw' and think:
             input_ids = self.reason(input_ids, thinking_budget)
+            torch.cuda.empty_cache()   # generation's cached blocks don't fit scoring's shapes
 
         L = len(input_ids)
         lp, top_ids, top_lp = self.score(torch.cat([input_ids, target]), task_toks, equiv)

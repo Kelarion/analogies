@@ -23,6 +23,9 @@ export HF_TOKEN_PATH=$HOME/.cache/huggingface/token
 export HF_HUB_OFFLINE=1        # weights must already be downloaded (hf download ...)
 export TQDM_DISABLE=1 HF_HUB_DISABLE_PROGRESS_BARS=1   # progress bars rewrite the log
                                # file many times a second; nobody watches them in batch
+# grow memory segments in place instead of caching many odd-sized blocks: generation's KV
+# cache grows a step at a time, which otherwise fragments the cache until allocations fail
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd {repo}
 echo "node: $(hostname)  start: $(date -Is)  job: ${{SLURM_ARRAY_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}"
 echo "commit: $(git rev-parse HEAD)"
