@@ -33,7 +33,8 @@ task_args = {
              'd': 1,
             #  'degree': 0.5,
              'edges': 4,
-             'index': [0,1,2,3,4],
+             'index': [1,2,3,4],
+             'target': [],
             # 'index': 0,
              'connected': None, 
              'keep_connected': False,
@@ -43,7 +44,7 @@ task_args = {
              # 'num_trials': [2*[8*k**2], 4*[4*k**2], 8*[2*k**2], 16*[k**2]],
              # 'num_trials': [i*[None] for i in [1,2,4,8]],
             #  'num_trials': [[100, 100, 100, 100]],
-            #  'num_trials': 4*[2*k**2],
+             # 'num_trials': [16*[100]],
              'num_trials': [16*[None]],
              # 'length': 1,
              'samps': 18,
@@ -96,7 +97,7 @@ mod_args = {'model': ICLModel,
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
 # (pickles copied to the cluster over ssh) or on the cluster; push/pull first either way.
-su.send_to_server(task_args, mod_args, per_job=1, exclude=['cn-g028', 'cn-g029'], verbose=True)            # or name='my-sweep'
+su.send_to_server(task_args, mod_args, per_job=8, exclude=['cn-g028', 'cn-g029'], verbose=True)            # or name='my-sweep'
 
 # %% Or: run here, e.g. in an interactive session (each model is loaded once)
 # exps, prm = su.get_all_experiments(task_args, mod_args)
