@@ -632,6 +632,162 @@ def ngram(data, i, order=1, alpha=1.0):
             ctx = (ctx + (X[t],))[1:]
     return P
 
+# Kernel-model references, for automaton walks (node, action, node, ...). Each node that
+# follows an action in a block is predicted from the block's earlier transitions
+# u -a-> v, as a regression from the indicators [eye(N)[u], eye(M)[a]] to eye(N)[v]; any
+# other token gets `fallback` (uniform_block by default). Only the nodes of the token's
+# block are candidates.
+
+def _kinds(data, i):
+    """Per block, {symbol: 'node' | 'action' | None} for the block's alphabet."""
+    code, kinds = block_code(data, i), data.get('kinds')
+    if kinds is None:
+        raise ValueError("these references need data['kinds'] (runs saved since it was added)")
+    return [{int(s): kinds[r] for r, s in enumerate(code[b])} for b in range(len(code))]
+
+
+def _relational_ref(data, i, predict, eps=0.01, fallback=None):
+    """P with each node after an action given by predict(seen, u, a, nodes): seen is the
+    block's earlier transitions [(u, a, v)] as symbols (repeats included), nodes the
+    block's node symbols; it returns weights over nodes (>= 0, not all 0). Mixed with
+    eps of the uniform over nodes, so a miss scores a finite log-likelihood."""
+    X, B = data['X'][i], data['B'][i]
+    P = np.array((fallback or uniform_block)(data, i), float)
+    for b, kind in enumerate(_kinds(data, i)):
+        nodes = np.array([s for s, k in kind.items() if k == 'node'])
+        ts = np.flatnonzero(B == b)
+        seen = []
+        for t in ts[2:]:
+            u, a, v = (int(x) for x in X[t - 2:t + 1])
+            if not (kind.get(u) == 'node' and kind.get(a) == 'action' and kind.get(v) == 'node'):
+                continue
+            w = np.asarray(predict(seen, u, a, nodes), float)
+            p = w / w.sum() if w.sum() > 0 else np.full(len(nodes), 1 / len(nodes))
+            P[t] = 0
+            P[t, nodes] = (1 - eps) * p + eps / len(nodes)
+            seen.append((u, a, v))
+    return P
+
+
+def _choose(scores, beta):
+    """Scores over the candidates -> weights: uniform on the best (beta=None), or
+    softmax(beta * scores)."""
+    s = np.asarray(scores, float)
+    if beta is None:
+        return np.isclose(s, s.max(), atol=1e-9).astype(float)
+    return np.exp(beta * (s - s.max()))
+
+
+def kernel_ref(data, i, kappa=(0, 1, 1, 2), ridge=0.0, counts=False, beta=None, w_self=0.0,
+               eps=0.01, fallback=None):
+    """
+    Kernel (ridge) regression from (u, a) to v on the block's earlier transitions, the
+    kernel depending only on which labels two inputs share:
+        kappa = (k0, ku, ka, k2): k0 sharing neither, ku the source only, ka the action
+        only, k2 both. (0, 1, 1, 2) is the linear kernel on [eye(N)[u], eye(M)[a]]
+        (min-norm least squares: additive, parallelogram completion); an RBF on those
+        indicators is rbf_kappa(gamma). Positive semi-definite when every eigenvalue
+        on the full grid of N nodes x M actions is >= 0: k2-ku-ka+k0,
+        k2+(M-1)ku-ka-(M-1)k0, k2-ku+(N-1)ka-(N-1)k0, k2+(M-1)ku+(N-1)ka+(N-1)(M-1)k0.
+    ridge: added to the training kernel's diagonal (0: interpolate, via pinv).
+    counts: train on every earlier transition, repeats included, rather than each
+    distinct one once (the analysis used distinct ones).
+    The prediction y_hat (one score per node), plus w_self on the source itself, goes
+    to the best node(s) (beta=None) or softmax(beta * scores). A pair (u, a) seen
+    before is interpolated back to its target unless ridge > 0.
+    """
+    k0, ku, ka, k2 = kappa
+
+    def predict(seen, u, a, nodes):
+        tr = seen if counts else list(dict.fromkeys(seen))
+        s = np.zeros(len(nodes))
+        if tr:
+            U = np.array([x[0] for x in tr]); A = np.array([x[1] for x in tr])
+            Y = (np.array([x[2] for x in tr])[:, None] == nodes[None]).astype(float)
+            su, sa = U[:, None] == U[None], A[:, None] == A[None]
+            K = k0 + (ku - k0) * su + (ka - k0) * sa + (k2 - ku - ka + k0) * (su & sa)
+            ku_, ka_ = U == u, A == a
+            k = k0 + (ku - k0) * ku_ + (ka - k0) * ka_ + (k2 - ku - ka + k0) * (ku_ & ka_)
+            s = k @ np.linalg.pinv(K + ridge * np.eye(len(K))) @ Y
+        s = s + w_self * (nodes == u)
+        return _choose(s, beta)
+
+    return _relational_ref(data, i, predict, eps, fallback)
+
+
+def rbf_kappa(gamma):
+    """kernel_ref's kappa for an RBF exp(-gamma |x - x'|^2) on the concatenated
+    indicators: inputs differing in one label are at squared distance 2."""
+    r = np.exp(-2 * gamma)
+    return (r * r, r, r, 1.0)
+
+
+def cue_ref(data, i, weights=(0, 1, 0), w_self=0.0, counts=False, beta=None, eps=0.01,
+            fallback=None):
+    """
+    The cue heuristics: for an unseen pair (u, a), each node v scores
+        w_src * #(u -b-> v, b != a) + w_act * #(x -a-> v, x != u) + w_nei * #(x -b-> v,
+        x != u, b != a) + w_self [v == u]
+    over the block's earlier transitions (each distinct one once, or with counts every
+    repeat), with weights = (w_src, w_act, w_nei) -- the per-training-point weights a
+    kernel puts on each group when the rest of the (node x action) grid is seen, e.g.
+    (3, 1, -1) for the linear kernel. The scores go to the best node(s) (beta=None)
+    or softmax(beta * scores). A pair (u, a) seen before predicts what followed it.
+    """
+    w_src, w_act, w_nei = weights
+
+    def predict(seen, u, a, nodes):
+        known = [v for uu, aa, v in seen if (uu, aa) == (u, a)]
+        if known:
+            return (np.array(known)[:, None] == nodes[None]).sum(0)
+        tr = seen if counts else list(dict.fromkeys(seen))
+        s = np.zeros(len(nodes))
+        for uu, aa, v in tr:
+            w = w_src if uu == u else w_act if aa == a else w_nei
+            s += w * (nodes == v)
+        s += w_self * (nodes == u)
+        return _choose(s, beta)
+
+    return _relational_ref(data, i, predict, eps, fallback)
+
+
+def copy_or_sink(data, i, eps=0.01, fallback=None):
+    """
+    The rule that matched gemma's choices on record512 (71 of 80 tests): if the source
+    u has started a transition before, predict what followed it, by how often, whatever
+    the action; otherwise uniform over the 'sink' nodes (seen only as targets, never
+    as sources), u excluded; failing that over every node seen as a target but u; and
+    failing that over all the block's nodes.
+    """
+    def predict(seen, u, a, nodes):
+        after = [v for uu, _, v in seen if uu == u]
+        if after:
+            return (np.array(after)[:, None] == nodes[None]).sum(0)
+        srcs, tgts = {x[0] for x in seen}, {x[2] for x in seen}
+        for cand in ((tgts - srcs) - {u}, tgts - {u}):
+            if cand:
+                return np.isin(nodes, list(cand)).astype(float)
+        return np.ones(len(nodes))
+
+    return _relational_ref(data, i, predict, eps, fallback)
+
+
+KERNEL_REFS = {
+    'linear kernel': partial(kernel_ref, kappa=(0, 1, 1, 2)),
+    'RBF, gamma=1': partial(kernel_ref, kappa=rbf_kappa(1.0)),
+    'copy source': partial(cue_ref, weights=(1, 0, 0)),
+    'action majority': partial(cue_ref, weights=(0, 1, 0)),
+    'other-action majority': partial(cue_ref, weights=(0, 0, 1)),
+    'target frequency': partial(cue_ref, weights=(1, 1, 1)),
+    'anti-frequency': partial(cue_ref, weights=(-1, -1, -1)),
+    'avoid copy, anti-frequency': partial(cue_ref, weights=(-0.92, -0.33, -0.23)),
+    'copy or sink': copy_or_sink,
+}
+"""The references discussed, by name: refs=KERNEL_REFS, or pick some, e.g.
+{k: KERNEL_REFS[k] for k in ['linear kernel', 'action majority']}. They are rules
+(the best node(s), with eps = 0.01 elsewhere); partial(kernel_ref, beta=...) or
+partial(cue_ref, beta=...) gives a graded version."""
+
 REF_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X']
 
 def ylabel(perplexity=False, kl=False, renorm=True):
@@ -651,7 +807,8 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
                     completion token from the start of the assistant turn (one star per block).
                     Only meaningful for the 'dialogue' and 'single' formats.
     refs:   {label: predictor}, reference predictors (see true_dist, uniform_block,
-            uniform_kind, ngram) scored at the same tokens as the model, and drawn with
+            uniform_kind, ngram, and for relations kernel_ref, cue_ref, copy_or_sink and
+            KERNEL_REFS) scored at the same tokens as the model, and drawn with
             hollow markers and dashed lines in each block's colour. E.g.
                 refs={'true': true_dist, 'uniform': uniform_block,
                       'kind': partial(uniform_kind, grammar=task.grammar),
