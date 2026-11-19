@@ -6,6 +6,7 @@ import icl_tasks
 from icl_model import ICLModel
 from geometry import Geometry
 import icl_utils
+import server_utils as su
 
 SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
