@@ -13,6 +13,7 @@ dependencies = [
     "numba>=0.68.0",
     "numpy>=2.5.4",
     "pandas>=3.0.6",
+    "sbmf",
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "torch>=2.14.1",
@@ -30,6 +31,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.uv.sources]
+sbmf = { git = "https://github.com/Kelarion/concepts", rev = "0422461" }
 
 [dependency-groups]
 dev = [
