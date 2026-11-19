@@ -10,6 +10,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # src/.
 JOB_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'array_template.sh')
 WORKER = os.path.join(REPO_DIR, 'jobs', 'run_experiment.py')
 DOWNLOAD_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'download_template.sh')
+PREREQUISITE_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'prerequisite_template.sh')
 WEIGHTS = 'jobs/weights.py'          # relative to the repo, run on the cluster
 STATUS = 'jobs/sweep_status.py'
 
@@ -21,6 +22,7 @@ import socket
 import sys
 import time
 import json
+import hashlib
 import re
 import shlex
 import shutil
@@ -694,7 +696,7 @@ def _git(*args, cwd=REPO_DIR):
 
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
                    name=None, max_parallel=8, template=None, remote=None, check_commit=True,
-                   ensure_weights=True, per_job=1, exclude=None):
+                   ensure_weights=True, ensure_prerequisites=True, per_job=1, exclude=None):
     """
     Submit every task x model combination as one Slurm job array.
 
@@ -714,6 +716,13 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     ensure_weights: if the model class has a model_name field, check that each model in the
         sweep is fully in the cluster's Hugging Face cache; for any that isn't, first submit
         a CPU job that downloads it, and make the array wait for that job to succeed.
+    ensure_prerequisites: if the task or model class has a `prerequisites(args)` classmethod
+        (e.g. icl_model.ICLModel: the stored token categories its geometry names), check each
+        file it declares for the sweep's combinations on the cluster; for any that is missing
+        or stale, first submit a job that makes it (jobs/prerequisite_template.sh; after the
+        download, if any), and make the array wait for those too. Each such job is named after
+        its file and runs as a singleton, so concurrent sweeps make a file only once. With
+        run_remote=False they are made here instead, before the first array task.
     per_job: combinations each array task runs, one after another in one process, so the
         model is loaded once per job instead of once per combination. Loading a large model
         can take longer than a short experiment, and many jobs loading at once strain the
@@ -768,7 +777,11 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
               f'in {n_jobs} jobs of up to {per_job}, in {sweep}'
               + (f' on {REMOTE_HOST}' if remote else ''))
 
+    prereqs = (_prerequisites(task_args, tasks, mod_args, models) if ensure_prerequisites else [])
     if not run_remote:
+        for p, why in _missing_prerequisites(prereqs, REPO_DIR, False).values():
+            print(f'Making first, here: {p["what"]} ({why})')
+            subprocess.check_call([sys.executable, *p['make']], cwd=REPO_DIR)
         print('Running the first job here...')
         subprocess.check_call([sys.executable, WORKER, '0', str(n_task), local,
                                str(per_job), str(n_tot)])
@@ -789,16 +802,32 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         with open(os.path.join(local, 'download.sh'), 'w') as f:
             f.write(script)
 
+    needed = _missing_prerequisites(prereqs, repo, remote) if prereqs else {}
+    if needed:
+        with open(PREREQUISITE_TEMPLATE) as f:
+            template_ = f.read()
+        for k, (p, _) in enumerate(needed.values()):
+            with open(os.path.join(local, f'prerequisite_{k}.sh'), 'w') as f:
+                f.write(template_.format(command=' '.join(shlex.quote(a) for a in p['make']),
+                                         what=p['what'], log=f'prerequisite_{k}', **fill))
+
     if remote:
         _remote(f'mkdir -p {sweep}')
         subprocess.run(['rsync', '-a', local + '/', f'{REMOTE_HOST}:{sweep}/'], check=True)
 
-    after = None
+    after = []
     if missing:
-        after = _sbatch(os.path.join(sweep, 'download.sh'), remote)
+        after.append(_sbatch(os.path.join(sweep, 'download.sh'), remote))
         for m, why in missing.items():
             print(f'Not cached on the cluster: {m}\n    ({why})')
-        print(f'Downloading first (job {after}); the array starts once that succeeds.')
+        print(f'Downloading first (job {after[0]}); the array starts once that succeeds.')
+    for k, (p, why) in enumerate(needed.values()):
+        name_ = 'prep-' + hashlib.md5(p['key'].encode()).hexdigest()[:10]
+        job_ = _sbatch(os.path.join(sweep, f'prerequisite_{k}.sh'), remote, after=after[:1],
+                       extra=[f'--job-name={name_}'], singleton=True)
+        print(f'Not on the cluster: {p["what"]}\n    ({why})\n    making it first (job {job_}, '
+              f'log {sweep}/logs/prerequisite_{k}.out)')
+        after.append(job_)
     extra = [f'--exclude={",".join(exclude)}'] if exclude else []
     job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after, extra=extra)
     _record_job(sweep, job, remote)
@@ -831,9 +860,42 @@ def _missing_weights(names, scratch, repo, remote):
     return json.loads(out.strip().splitlines()[-1])
 
 
-def _sbatch(script, remote, after=None, extra=()):
-    """Submit `script`, optionally to start only once job `after` has succeeded; returns the job id."""
-    args = (['sbatch', '--parsable'] + ([f'--dependency=afterok:{after}'] if after else [])
+def _prerequisites(task_args, tasks, mod_args, models):
+    """What the task and model classes declare their combinations need first (a
+    `prerequisites(args)` classmethod returning dicts with 'key', 'check', 'make' and 'what';
+    see icl_model.ICLModel), each once."""
+    out = {}
+    for cls, argsets in ((task_args['task'], tasks), (mod_args['model'], models)):
+        declare = getattr(cls, 'prerequisites', None)
+        for args in argsets if declare else ():
+            for p in declare(args):
+                out.setdefault(p['key'], p)
+    return list(out.values())
+
+
+def _missing_prerequisites(prereqs, repo, remote):
+    """{key: (prerequisite, why)} for those whose check (a script in the repo and its
+    arguments, exiting 0 when the file is there and current) fails on the cluster, or here."""
+    out = {}
+    for p in prereqs:
+        cmd = ' '.join(shlex.quote(a) for a in p['check'])
+        if remote:
+            lines = _remote(f'cd {repo} && .venv/bin/python {cmd}; echo "exit=$?"').splitlines()
+            code, msg = int(lines[-1].split('=', 1)[1]), '\n'.join(lines[:-1]).strip()
+        else:
+            r = subprocess.run([sys.executable, *p['check']], cwd=repo, capture_output=True, text=True)
+            code, msg = r.returncode, (r.stdout + r.stderr).strip()
+        if code:
+            out[p['key']] = (p, msg.splitlines()[-1] if msg else f'check exited {code}')
+    return out
+
+
+def _sbatch(script, remote, after=None, extra=(), singleton=False):
+    """Submit `script`, optionally to start only once the job(s) `after` have succeeded (and,
+    with singleton, once no other job of its name is running); returns the job id."""
+    after = [after] if isinstance(after, str) else [a for a in (after or []) if a]
+    dep = ([f'afterok:{":".join(after)}'] if after else []) + (['singleton'] if singleton else [])
+    args = (['sbatch', '--parsable'] + ([f'--dependency={",".join(dep)}'] if dep else [])
             + list(extra) + [script])
     if remote:
         out = _remote(' '.join(shlex.quote(a) for a in args))
