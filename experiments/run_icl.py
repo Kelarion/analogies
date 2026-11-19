@@ -34,8 +34,9 @@ task_args = {
             #  'degree': 0.5,
              'edges': 4,
              # 'index': [1,2,3,4],
-             'index': [2,4],
-             'target': 0,
+             # 'index': [2,4],
+             'index': 1, 
+             'target': [0,1,2],
             # 'index': 0,
              'connected': None, 
              'keep_connected': False,
@@ -93,7 +94,8 @@ mod_args = {'model': ICLModel,
             'equiv': True,
             'delim': ',',
             # 'delim': ',',
-            'tokens': [icl_utils.Vocabulary('nouns'), icl_utils.Vocabulary('words', content=True)],
+            # 'tokens': [icl_utils.Vocabulary('nouns'), icl_utils.Vocabulary('words', content=True)],
+            'tokens': icl_utils.Vocabulary('words', content=True),
             }
 
 # %% Either: submit as a Slurm job array, one job per combination. Works from the laptop
