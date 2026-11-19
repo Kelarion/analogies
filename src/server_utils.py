@@ -696,7 +696,8 @@ def _git(*args, cwd=REPO_DIR):
 
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
                    name=None, max_parallel=8, template=None, remote=None, check_commit=True,
-                   ensure_weights=True, ensure_prerequisites=True, per_job=1, exclude=None):
+                   ensure_weights=True, ensure_prerequisites=True, per_job=1, exclude=None,
+                   dry_run=False, attach=()):
     """
     Submit every task x model combination as one Slurm job array.
 
@@ -731,6 +732,10 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     exclude: nodes to keep the jobs off, e.g. ['cn-g028'] for a node with known problems.
     run_remote=False runs the first array task here instead, for debugging.
     max_parallel caps how many array tasks run at once.
+    dry_run: say what would be submitted (combinations, missing weights and prerequisites, on
+        the cluster if remote) and stop, writing and submitting nothing.
+    attach: files to copy into the sweep folder alongside the pickles (e.g. the spec file
+        `sweeps send` read the arguments from), so the folder records how it was made.
     """
     if remote is None:
         remote = run_remote and shutil.which('sbatch') is None
@@ -762,6 +767,23 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     local = os.path.join(SWEEP_DIR, name)        # where the files are written
     if os.path.exists(local):
         raise FileExistsError(f'{local} already exists; pick another name')
+    if dry_run:
+        names = _model_names(mod_args, models) if ensure_weights else []
+        missing = _missing_weights(names, scratch, repo, remote) if names else {}
+        prereqs = _prerequisites(task_args, tasks, mod_args, models) if ensure_prerequisites else []
+        needed = _missing_prerequisites(prereqs, repo, remote) if prereqs else {}
+        where = f'{REMOTE_HOST}:{sweep}' if remote else sweep
+        print(f'Dry run: {n_task} tasks x {len(models)} models = {n_tot} combinations, '
+              f'in {n_jobs} array tasks of up to {per_job}, {max_parallel} at once, into {where}')
+        for m, why in missing.items():
+            print(f'  would download first: {m}  ({why})')
+        for p, why in needed.values():
+            print(f'  would make first: {p["what"]}  ({why})')
+        if names and not missing:
+            print(f'  weights cached: {", ".join(names)}')
+        if prereqs and not needed:
+            print(f'  prerequisites present: {len(prereqs)}')
+        return None
     os.makedirs(os.path.join(local, 'logs'))
 
     for i, args in enumerate(tasks):
@@ -770,6 +792,8 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     for j, args in enumerate(models):
         with open(os.path.join(local, 'model_%d.pkl' % j), 'wb') as f:
             pkl.dump({'model': mod_args['model'], 'args': args}, f)
+    for path_ in attach:
+        shutil.copy(path_, os.path.join(local, os.path.basename(path_)))
     with open(os.path.join(local, 'sweep.json'), 'w') as f:
         json.dump({'n_task': n_task, 'n_tot': n_tot, 'per_job': per_job}, f)
     if verbose:

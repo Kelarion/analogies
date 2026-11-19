@@ -115,3 +115,4 @@ def rank(results, by=('model_name', 'method', 'dim')):
         print(', '.join(f'{k}={v}' for k, v in zip(by, key)))
         for te, tr, args, m in sorted(groups[key], key=lambda r: -r[0]):
             print(f'    test {te:+.4f}  train {tr:+.4f}   model {m["model"]}   fit {m["fit"]}')
+            
