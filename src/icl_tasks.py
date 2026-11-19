@@ -82,9 +82,15 @@ class GrammarTask(sxp.Task):
         super().__post_init__()                           # records .args, builds any Build
         if self.grammar is None:
             self.grammar = self.make_grammar()
+        self.grammar = self._adapt(self.grammar)          # e.g. AutomatonTask's show
         self._shared_kinds()                              # checks share_toks
         spec = self.prompt_spec                           # checks the fields
         prompts.check(spec, self.prompt_facts())
+
+    def _adapt(self, g):
+        """Fit a grammar (made or given) to the task's fields before it is used; the
+        identity here. AutomatonTask applies its show."""
+        return g
 
     def make_grammar(self, sample=0):
         """The grammar, from the task's fields, when none is given: sample's, for tasks
@@ -299,6 +305,12 @@ class AutomatonTask(GrammarTask):
     - listed (num_trials None): every transition once, in a fresh random
       order each sample (see the automaton's transitions())
 
+    show: which kinds of label the trials show, as a set like share_toks, e.g. {'node'} for
+    walks of nodes only; None (the default) leaves the automaton as built, which for the
+    graphs the tasks make is everything. Applied to every automaton the task uses, made or
+    given, and to each sample's fresh one. Hidden labels still have symbols (data['V'] and
+    data['code'] count them), they just never appear.
+
     With holdout=True, each block holds out one random unit from all its
     trials but the last, which ends with it: for an FSA, Edge(u, v) -- every
     edge u -> v whatever its action -- for a transition drawn uniformly (or
@@ -324,6 +336,7 @@ class AutomatonTask(GrammarTask):
     holdout_unit: str = "edge"          # FSA only: "edge" or "pair"
     keep_connected: bool = True         # FSA edges only
     max_redraws: int = 1000
+    show: object = None                 # None, or a set of some kinds, e.g. {'node'} (see above)
 
     def prompt_facts(self):
         g = self.grammar
@@ -340,13 +353,35 @@ class AutomatonTask(GrammarTask):
                     trial_len=lens.pop() if len(lens) == 1 else None,
                     holdout=self.holdout, listed=any(n is None for n in self.num_trials))
 
+    def _adapt(self, g):
+        """The automaton with the task's show applied (to a made or given one alike)."""
+        s = self.show
+        if s is None:
+            return g
+        if isinstance(s, str):
+            raise TypeError(f"show is a set of kinds, like share_toks: write show={{{s!r}}}")
+        if not isinstance(s, (set, frozenset)):
+            raise TypeError(f"show is None or a set of kinds, e.g. {{'node'}}, not {s!r}")
+        if not isinstance(g, auto.Automaton):
+            raise ValueError(f"show is for automata; this grammar is a {type(g).__name__}")
+        kinds = set(g.KINDS)
+        if set(s) - kinds:
+            raise ValueError(f"show={set(s)}: the kinds are {kinds}")
+        if not s:
+            raise ValueError("show=set() shows nothing")
+        if set(s) == kinds:
+            raise ValueError(f"show={set(s)} shows every kind, as the automata do unless built "
+                             "otherwise: leave show=None")
+        g._set_show(s)
+        return g
+
     def _new_sample(self, rng, s):
         """A fresh automaton for each sample, make_grammar(s), when the task makes its own
         (sample 0's is made with the task). For a random graph (RelationTask) every sample
         has its own; a fixed one (CycleTask, GridTask) just comes out the same again. A
         given grammar is kept for every sample."""
         if s > 0 and self.args['grammar'] is None:
-            self._set_grammar(self.make_grammar(s))
+            self._set_grammar(self._adapt(self.make_grammar(s)))
 
     def sample(self):
         """GrammarTask.sample, plus the automaton of each sample as data['automaton'][i]

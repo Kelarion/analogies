@@ -124,7 +124,7 @@ class ICLModel(sxp.Model):
         lm = get_lm(self.model_name, self.prepend_bos)
         rng = np.random.default_rng(self.seed)
         pool = vocabulary.get_pool(self.tokens, lm.tokenizer, self.delim, self.equiv)
-        n_tok = len(np.unique(np.concatenate(X)))
+        n_tok = data['V'] if 'V' in data else len(np.unique(np.concatenate(X)))   # hidden kinds too
 
         template_kwargs = {} if self.effort is None else {'reasoning_effort': self.effort}
         equiv = pool.equiv
@@ -147,6 +147,8 @@ class ICLModel(sxp.Model):
                 task_toks = pool.assign(n_tok, rng)
             else:
                 groups = geometry.symbol_groups(data['code'][i], data['kinds'], self.geometry.group)
+                seen = np.unique(X[i])                    # leave out symbols the trials never show
+                groups = [g[np.isin(g, seen)] for g in groups]
                 task_toks, info = assigner.assign(n_tok, rng, groups)
                 self.metrics['geometry'].append(info)
 
