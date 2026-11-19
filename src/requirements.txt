@@ -17,3 +17,11 @@ torch
 transformers
 transformer-lens>=3.0    # TransformerBridge (transformer_lens.model_bridge) arrived in 3.0
 accelerate               # from_pretrained(..., device_map="cuda") needs it
+
+# token vocabularies and geometry (vocabulary.py, geometry.py)
+wordfreq
+nltk                     # plus its data: python -m nltk.downloader wordnet stopwords framenet_v17
+
+# learned token categories (categories.py, bmf_sweep.py): sbmf from github.com/Kelarion/concepts,
+# pinned to a commit so stored codes stay reproducible. Pulls in numba, cvxpy, scikit-learn.
+sbmf @ git+https://github.com/Kelarion/concepts@0422461
