@@ -27,14 +27,16 @@ task_args = {'task': icl_tasks.ExhaustiveRelationTask,
              'k': 4,
              'd': 1,
              'edges': 4,
+             'index': [1,2,4],
         #      'd': 2,
         #      'degree': 0.9,
               'connected': None,
-              'samps': 18,
+              'samps': 100,
         }
 
 mod_args = {'model': ICLModel,
-            'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
+        #     'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
+            'model_name': ['Qwen/Qwen3.5-35B-A3B-Base', 'google/gemma-4-31B'],
         #     'think': False,        
         }
 
@@ -47,14 +49,14 @@ isw.varying(prm);         # what differs between the runs, and over what values
 # %% Which runs: fix everything except the grid (and line) dimensions
 
 these = {}
-# these |= {'model_name': 'Qwen/Qwen3.8-27B'}
-these |= {'model_name': ['google/gemma-4-31B-it','Qwen/Qwen3.8-27B']}
+# these |= {'model_name': 'Qwen/Qwen3.5-35B-A3B-Base'}
+# these |= {'model_name': ['google/gemma-4-31B-it','Qwen/Qwen3.8-27B']}
 these |= {'mode': 'raw'} 
 # these |= {'mode': 'dialogue'}
 # these |= {'commutes': 0}
-# these |= {'describe_task': True}
+these |= {'describe_task': False}
 # these |= {'explicitness': 0}
-these |= {'describe_task': [True, False]}      # describe_format and answer_only go with it
+# these |= {'describe_task': [True, False]}      # describe_format and answer_only go with it
 these |= {'hint': 0}
 # these |= {'share_toks': [False, {'action'}, {'node'}, True]}
 these |= {'share_toks': False}
@@ -63,9 +65,9 @@ these |= {'share_toks': False}
 # these |= {'tokens': icl_utils.Vocabulary('nouns')}
 # these |= {'num_trials': (None, None)}                 # a list-valued field as a tuple
 # these |= {'num_trials': [[72,72]]}       # a list: any of these
-# these |= {'k': lambda k: k >= 8}
+# these |= {'k': lambda k: k >= 8} 
 # these |= {'delim': ','}
-these |= {'index': [1,2,3,4]}
+these |= {'index': 1}
 these |= {'d':1}
 these |= {'think': False}
 
@@ -74,15 +76,17 @@ these |= {'think': False}
 # rows = 'share_toks'
 # rows = 'tokens'
 # rows = 'describe_task'
+rows = 'target'
 # rows = 'hint'
-rows = 'index'
+# rows = 'index'
 # rows = None
 
 # cols = 'explicitness'
 # cols = 'hint'
 # cols = 'commutes'
 # cols = 'share_toks'
-cols = 'num_trials'
+# cols = 'num_trials'
+cols = 'tokens'
 # cols = 'index'
 # cols = None
 # cols = 'describe_task'
@@ -113,7 +117,7 @@ refs = {
 
 isw.plot_heldout(records, prm, hue=lines, rows=rows, cols=cols, 
                  where=these, refs=refs, kl=kl, keep='fixed samples',
-                 err='iqr', traces=0.7, renorm=False)
+                 err='iqr', traces=0.1, renorm=False)
 plt.ylim([-5,0.1])
 plt.show()
 
@@ -135,10 +139,14 @@ plt.show()
 # deez = {'hint': 0, 'model_name': 'Qwen/Qwen3.8-27B', 'share_toks': False, 'num_trials': [16*[16]]}
 deez = {
         # 'model_name': 'google/gemma-4-31B-it',
-        'model_name': 'Qwen/Qwen3.8-27B',
-        'index': 2,
-        'describe_task': True,
+        # 'model_name': 'google/gemma-4-31B',
+        # 'model_name': 'Qwen/Qwen3.8-27B',
+        'model_name': 'Qwen/Qwen3.5-35B-A3B-Base',
+        # 'index': 2,
+        # 'describe_task': False,
         # 'num_trials': [1*[None]]
+        'tokens': icl_utils.Vocabulary('nouns'),
+        'target': 2,
         }
 
 refs = {
@@ -158,7 +166,7 @@ foo = isw.trace(records[idx[0]])
 
 isw.plot_node_probs(records, prm, prob=True,
                  where=these | deez, over='vocab',
-                 err='iqr', traces=0.7)
+                 err='iqr', traces=0.1)
 
 # isw.plot_heldout(records, prm, hue=lines, rows=rows, cols=cols, 
 #                  where=these | deez, refs=refs, kl=kl,keep='fixed samples',
