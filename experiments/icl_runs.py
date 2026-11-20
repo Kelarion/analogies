@@ -4,7 +4,6 @@ import numpy as np
 
 import icl_tasks
 from icl_model import ICLModel
-from geometry import Geometry
 import icl_utils
 import server_utils as su
 
@@ -28,9 +27,10 @@ task_args = {
              'd': 1,
             #  'degree': 0.5,
              'edges': 4,
-             'index': 1,
+             'index': [0,1,2],
+             'all_edges': True, 
              # 'index': [2,4],
-             'target': [0,1,2],
+             # 'target': [0,1,2],
             # 'index': 0,
              'connected': None, 
              'keep_connected': False,
@@ -82,11 +82,13 @@ mod_args = {'model': ICLModel,
             'seed': 0,
             # 'equiv': (True, False),
             'equiv': True,
-            'delim': ',',
+            'delim': [',', '\n'],
             # 'delim': ',',
-            'geometry': [None,
-                         Geometry(group={'action', 'node'}, categories={'hypernyms'}, within=2, between=0.5, beta=2),
-                         Geometry(group={'block'}, categories={'hypernyms'}, within=2, between=0.5, beta=2)],
+            'group': [None, {'action','node'}, {'block'}],
+            # 'categories': [],
+            # 'geometry': [None,
+            #              Geometry(group={'action', 'node'}, categories={'hypernyms'}, within=2, between=0.5, beta=2),
+            #              Geometry(group={'block'}, categories={'hypernyms'}, within=2, between=0.5, beta=2)],
             # 'tokens': [icl_utils.Vocabulary('nouns'), icl_utils.Vocabulary('words', content=True)],
             'tokens': icl_utils.Vocabulary('words', content=True),
             }
