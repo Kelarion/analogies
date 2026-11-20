@@ -1629,3 +1629,96 @@ def _relation_holdouts(k, d, edges, exclusive, connected, keep_connected):
             key, vv = _canon(Fr, (u, a), v)
             found[key][vv] += 1
     return [(key, sorted(found[key].items())) for key in sorted(found)]
+
+def holdout_graph(k, d, edges, index, strict=False, all_edges=False, all_nodes=False,
+                  min_answers=2, exclusive=True, connected=None):
+    """
+    The index-th graph of indexed_relation's family (k nodes, d relations, each a function
+    without self-loops on `edges` of the nodes; exclusive, connected as there) among those
+    with well-defined hold-outs, and its hold-outs.
+
+    A hold-out u -a-> v of graph G is well defined if v is the only node w for which the
+    rest of G plus u -a-> w is isomorphic to G, relabelling nodes and relations: someone
+    who knows G only up to isomorphism (as from other blocks, in other words) can tell
+    the answer from the rest. This includes the answer being fixed by every symmetry of
+    the rest that fixes u and a. The answer v must also be on some other edge, so its word
+    is in the block's context, and so must the action. With strict, so must the source u;
+    otherwise u may appear only in the query, the test trial's start.
+
+    Graphs with a node on no edge are left out. Of the rest, a graph is kept if its
+    well-defined hold-outs have at least min_answers different answers, and with
+    all_edges every edge is one, with all_nodes every node is the answer of one. (Every
+    node answering nearly always means every edge is a hold-out; for one relation it
+    means a permutation.) Graphs are in indexed_relation's order; `index` counts only
+    those kept, so it depends on these settings. Brute force, cached: for k <= 5.
+
+    Returns the whole graph (MultiDiGraph, nodes 0..k-1, `action` on each edge) with in
+    G.graph:
+        index, n    which graph this is, of how many kept
+        count       labelled graphs in its class
+        holdouts    its well-defined hold-outs, as Edge(u, v, a), in order
+        answers     the different answers among them, in order
+    """
+    items = _holdout_graphs(k, d, edges, bool(strict), bool(all_edges), bool(all_nodes),
+                            int(min_answers), exclusive, connected)
+    if not items:
+        raise ValueError(f"no graph with k={k}, d={d}, edges={edges} has hold-outs that meet "
+                         f"strict={strict}, all_edges={all_edges}, all_nodes={all_nodes}, "
+                         f"min_answers={min_answers}")
+    if not 0 <= index < len(items):
+        raise IndexError(f"index {index}: there are {len(items)} such graphs")
+    key, count, holdouts = items[index]
+    G = nx.MultiDiGraph(index=index, n=len(items), count=count,
+                        holdouts=tuple(Edge(u, v, a) for u, a, v in holdouts),
+                        answers=tuple(sorted({v for _, _, v in holdouts})))
+    G.add_nodes_from(range(k))
+    for r in range(d):
+        for x in range(k):
+            if key[r * k + x] >= 0:
+                G.add_edge(x, key[r * k + x], action=r)
+    return G
+
+
+def _well_defined_holdouts(F, strict):
+    """[(u, a, v)] of the edges of F (d x k targets, -1 none) that holdout_graph allows."""
+    d, k = F.shape
+    key = _canon(F)
+    out = []
+    for a in range(d):
+        for u in range(k):
+            v = int(F[a, u])
+            if v < 0:
+                continue
+            C = F.copy()
+            C[a, u] = -1
+            links = _relation_links(C)
+            nodes, acts = {x for e in links for x in e[:2]}, {e[2] for e in links}
+            if v not in nodes or a not in acts or (strict and u not in nodes):
+                continue                                         # a word only in the test
+            fits = []
+            for w in range(k):
+                if w != u:
+                    C[a, u] = w
+                    if _canon(C) == key:
+                        fits.append(w)
+            if fits == [v]:
+                out.append((u, a, v))
+    return out
+
+
+@lru_cache(maxsize=None)
+def _holdout_graphs(k, d, edges, strict, all_edges, all_nodes, min_answers, exclusive, connected):
+    """[(key, labelled count, [(u, a, v), ...])] for holdout_graph, in indexed_relation's order."""
+    out = []
+    for key, count in _relation_graphs(k, d, edges, exclusive, connected):
+        F = np.array(key).reshape(d, k)
+        links = _relation_links(F)
+        if {x for e in links for x in e[:2]} != set(range(k)):
+            continue                                             # a node on no edge
+        hs = _well_defined_holdouts(F, strict)
+        answers = {v for _, _, v in hs}
+        if (len(answers) < max(1, min_answers) or (all_edges and len(hs) < len(links))
+                or (all_nodes and answers != set(range(k)))):
+            continue
+        out.append((key, count, hs))
+    return out

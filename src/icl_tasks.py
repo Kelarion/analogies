@@ -528,86 +528,92 @@ class GridTask(AutomatonTask):
 
 @dataclass(kw_only=True)
 class ExhaustiveRelationTask(AutomatonTask):
-    """AutomatonTask that sweeps every distinct hold-out on small relation graphs
-    (automata.indexed_relation): k nodes, d relations, each a function without
-    self-loops on `edges` of the nodes, exclusive (no two relations join the same
-    x -> y, as RelationTask's graphs) unless exclusive=False, and connected as
-    RelationTask's `connected`. A sample's graph is training set `index` with its
-    answer `target` put back as the held-out edge u -a-> v, and every block holds
-    out that one edge: its trials avoid it and the last ends with it, as with
-    holdout=True, but the edge is the sweep's rather than a random draw. With num_trials None a block lists every other
-    transition once, so it shows exactly the training set.
+    """AutomatonTask over an exhaustive list of small relation graphs
+    (automata.holdout_graph): k nodes, d relations, each a function without self-loops on
+    `edges` of the nodes, exclusive (no two relations join the same x -> y, as
+    RelationTask's graphs) unless exclusive=False, connected as RelationTask's
+    `connected`. Every block of a sample uses the same graph and holds out one of its
+    well-defined edges: the trials avoid it and the last ends with it, as with
+    holdout=True. Which edge varies from block to block, so the answer isn't always the
+    word in the same role.
 
-    Which hold-out each sample gets:
-      index and target given    that one, in every sample (sweep both fields)
-      index given, target None  sample s gets that training set's answer s mod n
-      both None                 sample s gets the s-th (index, target) pair, in
-                                order (wrapping): samps=self.n_holdouts covers them all
-    data['holdout'][i] records sample i's (index, target, edge u-v-a, count); the
-    held-out edge is also marked holdout=True in data['automaton'][i]."""
+    Well defined: the answer v is the only node that completes the rest of the graph,
+    with the query (u, a), into a graph isomorphic to the whole, so knowing the graph only
+    up to relabelling (as from the other blocks) is enough to answer; and v and the
+    action are in the block's context. strict: so is the source u (otherwise it may
+    appear only in the query). Only graphs with well-defined hold-outs with at least
+    min_answers different answers are used, and with all_edges only graphs where every
+    edge is one, with all_nodes only those where every node answers one (see
+    holdout_graph). `index` picks one of those graphs, so its meaning depends on all of
+    these settings; index=None gives sample s graph s (wrapping), so samps=self.n_graphs
+    covers them all.
+
+    The blocks go through the graph's answers in a random order, the same order
+    repeated, so consecutive blocks have different answers (given two or more); each
+    block holds out a random well-defined edge into its answer. With num_trials None a
+    block lists every other transition once, then the test.
+
+    data['holdout'][i] records sample i's graph (index, n_graphs, count: its labelled
+    graphs), its answers and hold-outs, and each block's held-out edge as (u, v, a), in
+    the automaton's labels (data['automaton'][i] is the whole graph). show must show the
+    actions when there are several relations: the hold-outs are judged with them.
+    Runs made before this version held out one training set's edge in every block, and
+    recorded `target`; they don't record strict, so a query on strict leaves them out.
+    """
     k: int = 4
     d: int = 1
     edges: int = 4
     index: int = None
-    target: int = None
     exclusive: bool = True
     connected: str = None
-    holdout: bool = True
-    keep_connected: bool = False         # here: which hold-outs the sweep includes
+    strict: bool = False
+    all_edges: bool = False
+    all_nodes: bool = False
+    min_answers: int = 2
     backtrack: bool = False
     length: int = 1
     mean_length: float = None
 
     def __post_init__(self):
-        if not self.holdout:
-            raise ValueError("ExhaustiveRelationTask always holds out its edge: holdout=True")
-        if self.symmetric:
-            raise ValueError("ExhaustiveRelationTask doesn't hold out reverses (symmetric=False)")
-        if self.holdout_unit != "edge":
-            raise ValueError("ExhaustiveRelationTask holds out one transition: holdout_unit='edge'")
-        if self.index is None and self.target is not None:
-            raise ValueError("target needs index")
+        self.holdout, self.symmetric, self.holdout_unit = True, False, "edge"
+        if self.grammar is not None:
+            raise ValueError("ExhaustiveRelationTask makes its own graphs: leave grammar=None")
+        if self.d > 1 and self.show is not None and 'action' not in self.show:
+            raise ValueError("with several relations, show must include 'action': the "
+                             "hold-outs are judged with the actions visible")
+        self._samples = []
         super().__post_init__()
 
-    def _training_set(self, index):
-        return auto.indexed_relation(self.k, self.d, self.edges, index, holdout=True,
-                                     exclusive=self.exclusive, connected=self.connected,
-                                     keep_connected=self.keep_connected)
-
-    def _graph(self, index, target):
-        """Training set `index` with its answer `target` put back, marked holdout=True."""
-        G = self._training_set(index)
-        (u, a), answers = G.graph['query'], G.graph['answers']
-        if not 0 <= target < len(answers):
-            raise IndexError(f"target {target}: training set {index} has {len(answers)} answers")
-        G.add_edge(u, answers[target], action=a, holdout=True)
-        G.graph.update(holdout=auto.Edge(u, answers[target], a), target=target,
-                       count=G.graph['counts'][target])
-        return G
-
-    def _holdouts(self):
-        """The (index, target) pairs the samples go through, in order."""
-        n_t = lambda i: len(self._training_set(i).graph['answers'])
-        if self.index is not None:
-            if self.target is not None:
-                return [(self.index, self.target)]
-            return [(self.index, t) for t in range(n_t(self.index))]
-        return [(i, t) for i in range(self._training_set(0).graph['n']) for t in range(n_t(i))]
+    def _graph(self, index):
+        return auto.holdout_graph(self.k, self.d, self.edges, index, strict=self.strict,
+                                  all_edges=self.all_edges, all_nodes=self.all_nodes,
+                                  min_answers=self.min_answers, exclusive=self.exclusive,
+                                  connected=self.connected)
 
     @property
-    def n_holdouts(self):
-        """How many distinct hold-outs the samples cycle through."""
-        return len(self._holdouts())
+    def n_graphs(self):
+        """How many graphs these settings allow (what index ranges over)."""
+        return self._graph(0).graph['n']
 
     def make_grammar(self, sample=0):
-        pairs = self._holdouts()
-        G = self._graph(*pairs[sample % len(pairs)])
-        return auto.FSA(G, backtrack=self.backtrack, length=self.length,
+        index = self.index if self.index is not None else sample % self.n_graphs
+        return auto.FSA(self._graph(index), backtrack=self.backtrack, length=self.length,
                         mean_length=self.mean_length)
+
+    def _new_sample(self, rng, s):
+        super()._new_sample(rng, s)
+        self._blocks = []                                    # this sample's hold-outs
+        self._samples.append(self._blocks)
 
     def _new_block(self, rng, b):
         g = self.grammar
-        h = g.graph.graph['holdout']
+        hs, answers = g.graph.graph['holdouts'], g.graph.graph['answers']
+        if b == 0:                                           # this sample's order of answers
+            self._order = [answers[j] for j in rng.permutation(len(answers))]
+        v = self._order[b % len(self._order)]
+        into = [h for h in hs if h.v == v]
+        h = into[rng.integers(len(into))]
+        self._blocks.append(h)
         forbid = {h}
         if self.num_trials[b] is None:                       # every other transition, then h
             trans = self._listing(forbid)
@@ -619,11 +625,13 @@ class ExhaustiveRelationTask(AutomatonTask):
         return h, forbid
 
     def sample(self):
+        self._samples = []
         data = super().sample()
         info = []
-        for g in self._used:
+        for g, blocks in zip(self._used, self._samples):
             a = g.graph.graph
-            h = a['holdout']
-            info.append({'index': a['index'], 'target': a['target'], 'edge': (h.u, h.v, h.action),
-                         'count': a['count'], 'n_sets': a['n'], 'n_targets': len(a['answers'])})
+            info.append({'index': a['index'], 'n_graphs': a['n'], 'count': a['count'],
+                         'answers': a['answers'],
+                         'holdouts': [(h.u, h.v, h.action) for h in a['holdouts']],
+                         'edges': [(h.u, h.v, h.action) for h in blocks]})
         return dict(data, holdout=info)

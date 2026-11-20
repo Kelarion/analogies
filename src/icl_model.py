@@ -76,10 +76,15 @@ class ICLModel(sxp.Model):
                      also keys prompts.POOLS, for prompts that say what the words are.
     delim            the delimiter (task symbol 0); never in the vocabulary
     equiv            score with TokenEquivalence (e.g. ' cat' and 'cat' together)
-    geometry         None to draw each sample's tokens uniformly from the pool; a
-                     geometry.Geometry to give groups of symbols similar tokens (e.g. each
-                     block's, or each node's across blocks). Needs the task's data['code'] and
-                     data['kinds']; what each sample got goes in metrics['geometry']
+    group            None to draw each sample's tokens uniformly from the pool; or which
+                     symbols get similar tokens, as a set: 'block' (each block's own) and/or
+                     kinds (each grammar token across blocks), e.g. {'block'}, {'node'}.
+                     Needs the task's data['code'] and data['kinds'] (see geometry.py)
+    categories       where similar tokens come from, with a group: a set of sources, e.g.
+                     {'hypernyms'}, {'frames', 'hypernyms'}, {'semibmf300'} (see geometry.py)
+    embedding        what similarity is measured in ('input', 'canonical', or an .npz): the
+                     tokens are selected by it, with a group, and every run records each
+                     sample's similarities in it (metrics['similarity'], see geometry.py)
     prepend_bos      start 'raw' prompts with the BOS token
     seed             seed for the symbol-to-word assignment of each sample
     """
@@ -96,7 +101,9 @@ class ICLModel(sxp.Model):
     equiv: bool = False
     prepend_bos: bool = False
     seed: int = None
-    geometry: object = None
+    group: object = None
+    categories: object = frozenset({'hypernyms'})
+    embedding: str = 'input'
 
     @classmethod
     def prerequisites(cls, args):
@@ -104,17 +111,19 @@ class ICLModel(sxp.Model):
         take their defaults) needs before it starts: the stored fits its geometry names, for
         its model. For server_utils.send_to_server, which makes any that are missing first."""
         default = {f.name: f.default for f in fields(cls)}
-        geom = args.get('geometry', default['geometry'])
-        if geom is None:
+        if args.get('group', default['group']) is None:
             return []
         model = args.get('model_name', default['model_name'])
-        return [categories.prerequisite(model, c, geom.embedding)
-                for c in sorted(geom.categories) if categories.is_name(c)]
+        embedding = args.get('embedding', default['embedding'])
+        return [categories.prerequisite(model, c, embedding)
+                for c in sorted(args.get('categories', default['categories'])) if categories.is_name(c)]
 
     def __post_init__(self):
         vocabulary.check_tokens(self.tokens)     # checked, never rewritten: saved as given
-        if self.geometry is not None and not isinstance(self.geometry, geometry.Geometry):
-            raise TypeError(f"geometry is None or a geometry.Geometry, not {self.geometry!r}")
+        geometry.check_embedding(self.embedding)
+        geometry.check_categories(self.categories, self.embedding)
+        self._geometry = (None if self.group is None else       # checks group; not an argument
+                          geometry.Geometry(self.group, self.categories, self.embedding))
         super().__post_init__()
 
     def fit(self, blocks, X, prompt=None, **data):
@@ -135,22 +144,25 @@ class ICLModel(sxp.Model):
                         'top_ids': [], 'top_lp': [], 'top_vocab': {},
                         'data': dict(data, blocks=blocks, X=X, prompt=prompt)}
         assigner = None
-        if self.geometry is not None:
+        space = geometry.get_space(self.embedding, pool, lm, self.model_name)
+        self.metrics['similarity'], self.metrics['similarity_info'] = [], space.info()
+        if self._geometry is not None:
             if 'code' not in data or 'kinds' not in data:
                 raise ValueError("a geometry needs the task's data['code'] and data['kinds'] "
                                  "(which symbols are which grammar tokens, in which blocks)")
-            assigner = geometry.get_assigner(self.geometry, pool, lm, self.model_name)
+            assigner = geometry.get_assigner(self._geometry, pool, lm, self.model_name)
             self.metrics['geometry'] = []
             self.metrics['geometry_codes'] = assigner.cats.meta   # how any stored fits were made
         for i, blks in enumerate(blocks):
             if assigner is None:
                 task_toks = pool.assign(n_tok, rng)
             else:
-                groups = geometry.symbol_groups(data['code'][i], data['kinds'], self.geometry.group)
+                groups = geometry.symbol_groups(data['code'][i], data['kinds'], self.group)
                 seen = np.unique(X[i])                    # leave out symbols the trials never show
                 groups = [g[np.isin(g, seen)] for g in groups]
                 task_toks, info = assigner.assign(n_tok, rng, groups)
                 self.metrics['geometry'].append(info)
+            self.metrics['similarity'].append(space.cosines(task_toks).astype(np.float16))
 
             code = data['code'][i] if 'code' in data else None
             system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks, code)

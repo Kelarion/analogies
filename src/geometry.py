@@ -1,30 +1,25 @@
 """
-Assigning tokens to a task's symbols with a geometry: groups of symbols that get similar tokens.
+Assigning tokens to a task's symbols with a geometry: groups of symbols that get similar tokens,
+and a record of the geometry every sample's tokens actually have.
 
-    geom = Geometry({'block', 'node'}, categories={'hypernyms', 'frames'}, embedding='input', within=2, between=0.5)
-    ICLModel(..., tokens=Vocabulary('words', content=True), geometry=geom)
+ICLModel takes three arguments for this:
 
-With a geometry, ICLModel draws each sample's tokens through an Assigner instead of uniformly
-from the pool. A Geometry is a frozen dataclass, saved and hashed like any argument; its repr
-lists only fields that differ from their defaults, so fields added later leave digests alone.
+    ICLModel(..., group={'block'}, categories={'hypernyms'}, embedding='input')
 
   group       which symbols should be similar, as a set, the way share_toks names what is
               shared; read off the task's data (data['code'] and data['kinds'], see
-              GrammarTask), so nothing here is task-specific:
+              GrammarTask), so nothing here is task-specific. None (the default) draws every
+              sample's tokens uniformly from the pool, as before.
                 a kind        each grammar token of that kind is grouped with its role-mates,
                 ('action',    its symbols in the other blocks: where share_toks={'action'}
                  'node', ..)  makes an action the same token in every block, group={'action'}
                               makes it similar tokens
                 'block'       each block's own symbols are grouped together
               e.g. {'block'}, {'node', 'action'}, {'action'}, {'block', 'node'}. Symbols shared
-              across blocks are left out of these groups. With 'block' and a kind, groups
-              overlap: a node's token must be similar to its block-mates' and to its
-              role-mates', so it must carry both groups' categories (a learned code with many
-              categories per token makes this easy; WordNet, nearly a tree, makes it hard).
-              Symbols in no group are drawn uniformly, but kept out of every group's category.
-  categories  where similar tokens come from: a set of sources, whose categories are pooled
-              and used alike, whatever their source (only the similarity check cares how
-              well they work):
+              across blocks, or that the trials never show, are left out. With 'block' and a
+              kind, groups overlap: a node's token must carry both groups' categories.
+  categories  where similar tokens come from (used only with a group): a set of sources, whose
+              categories are pooled and used alike, whatever their source:
                 'hypernyms'    WordNet hypernyms (and own synsets) of each word's three most
                                frequent noun and verb senses
                 'supersenses'  WordNet's lexicographer files: noun.artifact, verb.motion, ...
@@ -32,42 +27,37 @@ lists only fields that differ from their defaults, so fields added later leave d
                 'wholes'       what a word is part, member or substance of: wheel -> car
                 'frames'       FrameNet frames whose lexical units include the word
                 a stored fit   learned codes for the run's model, by method and dimension
-                               ('semibmf300', 'bipca300'), fitted on this geometry's embedding
-                               (see categories.py): the same Geometry uses each model's own
-                               codes, made before the sweep runs if missing
+                               ('semibmf300', 'bipca300'), fitted on this embedding (see
+                               categories.py): made before the sweep runs if missing
                 a path         an .npz of binary codes, with 'tokens' (strings as the tokenizer
-                               decodes them, e.g. ' king') and 'codes' (one row per token, one
-                               column per category; optionally 'names', one per column)
-              (WordNet sources read a word's three most frequent senses, as lowercase lemmas;
-              FrameNet matches a word or its base form.) Each group gets a category its tokens
-              all carry (with combine=2, two), and no token outside the group carries it, so
-              groups are kept apart by construction. Categories covering more than max_share
-              of the pool (WordNet's 'entity', say) are never used.
-  embedding   the similarity used to check draws and to report them:
+                               decodes them) and 'codes' (one row per token)
+              Each group gets a category its tokens all carry, and no token outside the group
+              carries it, so groups are kept apart by construction. Categories covering more
+              than MAX_SHARE of the pool (WordNet's 'entity', say) are never used.
+  embedding   the similarity tokens are selected by, and the geometry is recorded in:
                 'input'       the model's input embeddings
                 'canonical'   the unembeddings, centred and whitened over the vocabulary (Park
                               et al. 2024's canonical representation)
                 a path        an .npz with 'tokens' and 'vectors'
-              Cosine similarity of vectors centred on the pool's mean, in z units: standard
+              Cosine similarity of vectors centred on the pool's mean; z units are standard
               deviations of random pool pairs' similarity above their mean.
-  within      if given, each group's mean pairwise similarity must be at least this (z)
-  between     if given, the mean similarity of pairs of grouped symbols that share no group
-              must be within +-this (z)
-  beta        how strongly tokens are drawn towards their group-mates (0: uniformly within
-              their categories). After a first draw, each grouped symbol's token is resampled
-              a few times from the tokens its categories allow, with probability proportional
-              to exp(beta * mean similarity to its group-mates, in z); the categories still
-              decide what is allowed, so it never breaks them. Helps when categories alone
-              give weak groups (single learned latents, overlapping groups).
 
-A draw failing a check is redrawn, with the same categories a few times, then with others;
-without checks the categories alone decide. Each sample's groups, categories and achieved
-similarities go into ICLModel's metrics['geometry'].
+How a sample's tokens are drawn (Assigner.assign): a category for each group, then for each
+symbol a token in all its groups' categories and none of the others'; then BETA pulls each
+grouped token towards its group-mates (resampling it among the tokens its categories allow,
+with probability ~ exp(BETA * mean z to its mates)); then two checks, redrawing until they
+pass: every group's mean pairwise similarity at least WITHIN, and pairs of symbols that share
+no group within +-BETWEEN on average (z). BETWEEN enforces separation; BETA encourages tight
+groups, and WITHIN is only a low floor under it. These, MAX_SHARE and COMBINE are fixed here,
+not arguments, so runs differ only in group, categories and embedding.
 
-Which embedding: input embeddings are what the model starts from for each token, but in large
-models they are nearly orthogonal, and carry spelling as much as meaning; the canonical
-representation is more semantic, but tracks shared prefixes. The z units make thresholds
-comparable between them (and between models).
+What is saved, for every run (grouped or not), in ICLModel's metrics:
+  similarity        each sample's V x V cosine similarities among its task tokens, by symbol
+                    (NaN for the delimiter, and any token without a vector), as float16
+  similarity_info   the embedding, and the pool's random-pair mean and sd (z = (cos - mean) / sd)
+  geometry          for grouped runs, each sample's groups, their categories, each group's mean
+                    within-group z and the mean z of pairs sharing no group
+  geometry_codes    how any stored fits used were made
 """
 import os
 from dataclasses import dataclass, fields
@@ -79,6 +69,11 @@ import categories as stored
 
 EMBEDDINGS = ('input', 'canonical')
 SOURCES = ('hypernyms', 'supersenses', 'domains', 'wholes', 'frames')
+WITHIN = 1.0            # every group's mean pairwise similarity must be at least this (z)
+BETWEEN = 0.5           # pairs of symbols sharing no group must average within +-this (z)
+BETA = 2.0              # pull of each grouped token towards its group-mates (see Assigner)
+MAX_SHARE = 0.05        # categories covering more of the pool than this are never used
+COMBINE = 1             # categories a group's tokens share (2: pairs of a code's categories)
 N_SENSES = 3            # WordNet senses whose hypernyms a token carries
 TRIES = 400             # categories tried per group
 REDRAWS = 20            # draws tried per category
@@ -86,17 +81,35 @@ SWEEPS = 3              # resampling sweeps when beta > 0
 RESTARTS = 50           # whole samples tried before giving up
 
 
+def check_embedding(embedding):
+    """Raise unless `embedding` is one of EMBEDDINGS or a path to an .npz."""
+    if not isinstance(embedding, str) or not (embedding in EMBEDDINGS or embedding.endswith('.npz')):
+        raise ValueError(f"embedding={embedding!r}: one of {EMBEDDINGS}, or a path to an .npz of tokens and vectors")
+
+
+def check_categories(categories, embedding):
+    """Raise unless `categories` is a non-empty set of sources (see the module docstring)."""
+    if isinstance(categories, str):
+        raise TypeError(f"categories is a set of sources: write categories={{{categories!r}}}")
+    if not isinstance(categories, (set, frozenset)) or not categories:
+        raise TypeError(f"categories is a non-empty set of sources from {SOURCES} or .npz paths, not {categories!r}")
+    for c in categories:
+        if not isinstance(c, str):
+            raise TypeError(f"categories: {c!r} isn't a source name or path")
+        if c not in SOURCES and not c.endswith('.npz') and not stored.is_name(c):
+            raise ValueError(f"categories: {c!r} is neither one of {SOURCES}, a stored fit (<method><dim>, "
+                             f"method one of {sorted(stored.METHODS)}, e.g. 'semibmf300'), nor a path to an .npz")
+    if any(stored.is_name(c) for c in categories) and embedding not in stored.EMBEDDINGS:
+        raise ValueError(f"stored fits are made on one of {stored.EMBEDDINGS}, not on {embedding!r}")
+
+
 @dataclass(frozen=True, repr=False)
 class Geometry:
-    """How a sample's tokens are assigned: see the module docstring."""
+    """ICLModel's group, categories and embedding together (see the module docstring); built
+    by ICLModel, not an argument itself."""
     group: frozenset = frozenset({'block'})
     categories: frozenset = frozenset({'hypernyms'})
     embedding: str = 'input'
-    within: float = None
-    between: float = None
-    combine: int = 1
-    max_share: float = 0.05
-    beta: float = 0.0
 
     def __post_init__(self):
         put = lambda k, v: object.__setattr__(self, k, v)
@@ -105,37 +118,10 @@ class Geometry:
         if not isinstance(self.group, (set, frozenset)) or not all(isinstance(k, str) for k in self.group):
             raise TypeError(f"group is a set of 'block' and kinds, e.g. {{'block'}} or {{'action'}}, not {self.group!r}")
         if not self.group:
-            raise ValueError("group=set() groups nothing: for uniform draws, leave ICLModel's geometry None")
-        put('group', frozenset(self.group))
-        if isinstance(self.categories, str):
-            raise TypeError(f"categories is a set of sources: write categories={{{self.categories!r}}}")
-        if not isinstance(self.categories, (set, frozenset)) or not self.categories:
-            raise TypeError(f"categories is a non-empty set of sources from {SOURCES} or .npz paths, not {self.categories!r}")
-        for c in self.categories:
-            if not isinstance(c, str):
-                raise TypeError(f"categories: {c!r} isn't a source name or path")
-            if c not in SOURCES and not c.endswith('.npz') and not stored.is_name(c):
-                raise ValueError(f"categories: {c!r} is neither one of {SOURCES}, a stored fit "
-                                 f"(<method><dim>, method one of {sorted(stored.METHODS)}, e.g. "
-                                 f"'semibmf300'), nor a path to an .npz")
-        if any(stored.is_name(c) for c in self.categories) and self.embedding not in stored.EMBEDDINGS:
-            raise ValueError(f"stored fits are made on one of {stored.EMBEDDINGS}, not on {self.embedding!r}")
-        put('categories', frozenset(self.categories))
-        if not isinstance(self.embedding, str) or not (self.embedding in EMBEDDINGS or self.embedding.endswith('.npz')):
-            raise ValueError(f"embedding={self.embedding!r}: one of {EMBEDDINGS}, or a path to an .npz of tokens and vectors")
-        for k in ('within', 'between'):
-            if getattr(self, k) is not None:
-                put(k, float(getattr(self, k)))
-        if self.between is not None and self.between < 0:
-            raise ValueError("between is a bound on |similarity|, so not negative")
-        if self.combine not in (1, 2):
-            raise ValueError("combine is 1 or 2 (categories a group's tokens share)")
-        put('beta', float(self.beta))
-        if self.beta < 0:
-            raise ValueError("beta >= 0 (0: uniform within categories)")
-        put('max_share', float(self.max_share))
-        if not 0 < self.max_share <= 1:
-            raise ValueError("max_share is a share of the pool, in (0, 1]")
+            raise ValueError("group=set() groups nothing: for uniform draws, leave group=None")
+        check_embedding(self.embedding)
+        check_categories(self.categories, self.embedding)
+        put('group', frozenset(self.group)); put('categories', frozenset(self.categories))
 
     def __repr__(self):
         """Only fields that differ from their defaults; the group set sorted, since a set's own
@@ -253,8 +239,8 @@ class Categories:
                 have = np.array([row.get(s, -1) for s in strs])
                 members += [np.where((have >= 0) & codes[np.maximum(have, 0), k])[0] for k in range(codes.shape[1])]
         members = [m[usable[m]] for m in members]
-        keep = [k for k, m in enumerate(members) if 2 <= len(m) <= geom.max_share * n]
-        self._dropped = (sum(len(m) > geom.max_share * n for m in members), sum(len(m) < 2 for m in members), len(members))
+        keep = [k for k, m in enumerate(members) if 2 <= len(m) <= MAX_SHARE * n]
+        self._dropped = (sum(len(m) > MAX_SHARE * n for m in members), sum(len(m) < 2 for m in members), len(members))
         self.base_names = [names[k] for k in keep]; base = [members[k] for k in keep]
         self.token_cols = [[] for _ in range(n)]
         for c, m in enumerate(base):
@@ -262,7 +248,7 @@ class Categories:
                 self.token_cols[i].append(c)
         self.token_cols = [frozenset(c) for c in self.token_cols]
         self.base = base
-        if geom.combine == 1:
+        if COMBINE == 1:
             self.defs = [(c,) for c in range(len(base))]; self.members = base
         else:
             self.defs, self.members = [], []
@@ -275,10 +261,10 @@ class Categories:
         if not len(self.members):
             big, small, total = self._dropped
             raise ValueError(f"no usable categories in {sorted(geom.categories)} for this pool: of {total}, {big} "
-                             f"cover more than max_share={geom.max_share} of its {n} tokens and {small} fewer "
-                             f"than 2 (raise max_share for broad categories)")
+                             f"cover more than MAX_SHARE={MAX_SHARE} of its {n} tokens and {small} fewer "
+                             f"than 2 (MAX_SHARE, a constant in geometry.py)")
         self.n = n; self._mask, self._carrier, self._of = {}, {}, {}
-        self._pair = {d: c for c, d in enumerate(self.defs)} if geom.combine == 2 else None
+        self._pair = {d: c for c, d in enumerate(self.defs)} if COMBINE == 2 else None
 
     def mask(self, c):
         """Which pool tokens are in category c."""
@@ -346,22 +332,21 @@ def model_vectors(hf, ids, embedding, vocab_size):
     raise ValueError(f"embedding {embedding!r}: one of {EMBEDDINGS}")
 
 
-def _vectors(geom, pool, lm, model=None):
+def _vectors(embedding, pool, lm, model=None):
     """(vectors for the pool's tokens, mask of those that have one): from a file; else, for
     'input' or 'canonical', from the model's cached embeddings of the fit vocabulary if there
     are any (the vectors its stored codes were fitted on; tokens outside it go unused); else
     from its weights."""
     n = pool.size
-    if geom.embedding in stored.EMBEDDINGS and model is not None and \
-            stored.embeddings_status(model, geom.embedding) == 'ok':
-        toks, V = stored.embeddings(model, geom.embedding)
+    if embedding in stored.EMBEDDINGS and model is not None and stored.embeddings_status(model, embedding) == 'ok':
+        toks, V = stored.embeddings(model, embedding)
         row = {str(t): i for i, t in enumerate(toks)}
         have = np.array([row.get(pool.strs[i], -1) for i in pool.ids])
         X = np.zeros((n, V.shape[1]), np.float32)
         X[have >= 0] = V[have[have >= 0]]
         return X, have >= 0
-    if geom.embedding.endswith('.npz'):
-        f = np.load(geom.embedding, allow_pickle=True)
+    if embedding.endswith('.npz'):
+        f = np.load(embedding, allow_pickle=True)
         row = {str(t): i for i, t in enumerate(f['tokens'])}
         have = np.array([row.get(pool.strs[i], -1) for i in pool.ids])
         X = np.zeros((n, f['vectors'].shape[1]), np.float32)
@@ -369,8 +354,54 @@ def _vectors(geom, pool, lm, model=None):
         return X, have >= 0
     hf = getattr(lm, 'hf_model', None)
     if hf is None:
-        raise ValueError(f"embedding={geom.embedding!r} needs the model's weights (lm.hf_model)")
-    return model_vectors(hf, pool.ids, geom.embedding, len(pool.tokenizer)), np.ones(n, bool)
+        raise ValueError(f"embedding={embedding!r} needs the model's weights (lm.hf_model)")
+    return model_vectors(hf, pool.ids, embedding, len(pool.tokenizer)), np.ones(n, bool)
+
+
+class Space:
+    """A pool's tokens in an embedding: unit vectors centred on the pool's mean, which tokens
+    have one, and the mean and sd of random pool pairs' cosine (the z units)."""
+
+    def __init__(self, embedding, pool, lm=None, model=None, seed=0):
+        self.embedding, self.pool = embedding, pool
+        X, self.usable = _vectors(embedding, pool, lm, model)
+        X = X - X[self.usable].mean(0)
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        self.X = np.where(norms > 0, X / np.where(norms > 0, norms, 1), 0).astype(np.float32)
+        rng = np.random.default_rng(seed); u = np.where(self.usable)[0]
+        a, b = rng.choice(u, 20000), rng.choice(u, 20000); ok = a != b
+        q = np.einsum('ij,ij->i', self.X[a[ok]], self.X[b[ok]])
+        self.mean, self.sd = float(q.mean()), float(q.std())
+        self.index = {int(t): i for i, t in enumerate(pool.ids)}
+
+    def z(self, A, B):
+        """z-unit similarities between pool indices A and B."""
+        return (self.X[A] @ self.X[B].T - self.mean) / self.sd
+
+    def cosines(self, task_toks):
+        """A sample's V x V cosines among its task tokens (ids), by symbol; NaN for tokens
+        outside the pool (the delimiter) or without a vector."""
+        idx = np.array([self.index.get(int(t), -1) for t in task_toks])
+        ok = idx >= 0
+        ok[ok] = self.usable[idx[ok]]
+        C = np.full((len(idx), len(idx)), np.nan, np.float32)
+        C[np.ix_(ok, ok)] = self.X[idx[ok]] @ self.X[idx[ok]].T
+        return C
+
+    def info(self):
+        return {'embedding': self.embedding, 'mean': self.mean, 'sd': self.sd,
+                'units': 'cosine of pool-centred vectors; z = (cosine - mean) / sd'}
+
+
+_SPACES = {}
+
+
+def get_space(embedding, pool, lm=None, model=None):
+    """The Space for an embedding, pool and model, built the first time it is asked for."""
+    key = (embedding, id(pool), model)
+    if key not in _SPACES:
+        _SPACES[key] = Space(embedding, pool, lm, model)
+    return _SPACES[key]
 
 
 # -- assignment -------------------------------------------------------------------------------
@@ -378,21 +409,11 @@ def _vectors(geom, pool, lm, model=None):
 class Assigner:
     """Draws one sample's task tokens for a pool and a geometry (see the module docstring)."""
 
-    def __init__(self, geom, pool, lm=None, model=None, seed=0):
+    def __init__(self, geom, pool, lm=None, model=None):
         self.geom, self.pool = geom, pool
-        X, self.usable = _vectors(geom, pool, lm, model)
-        X = X - X[self.usable].mean(0)
-        norms = np.linalg.norm(X, axis=1, keepdims=True)
-        self.X = np.where(norms > 0, X / np.where(norms > 0, norms, 1), 0).astype(np.float32)
-        rng = np.random.default_rng(seed); u = np.where(self.usable)[0]
-        a, b = rng.choice(u, 20000), rng.choice(u, 20000); ok = a != b
-        q = np.einsum('ij,ij->i', self.X[a[ok]], self.X[b[ok]])
-        self.mu, self.sd = float(q.mean()), float(q.std())
+        self.space = get_space(geom.embedding, pool, lm, model)
+        self.usable, self.z = self.space.usable, self.space.z
         self.cats = Categories(geom, [pool.strs[i] for i in pool.ids], self.usable, model)
-
-    def z(self, A, B):
-        """z-unit similarities between pool indices A and B."""
-        return (self.X[A] @ self.X[B].T - self.mu) / self.sd
 
     def assign(self, n, rng, groups):
         """(task_toks, info): ids for symbols 0..n-1 (0 the delimiter), and what was drawn.
@@ -412,21 +433,20 @@ class Assigner:
                 if drawn is None:
                     break                            # nothing fits these categories
                 idx, cands = drawn
-                if self.geom.beta > 0:
+                if BETA > 0:
                     idx = self._resample(groups, of, cands, idx, rng)
                 info = self._info(groups, of, cat, idx)
-                g_ = self.geom
-                if g_.within is not None and min(info['within_z'], default=np.inf) < g_.within:
+                if min(info['within_z'], default=np.inf) < WITHIN:
                     continue
-                if g_.between is not None and info['between_z'] is not None and abs(info['between_z']) > g_.between:
+                if info['between_z'] is not None and abs(info['between_z']) > BETWEEN:
                     continue
                 toks = np.empty(n, int); toks[0] = self.pool.delim_id
                 for s, t in idx.items():
                     toks[s] = self.pool.ids[t]
                 return toks, info
         raise RuntimeError(f"couldn't draw {len(groups)} groups (sizes {[len(g) for g in groups]}) under "
-                           f"{self.geom!r} in {RESTARTS} tries: loosen within/between, raise max_share, "
-                           f"use a bigger pool, or (for overlapping groups) categories with more per token")
+                           f"{self.geom!r} in {RESTARTS} tries: use more categories, a bigger pool, or (for "
+                           f"overlapping groups) categories with more per token")
 
     def _categories(self, groups, of, rng):
         """A category for each group (largest groups first), with every symbol's categories
@@ -504,7 +524,7 @@ class Assigner:
                 s = int(s); held = np.zeros(len(self.usable), bool)
                 held[[t for k, t in idx.items() if k != s]] = True
                 cand = np.where(cands[s] & ~held)[0]
-                score = self.geom.beta * self.z(cand, np.array([idx[m] for m in mates[s]])).mean(1)
+                score = BETA * self.z(cand, np.array([idx[m] for m in mates[s]])).mean(1)
                 p = np.exp(score - score.max()); idx[s] = int(cand[rng.choice(len(cand), p=p / p.sum())])
         return idx
 

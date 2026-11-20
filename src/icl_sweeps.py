@@ -864,6 +864,10 @@ def _exhaustive_samples(record):
     for i in range(len(m['logp_ctx'])):
         G, label = _sample_graph(data, i)
         h = data['holdout'][i] if 'holdout' in data else {}
+        if 'edges' in h:
+            raise ValueError("this run holds out a different edge in each block (the newer "
+                             "ExhaustiveRelationTask); these plots assume one per sample: use "
+                             "trace, whose target column follows each block")
         code = block_code(data, i)
         gram = {int(x): r for r, x in enumerate(code[0])}
         u, a, v = (label[gram[int(x)]] for x in data['blocks'][i][0][-1][:-1][-3:])

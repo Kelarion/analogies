@@ -1,11 +1,11 @@
 """
 Learned token categories: binary latent codes fitted by sbmf (github.com/Kelarion/concepts)
-to a model's token embeddings, stored per model, for geometry.Geometry.
+to a model's token embeddings, stored per model, for geometry (ICLModel's group and categories).
 
 A stored fit is named by method and dimension, e.g. 'semibmf300' or 'bipca300', and fitted on
 the embedding the geometry measures similarity with ('input' or 'canonical', see geometry):
 
-    Geometry({'block'}, categories={'semibmf300'}, embedding='canonical')
+    ICLModel(..., group={'block'}, categories={'semibmf300'}, embedding='canonical')
         reads $ICL_CATEGORIES/<model>/semibmf300-canonical.npz for the run's model
 
 ICL_CATEGORIES defaults to $SCRATCH/icl_categories, and <model> is the model's name with '/'
