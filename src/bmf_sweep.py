@@ -17,6 +17,7 @@ bi-cross-validation (bae_util.gabriel_bicv): the mean log-likelihood per held-ou
 a k_row x k_col grid of row and column blocks, each held out once, under common random
 numbers. metrics['test_ll'] is the score (higher is better); metrics['train_ll'] the fit's.
 
+For sbmf's methods (semibmf, bipca; k-means has no hyperparameters to tune here).
 Hyperparameters left as None take categories.METHODS' value, so a sweep starts from the
 current table and varies what it lists. The annealing settings used are those a stored fit
 would use (fit()'s own defaults filled in), so the winner can be copied straight into
@@ -94,7 +95,7 @@ class BMFFit(sxp.Model):
         t = time.time()
         _, X = categories.embeddings(self.model_name, self.embedding)
         idx = np.sort(np.random.default_rng(seed).choice(len(X), min(rows, len(X)), replace=False))
-        X = categories.preprocess(X[idx])
+        X = categories.preprocess(X[idx], self.method)
         model_kw, fit_kw = self.settings()
         settings = categories.fit_settings(self.method, **fit_kw)     # a schedule name -> object
         model = categories.build(self.method, self.dim, **model_kw)
@@ -115,4 +116,3 @@ def rank(results, by=('model_name', 'method', 'dim')):
         print(', '.join(f'{k}={v}' for k, v in zip(by, key)))
         for te, tr, args, m in sorted(groups[key], key=lambda r: -r[0]):
             print(f'    test {te:+.4f}  train {tr:+.4f}   model {m["model"]}   fit {m["fit"]}')
-            

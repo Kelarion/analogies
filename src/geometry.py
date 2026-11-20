@@ -27,7 +27,7 @@ ICLModel takes three arguments for this:
                 'wholes'       what a word is part, member or substance of: wheel -> car
                 'frames'       FrameNet frames whose lexical units include the word
                 a stored fit   learned codes for the run's model, by method and dimension
-                               ('semibmf300', 'bipca300'), fitted on this embedding (see
+                               ('kmeans100', 'semibmf300', 'bipca300'), fitted on this embedding (see
                                categories.py): made before the sweep runs if missing
                 a path         an .npz of binary codes, with 'tokens' (strings as the tokenizer
                                decodes them) and 'codes' (one row per token)

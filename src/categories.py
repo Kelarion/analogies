@@ -2,7 +2,8 @@
 Learned token categories: binary latent codes fitted by sbmf (github.com/Kelarion/concepts)
 to a model's token embeddings, stored per model, for geometry (ICLModel's group and categories).
 
-A stored fit is named by method and dimension, e.g. 'semibmf300' or 'bipca300', and fitted on
+A stored fit is named by method and dimension, e.g. 'semibmf300', 'bipca300' or 'kmeans100'
+(k-means with 100 clusters, one per token), and fitted on
 the embedding the geometry measures similarity with ('input' or 'canonical', see geometry):
 
     ICLModel(..., group={'block'}, categories={'semibmf300'}, embedding='canonical')
@@ -10,10 +11,13 @@ the embedding the geometry measures similarity with ('input' or 'canonical', see
 
 ICL_CATEGORIES defaults to $SCRATCH/icl_categories, and <model> is the model's name with '/'
 as '--' (as in the Hugging Face cache). Everything else about a fit is shared by every model
-and kept here: METHODS holds each method's hyperparameters, in sbmf's own names (constructor
-fields under 'model', fit() keywords under 'fit'); FIT_TOKENS is the vocabulary every fit is
-made on (later pools are matched to it by token string); embeddings are rescaled by one
-scalar to unit standard deviation (sbmf's intercept absorbs their mean). The entries are
+and kept here: METHODS holds each method's settings (for sbmf's models, in its own names:
+constructor fields under 'model', fit() keywords under 'fit'; for k-means, sklearn's KMeans
+arguments under 'model') and how its embeddings are prepared ('preprocess': 'scale' rescales
+by one scalar to unit standard deviation, sbmf's intercept absorbing their mean; 'unit'
+centres them and scales each row to unit length, the cosine geometry geometry.py measures,
+so k-means clusters are regions of that space). FIT_TOKENS is the vocabulary every fit is
+made on (later pools are matched to it by token string). The entries are
 meant to be chosen once by a sweep (bmf_sweep.py) and then left alone: each file records the
 entry it was fitted with, and load() refuses one that no longer matches (regenerating keeps
 the old file as <name>-<embedding>.stale-<date>.npz).
@@ -46,12 +50,12 @@ import vocabulary as voc
 # tests' learning rates) until bmf_sweep picks better ones. Changing an entry makes codes
 # fitted with the old one stale: load() refuses them until they are regenerated.
 METHODS = {
-    'semibmf': {'class': 'SemiBMF', 'model': {}, 'fit': {'lr': 0.1, 'max_iter': 600}},
-    'bipca': {'class': 'BiPCA', 'model': {}, 'fit': {'lr': 0.25, 'max_iter': 600}},
+    'semibmf': {'class': 'SemiBMF', 'model': {}, 'fit': {'lr': 0.1, 'max_iter': 600}, 'preprocess': 'scale'},
+    'bipca': {'class': 'BiPCA', 'model': {}, 'fit': {'lr': 0.25, 'max_iter': 600}, 'preprocess': 'scale'},
+    'kmeans': {'class': 'KMeans', 'model': {'n_init': 3}, 'fit': {}, 'preprocess': 'unit'},
 }
 FIT_TOKENS = voc.Vocabulary('words')   # what every fit is made on
 EMBEDDINGS = ('input', 'canonical')
-PREPROCESS = 'one scalar: X / X.std()'
 SEED = 0
 NAME = re.compile(r'^([a-z]+)([0-9]+)$')
 
@@ -107,7 +111,7 @@ def recipe(name):
     records, and what it must still match to be used."""
     method, dim = parse_name(name)
     return {'method': method, 'dim': dim, **json.loads(json.dumps(METHODS[method])),
-            'fit_tokens': repr(FIT_TOKENS), 'preprocess': PREPROCESS, 'seed': SEED}
+            'fit_tokens': repr(FIT_TOKENS), 'seed': SEED}
 
 
 def _write(p, **arrays):
@@ -197,10 +201,19 @@ def embeddings(model, embedding, tokenizer=None):
     return np.asarray(tokens), X.astype(np.float32)
 
 
-def preprocess(X):
-    """The rescaling every fit uses (PREPROCESS)."""
+def preprocess(X, method):
+    """Embeddings prepared as METHODS[method]['preprocess'] says: 'scale' divides by one scalar
+    (the standard deviation of all entries); 'unit' centres them and scales each row to unit
+    length."""
     X = np.asarray(X, np.float64)
-    return X / X.std()
+    how = METHODS[method]['preprocess']
+    if how == 'scale':
+        return X / X.std()
+    if how == 'unit':
+        X = X - X.mean(0)
+        n = np.linalg.norm(X, axis=1, keepdims=True)
+        return X / np.where(n > 0, n, 1)
+    raise ValueError(f"preprocess {how!r} for {method}: 'scale' or 'unit'")
 
 
 # -- fitting ----------------------------------------------------------------------------------
@@ -209,6 +222,8 @@ def build(method, dim, **model_overrides):
     """An sbmf model for a method, with METHODS' constructor fields (and any overrides)."""
     from sbmf import bae_models
     spec = METHODS[method]
+    if spec['class'] == 'KMeans':
+        raise ValueError("k-means isn't an sbmf model; fit_codes fits it directly")
     return getattr(bae_models, spec['class'])(dim, **{**spec['model'], **model_overrides})
 
 
@@ -235,8 +250,12 @@ def seed_all(seed):
 def fit_codes(X, method, dim, seed=SEED):
     """Binary codes (n x dim) for the rows of X, by METHODS[method]."""
     seed_all(seed)
+    if METHODS[method]['class'] == 'KMeans':
+        from sklearn.cluster import KMeans
+        lab = KMeans(dim, random_state=seed, **METHODS[method]['model']).fit(preprocess(X, method)).labels_
+        return np.eye(dim, dtype=bool)[lab]
     model = build(method, dim)
-    model.fit(preprocess(X), verbose=False, **fit_settings(method))
+    model.fit(preprocess(X, method), verbose=False, **fit_settings(method))
     if getattr(model, 'n_chains', 1) > 1:
         model.collapse()
     return np.asarray(model.S) > 0.5

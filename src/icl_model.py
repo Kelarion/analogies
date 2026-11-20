@@ -81,7 +81,8 @@ class ICLModel(sxp.Model):
                      kinds (each grammar token across blocks), e.g. {'block'}, {'node'}.
                      Needs the task's data['code'] and data['kinds'] (see geometry.py)
     categories       where similar tokens come from, with a group: a set of sources, e.g.
-                     {'hypernyms'}, {'frames', 'hypernyms'}, {'semibmf300'} (see geometry.py)
+                     {'hypernyms'}, {'frames', 'hypernyms'}, {'kmeans100'}, {'semibmf300'}
+                     (see geometry.py)
     embedding        what similarity is measured in ('input', 'canonical', or an .npz): the
                      tokens are selected by it, with a group, and every run records each
                      sample's similarities in it (metrics['similarity'], see geometry.py)
