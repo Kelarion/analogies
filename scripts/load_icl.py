@@ -14,6 +14,7 @@ import icl_utils
 import plotting as tpl
 import automata as auto
 import networkx as nx
+import geometry as geo
 
 SAVE_DIR = su.SAVE_DIR          # $SCRATCH/icl_results, or $ICL_RESULTS if set
 
@@ -27,7 +28,8 @@ task_args = {'task': icl_tasks.ExhaustiveRelationTask,
              'k': 4,
              'd': 1,
              'edges': 4,
-             'index': [1,2,4],
+             'index': 1,
+        #      'index': [1,2,4],
         #      'd': 2,
         #      'degree': 0.9,
               'connected': None,
@@ -49,12 +51,12 @@ isw.varying(prm);         # what differs between the runs, and over what values
 # %% Which runs: fix everything except the grid (and line) dimensions
 
 these = {}
-# these |= {'model_name': 'Qwen/Qwen3.5-35B-A3B-Base'}
+these |= {'model_name': 'Qwen/Qwen3.5-35B-A3B-Base'}
 # these |= {'model_name': ['google/gemma-4-31B-it','Qwen/Qwen3.8-27B']}
 these |= {'mode': 'raw'} 
-# these |= {'mode': 'dialogue'}
+# these |= {'mode': 'dialogue'} 
 # these |= {'commutes': 0}
-these |= {'describe_task': False}
+these |= {'describe_task': True}
 # these |= {'explicitness': 0}
 # these |= {'describe_task': [True, False]}      # describe_format and answer_only go with it
 these |= {'hint': 0}
@@ -67,31 +69,36 @@ these |= {'share_toks': False}
 # these |= {'num_trials': [[72,72]]}       # a list: any of these
 # these |= {'k': lambda k: k >= 8} 
 # these |= {'delim': ','}
-these |= {'index': 1}
+# these |= {'index': 1}
 these |= {'d':1}
 these |= {'think': False}
+these |= {'tokens': icl_utils.Vocabulary('words', content=True)}
+these |= {'show': [None, {'node'}]}
 
 # rows = 'k'
 # rows = 'explicitness'
 # rows = 'share_toks'
 # rows = 'tokens'
 # rows = 'describe_task'
-rows = 'target'
+rows = 'geometry'
 # rows = 'hint'
 # rows = 'index'
 # rows = None
+# rows = 'show'
 
 # cols = 'explicitness'
 # cols = 'hint'
 # cols = 'commutes'
 # cols = 'share_toks'
 # cols = 'num_trials'
-cols = 'tokens'
+# cols = 'tokens'
 # cols = 'index'
 # cols = None
 # cols = 'describe_task'
+cols = 'target'
 
-lines = 'model_name'
+lines = 'show'
+# lines = 'model_name'
 # lines = 'd'
 # lines = 'num_trials'
 # lines = 'commutes'
@@ -116,7 +123,7 @@ refs = {
         }
 
 isw.plot_heldout(records, prm, hue=lines, rows=rows, cols=cols, 
-                 where=these, refs=refs, kl=kl, keep='fixed samples',
+                 where=these, refs=refs, kl=kl,
                  err='iqr', traces=0.1, renorm=False)
 plt.ylim([-5,0.1])
 plt.show()
@@ -145,8 +152,10 @@ deez = {
         # 'index': 2,
         # 'describe_task': False,
         # 'num_trials': [1*[None]]
-        'tokens': icl_utils.Vocabulary('nouns'),
-        'target': 2,
+        # 'tokens': icl_utils.Vocabulary('nouns'),
+        'target': 0,
+        'geometry': geo.Geometry({'action','node'}, within=2, between=0.5, beta=2),
+        'show': [{'node'}],
         }
 
 refs = {
@@ -164,7 +173,7 @@ foo = isw.trace(records[idx[0]])
 #                  where=these | deez, refs=refs, kl=kl,
 #                  err='iqr', traces=0.7, renorm=False)
 
-isw.plot_node_probs(records, prm, prob=True,
+isw.plot_node_probs(records, prm, prob=False,
                  where=these | deez, over='vocab',
                  err='iqr', traces=0.1)
 

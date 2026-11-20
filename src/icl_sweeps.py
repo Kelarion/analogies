@@ -3,6 +3,8 @@ Choosing runs from a batch by their parameters, and plotting them on a grid.
 
     records, prm = su.load_experiments(task_args, mod_args, SAVE_DIR=SAVE_DIR)
     varying(prm)                                          # what differs between the runs
+    runs(records).value_counts(['k', 'hint'])             # which combinations exist
+    table(records, rows='test')                           # every run's scores, one DataFrame
     plot_runs(records, prm, rows='k', cols='hint', where={'explicitness': 3})
     plot_heldout(records, prm, hue='num_trials', rows='k', cols='hint',
                  where={'explicitness': 3})
@@ -23,6 +25,8 @@ copy_or_sink, and KERNEL_REFS for the ones discussed):
 As when sending runs, a list means alternatives and anything else is a value.
 Every grid cell (and every line within it) must then come down to a single run; if it
 doesn't, the error names the parameters still varying, which is the cue to fix them in `where`.
+Naming an argument, in `where` or as a grid dimension, also leaves out the runs saved
+without it (from before it existed), as load_experiments does: prm shows such runs as None.
 """
 import json
 import warnings
@@ -88,8 +92,15 @@ def _column(prm, name):
     return [_hashable(v) for v in prm[name]]       # a 2-d array (e.g. num_trials) by rows
 
 
-def select(prm, where=None):
-    """Indices of the runs (into records) matching `where` (see the module docstring)."""
+def _has(record, name):
+    """Whether a run was saved with argument `name` (task or model)."""
+    return name in record['task_args'] or name in record['model_args']
+
+
+def select(prm, where=None, records=None):
+    """Indices of the runs (into records) matching `where` (see the module docstring).
+    Given records, only runs saved with every argument `where` names: prm shows an
+    argument a run predates as None, which would otherwise match where={name: None}."""
     n = len(next(iter(prm.values())))
     keep = np.ones(n, bool)
     for name, cond in (where or {}).items():
@@ -104,6 +115,8 @@ def select(prm, where=None):
                 raise ValueError(f"where={{{name!r}: {cond!r}}}: a set is a value, and no {name} is a "
                                  f"set; for runs with any of these values, use a list: {sorted(cond, key=_key)}")
             keep &= np.array([v == _hashable(cond) for v in col])
+    if records is not None and where:
+        keep &= np.array([all(_has(rec, name) for name in where) for rec in records])
     return np.where(keep)[0]
 
 
@@ -181,8 +194,20 @@ def _grid(prm, where, dims, records=None):
     not used): returns ({(value per dim): run}, [values of each dim]). Raises if two runs
     land in the same place, naming what still varies between them (and, given records,
     what differs in how they were saved, when nothing differs in prm).
+
+    Given records, an argument named in `where` or `dims` leaves out the runs saved
+    without it (from before it existed), as load_experiments does for the arguments it's
+    given; a note says how many.
     """
     runs = select(prm, where)
+    if records is not None:
+        names = list(where or {}) + [d for d in dims if d is not None]
+        kept = [r for r in runs if all(_has(records[r], n) for n in names)]
+        if len(kept) < len(runs):
+            gone = sorted({n for r in runs for n in names if not _has(records[r], n)})
+            print(f"left out {len(runs) - len(kept)} of {len(runs)} runs saved without "
+                  f"{', '.join(gone)} (from before {'it' if len(gone) == 1 else 'they'} existed)")
+        runs = np.array(kept, int)
     if len(runs) == 0:
         raise ValueError(f"no runs match {where}")
     cols = {d: _column(prm, d) for d in dims if d is not None}
@@ -204,6 +229,12 @@ def _grid(prm, where, dims, records=None):
                    '; '.join(f"{side} {n}: " + ' vs '.join(f'{v!r} ({t})' for v, t in vals)
                              for (side, n), vals in saved.items())
                    if saved else "identical in prm (duplicate runs?)")
+            absent = sorted({n for (_, n), vals in saved.items()
+                             if any(isinstance(v, str) and v == '<absent>' for v, _ in vals)})
+            if absent:
+                why += (f"; to keep only the runs saved with {', '.join(absent)}, name "
+                        f"{'it' if len(absent) == 1 else 'them'} in `where` (e.g. "
+                        f"{absent[0]}=None)")
             why += f"; see compare_runs(records, {[int(r) for r in rs]})"
         raise ValueError(f"{len(rs)} runs at {where_ or 'the one cell'} (and "
                          f"{len(clash) - 1} other places), {why}")
@@ -506,6 +537,95 @@ def trace(record, refs=(), keep=None):
     tr.attrs['alphabet'] = list(alphabets[0]) if len(set(alphabets)) == 1 else {
         i: list(al) for i, al in enumerate(alphabets)}      # per sample, if they differ
     return tr
+
+
+# -- tables across runs -----------------------------------------------------------------
+
+ABSENT = '<absent>'     # in runs() and table(): an argument the run was saved without
+
+
+def runs(records, varying=False):
+    """
+    One row per run (indexed by its position in records), its saved arguments as columns:
+    for checking which combinations exist, or choosing runs, with pandas.
+
+        r = runs(records)
+        r.value_counts(['k', 'd'], dropna=False)       # how many runs of each combination
+        r.groupby(['k', 'd'], dropna=False).size().unstack()     # ... as a grid
+        r[(r.k == 5) & (r.hint == 0)].index            # run indices, e.g. for table()
+
+    None is kept as None, so group with dropna=False (pandas leaves None out otherwise).
+
+    Values are as select compares them (lists as tuples, sets as frozensets), so they
+    group and compare. An argument a run was saved without (from before it existed) is
+    ABSENT ('<absent>'), unlike prm, where it's None like an explicit None. A name in
+    both the task's and the model's arguments (seed) becomes task_seed and model_seed.
+    varying: only the arguments that differ between the runs.
+    """
+    tasks = [r['task_args'] for r in records]
+    mods = [r['model_args'] for r in records]
+    both = set().union(*map(set, tasks)) & set().union(*map(set, mods))
+    names = list(dict.fromkeys(k for a in tasks + mods for k in a))
+    val = lambda args, k: _hashable(args[k]) if k in args else ABSENT
+    rows = []
+    for t, m in zip(tasks, mods):
+        row = {}
+        for k in names:
+            if k in both:
+                row['task_' + k], row['model_' + k] = val(t, k), val(m, k)
+            else:
+                row[k] = val(t if k in t else m, k)
+        rows.append(row)
+    cols = {}
+    for c in dict.fromkeys(c for row in rows for c in row):
+        vals = [row[c] for row in rows]                  # None stays None, not NaN
+        cols[c] = pd.Series(vals, dtype=object if any(v is None for v in vals) else None)
+    out = pd.DataFrame(cols).set_axis(pd.RangeIndex(len(records), name='run'))
+    if varying:
+        out = out[[c for c in out if out[c].map(_key).nunique() > 1]]
+    return out
+
+
+def table(records, which=None, rows='hidden', params=None, refs=(), keep=None):
+    """
+    trace() of many runs as one DataFrame, with a `run` column (the index into records)
+    and the runs' arguments as columns, for slicing and plotting by hand:
+
+        tb = table(records, rows='test')
+        tb.groupby(['k', 'block']).task_mass.mean().unstack()
+        tb[tb.k == 5].groupby('trial').task_mass.mean().plot()
+
+    which:  run indices to include (e.g. from select, or runs(records)[...].index);
+            default all
+    rows:   'hidden' the tokens plot_icl shows (default); 'test' each block's held-out
+            token (final and hidden); 'all' every token
+    params: argument columns to add (from runs()): default those that differ between
+            the runs included; 'all', or a list of names
+    refs, keep: as for trace.
+    The alphabet of each run (trace's attrs['alphabet']) is in attrs['alphabet'][run].
+    """
+    which = list(range(len(records))) if which is None else [int(r) for r in which]
+    if rows not in ('hidden', 'test', 'all'):
+        raise ValueError(f"rows is 'hidden', 'test' or 'all', not {rows!r}")
+    info = runs([records[r] for r in which]).set_axis(pd.Index(which, name='run'))
+    if params is None:
+        params = [c for c in info if info[c].map(_key).nunique() > 1]
+    elif params == 'all':
+        params = list(info)
+    parts, alphabet = [], {}
+    for r in which:
+        tr = trace(records[r], refs=refs, keep=keep)
+        alphabet[r] = tr.attrs.get('alphabet')
+        if rows == 'hidden':
+            tr = tr[tr.hidden]
+        elif rows == 'test':
+            tr = tr[tr.hidden & tr.final]
+        tr.insert(0, 'run', r)
+        parts.append(tr)
+    out = pd.concat(parts, ignore_index=True)
+    out = out.join(info[params], on='run')
+    out.attrs['alphabet'] = alphabet
+    return out
 
 
 # -- which tests are well defined -----------------------------------------------------
