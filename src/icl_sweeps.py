@@ -86,9 +86,23 @@ def _order(vals):
     return sorted(set(vals), key=_key)
 
 
+ABSENT = '<absent>'     # in runs() and table(): an argument the run was saved without
+
+
+def _absent(v):
+    return isinstance(v, str) and v == ABSENT
+
+
+def _n_runs(prm):
+    return len(prm) if isinstance(prm, pd.DataFrame) else len(next(iter(prm.values())))
+
+
 def _column(prm, name):
+    """A parameter's value for each run, from prm (load_experiments) or runs(records)."""
     if name not in prm:
         raise KeyError(f"no parameter {name!r}; there are {sorted(prm)}")
+    if isinstance(prm, pd.DataFrame):
+        return list(prm[name])                     # already as _hashable makes them
     return [_hashable(v) for v in prm[name]]       # a 2-d array (e.g. num_trials) by rows
 
 
@@ -98,15 +112,21 @@ def _has(record, name):
 
 
 def select(prm, where=None, records=None):
-    """Indices of the runs (into records) matching `where` (see the module docstring).
-    Given records, only runs saved with every argument `where` names: prm shows an
-    argument a run predates as None, which would otherwise match where={name: None}."""
-    n = len(next(iter(prm.values())))
+    """
+    Indices of the runs (into records) matching `where` (see the module docstring), from
+    prm (load_experiments) or the table runs(records).
+
+    An argument a run was saved without (from before it existed) matches nothing `where`
+    gives for it. runs(records) shows it as ABSENT, so that's automatic; prm shows it as
+    None, like an explicit None, so with prm pass records too, or such runs match
+    where={name: None} (and lists containing None).
+    """
+    n = _n_runs(prm)
     keep = np.ones(n, bool)
     for name, cond in (where or {}).items():
         col = _column(prm, name)
         if callable(cond):
-            keep &= np.array([bool(cond(v)) for v in col])
+            keep &= np.array([not _absent(v) and bool(cond(v)) for v in col])
         elif isinstance(cond, list):
             ok = {_hashable(c) for c in cond}
             keep &= np.array([v in ok for v in col])
@@ -122,7 +142,7 @@ def select(prm, where=None, records=None):
 
 def varying(prm, runs=None, show=True):
     """{parameter: values} of the parameters that differ between `runs` (default all)."""
-    runs = np.arange(len(next(iter(prm.values())))) if runs is None else runs
+    runs = np.arange(_n_runs(prm)) if runs is None else runs
     out = {}
     for name in sorted(prm):
         col = _column(prm, name)
@@ -331,6 +351,95 @@ def heldout(record, refs=(), perplexity=False, kl=False, renorm=True, keep=None)
 REF_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X']
 
 
+def _as_curve(v):
+    """(x, Y), Y (samples, len(x)), from what a plot_grid function returns: a Series by
+    (sample, x) (as curve() makes), a DataFrame with a row per sample and a column per x,
+    a Series by x alone (one row, so no spread), or a tuple (x, Y)."""
+    if isinstance(v, tuple) and len(v) == 2:
+        x = np.asarray(v[0])
+        return x, np.asarray(v[1], float).reshape(-1, len(x))
+    if isinstance(v, pd.DataFrame):
+        return v.columns.to_numpy(), v.to_numpy(float)
+    if isinstance(v, pd.Series):
+        if v.index.nlevels == 2:
+            W = v.groupby(level=[0, 1]).mean().unstack(level=1)
+            return W.columns.to_numpy(), W.to_numpy(float)
+        return v.index.to_numpy(), v.to_numpy(float)[None]
+    raise TypeError("a plot function returns a Series by (sample, x), a DataFrame (a row "
+                    f"per sample, a column per x), or (x, Y); not a {type(v).__name__}")
+
+
+def _draw_grid(records, prm, curves_of, rows, cols, hue, where, err, traces, cmap, size,
+               sharey, xlabel, ylabel, note=None):
+    """
+    The grid behind plot_heldout and plot_grid: one panel per (rows, cols) value, one
+    colour per hue value, each cell a single run (see _grid). curves_of(record) gives
+    {name: (x, Y)}: the first is the run's line (centre and error bars over samples by
+    `err`, each sample's line too with `traces`), the others (e.g. references) dashed
+    centres with hollow markers in the same colour. x that isn't numeric is plotted as
+    categories, in order. note(record): extra text for a panel's title when it has one
+    line. Returns the axes.
+    """
+    cells, levels = _grid(prm, where, (rows, cols, hue), records)
+    hues = levels[2]
+    colors = plt.get_cmap(cmap)(np.linspace(0, 0.9, len(hues))) if hue else ['k']
+    curves = {key: curves_of(records[r]) for key, r in cells.items()}
+    extras = list(dict.fromkeys(n for c in curves.values() for n in list(c)[1:]))
+    xs = [x for c in curves.values() for x, _ in c.values()]
+    numeric = all(np.issubdtype(np.asarray(x).dtype, np.number)
+                  and not np.issubdtype(np.asarray(x).dtype, np.bool_) for x in xs)
+    if numeric:
+        where_x = lambda x: np.asarray(x, float)
+        ticks = np.unique(np.concatenate([np.asarray(x, float) for x in xs])) if xs else []
+        integer = len(ticks) and len(ticks) <= 20 and np.all(ticks == np.round(ticks))
+    else:
+        cats = _order(v for x in xs for v in x.tolist())
+        pos = {v: p for p, v in enumerate(cats)}
+        where_x = lambda x: np.array([pos[v] for v in x.tolist()], float)
+
+    fig, axs = _figure(levels, size, sharey)
+    style = dict(ls='--', lw=0.8, ms=5, mfc='none')
+    for i, rv in enumerate(levels[0]):
+        for j, cv in enumerate(levels[1]):
+            ax = axs[i, j]
+            here = [(h, (rv, cv, hv)) for h, hv in enumerate(hues) if (rv, cv, hv) in curves]
+            if not here:
+                ax.set_visible(False)
+                continue
+            for h, key in here:
+                (x, Y), *rest = curves[key].values()
+                if traces:
+                    draw_traces(ax, where_x(x), Y, colors[h], traces)
+                mu, e = spread(Y, err)
+                ax.errorbar(where_x(x), mu, e, color=colors[h], marker='o', ms=6, lw=2, capsize=2)
+                for name, (x2, Y2) in list(curves[key].items())[1:]:
+                    k = extras.index(name)
+                    ax.plot(where_x(x2), spread(Y2, err)[0], color=colors[h], alpha=0.8,
+                            marker=REF_MARKERS[k % len(REF_MARKERS)], **style)
+            title = _title(rows, cols, rv, cv)
+            if note is not None and len(here) == 1:
+                extra = note(records[cells[here[0][1]]])
+                title += f' {extra}' if extra else ''
+            ax.set_title(title)
+            ax.set_xlabel(xlabel or '')
+            if j == 0 and ylabel:
+                ax.set_ylabel(ylabel)
+    for ax in axs.flat:
+        if not numeric:
+            ax.set_xticks(range(len(cats)), [_show(v) for v in cats])
+        elif integer:
+            ax.set_xticks(ticks)
+    # one legend for the whole grid, in the first panel: every hue, then every extra line
+    handles = [Line2D([], [], color=colors[h], marker='o', lw=2, label=_label(hue, hv))
+               for h, hv in enumerate(hues)] if hue else []
+    handles += [Line2D([], [], color='0.4', marker=REF_MARKERS[k % len(REF_MARKERS)],
+                       label=name, **style) for k, name in enumerate(extras)]
+    if handles:
+        next(ax for ax in axs.flat if ax.get_visible()).legend(handles=handles, fontsize='small')
+    fig.tight_layout()
+    return axs
+
+
 def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=(),
                  perplexity=False, kl=False, err='std', traces=False, renorm=True, cmap='viridis',
                  size=(4, 3.5), sharey=True, keep=None):
@@ -343,51 +452,103 @@ def plot_heldout(records, prm, hue=None, rows=None, cols=None, where=None, refs=
     refs are drawn dashed with hollow markers in the colour of their line.
     keep: which blocks of which samples to score (see block_mask), e.g. 'fixed'; with
     one line per panel, the title says how many blocks were kept.
+    For anything else against block, or any other x, see plot_grid.
     Returns the axes.
     """
-    cells, levels = _grid(prm, where, (rows, cols, hue), records)
-    hues = levels[2]
-    colors = plt.get_cmap(cmap)(np.linspace(0, 0.9, len(hues))) if hue else ['k']
-    fig, axs = _figure(levels, size, sharey)
-    style = dict(ls='--', lw=0.8, ms=5, mfc='none')
-    nmax = 0
-    for i, rv in enumerate(levels[0]):
-        for j, cv in enumerate(levels[1]):
-            ax = axs[i, j]
-            here = [(h, cells[rv, cv, hv]) for h, hv in enumerate(hues) if (rv, cv, hv) in cells]
-            if not here:
-                ax.set_visible(False)
-                continue
-            for h, r in here:
-                s = heldout(records[r], refs, perplexity, kl, renorm, keep)
-                x = np.arange(1, s['model'].shape[1] + 1)
-                nmax = max(nmax, len(x))
-                if traces:
-                    draw_traces(ax, x, s['model'], colors[h], traces)
-                mu, e = spread(s['model'], err)
-                ax.errorbar(x, mu, e, color=colors[h], marker='o', ms=6, lw=2, capsize=2)
-                for k, name in enumerate(refs):
-                    ax.plot(x, spread(s[name], err)[0], color=colors[h], alpha=0.8,
-                            marker=REF_MARKERS[k % len(REF_MARKERS)], **style)
-            name = _title(rows, cols, rv, cv)
-            if keep is not None and len(here) == 1:
-                M = block_mask(records[here[0][1]], keep)
-                name += f' [{int(M.sum())}/{M.size} blocks]'
-            ax.set_title(name)
-            ax.set_xlabel('block')
-            if j == 0:
-                ax.set_ylabel('held-out ' + ylabel(perplexity, kl, renorm))
-    for ax in axs.flat:
-        ax.set_xticks(np.arange(1, nmax + 1))
-    # one legend for the whole grid, in the first panel: every hue, then every reference
-    handles = [Line2D([], [], color=colors[h], marker='o', lw=2, label=_label(hue, hv))
-               for h, hv in enumerate(hues)] if hue else []
-    handles += [Line2D([], [], color='0.4', marker=REF_MARKERS[k % len(REF_MARKERS)],
-                       label=name, **style) for k, name in enumerate(refs)]
-    if handles:
-        next(ax for ax in axs.flat if ax.get_visible()).legend(handles=handles, fontsize='small')
-    fig.tight_layout()
-    return axs
+    def curves_of(rec):
+        s = heldout(rec, refs, perplexity, kl, renorm, keep)
+        x = np.arange(1, s['model'].shape[1] + 1)
+        return {k: (x, v) for k, v in s.items()}
+
+    def note(rec):
+        if keep is None:
+            return None
+        M = block_mask(rec, keep)
+        return f'[{int(M.sum())}/{M.size} blocks]'
+
+    return _draw_grid(records, prm, curves_of, rows, cols, hue, where, err, traces, cmap,
+                      size, sharey, 'block', 'held-out ' + ylabel(perplexity, kl, renorm), note)
+
+
+# -- any function of a run's trace, on the grid ------------------------------------------
+
+def curve(df, y, x='block'):
+    """
+    Values of df's rows (trace rows, usually a selection) as a Series by (sample, x),
+    averaged over rows sharing one: what a plot_grid function returns. y is a column
+    name, a function of df, or an array; x a column ('block' is numbered from 1, as
+    plot_heldout does).
+    """
+    vals = df[y] if isinstance(y, str) else (y(df) if callable(y) else y)
+    xs = df[x].to_numpy() + 1 if x == 'block' else df[x].to_numpy()
+    idx = pd.MultiIndex.from_arrays([df['sample'].to_numpy(), xs], names=['sample', x])
+    return pd.Series(np.asarray(vals, float), index=idx).groupby(level=[0, 1]).mean()
+
+
+def at_target(df, col='ll'):
+    """Each row's vector column `col` (ll, ll_assistant, ref_<name>, ...) at the token Y
+    puts most weight on (the row's target)."""
+    return np.array([np.asarray(v)[j] for v, j in zip(df[col], df['target'])], float)
+
+
+def score(df, col='ll', renorm=True):
+    """Each row's -cross-entropy against Y from vector column `col`: sum(y * col), as
+    plot_icl and plot_heldout score (ll[target] when one token is right). renorm: less
+    log(task mass) (task_mass_assistant for the assistant span's columns), i.e. over the
+    task alphabet; refs (ref_<name>) are distributions over it already."""
+    out = np.array([np.nansum(np.where(np.asarray(y) > 0, np.asarray(y) * np.asarray(v), 0))
+                    if not np.isnan(np.asarray(v)[np.asarray(y) > 0]).any() else np.nan
+                    for y, v in zip(df['y'], df[col])], float)
+    if renorm and not col.startswith('ref_'):
+        mass = df['task_mass_assistant' if col.endswith('_assistant') else 'task_mass']
+        out = out - np.log(mass.to_numpy(float))
+    return out
+
+
+def plot_grid(records, prm, f, rows=None, cols=None, hue=None, where=None, refs=(),
+              keep=None, err='std', traces=False, xlabel=None, ylabel=None, cmap='viridis',
+              size=(4, 3.5), sharey=True):
+    """
+    Any quantity of each run, on plot_heldout's grid: f(tr) takes a run's trace() and
+    returns what to plot against what, for each sample. The summary over samples is by
+    `err` (see plot_icl), each sample's line too with `traces`; one line per value of
+    `hue`, panels by `rows` x `cols`, each a single run (see the module docstring).
+
+    f returns a Series by (sample, x) -- curve(rows, y, x) makes one --, a DataFrame
+    with a row per sample and a column per x, or (x, Y); or a dict of such, {name: ...},
+    whose first is the run's line and the others extra dashed lines (e.g. a reference),
+    named in the legend. x that isn't numeric is plotted as categories.
+
+    tr.attrs['args'] holds the run's arguments (task and model), e.g. to normalise by k.
+    refs: reference predictors, as trace columns ref_<name>. keep: only the trace rows
+    of the blocks block_mask keeps (e.g. 'fixed').
+
+        test = lambda tr: tr[tr.final & tr.hidden]           # each block's test token
+        # plot_heldout, from the user span (equal in 'raw'), renormalised
+        plot_grid(records, prm, lambda tr: curve(test(tr), score), ...)
+        # how often the model's top token over the vocabulary is the right word
+        plot_grid(records, prm, lambda tr: curve(test(tr), lambda t: t.top_any == t.word),
+                  ylabel='top token right', ...)
+        # task mass along the block, every hidden token, by trial
+        plot_grid(records, prm, lambda tr: curve(tr[tr.hidden], 'task_mass', x='trial'), ...)
+        # the model and a reference
+        plot_grid(records, prm, lambda tr: {'model': curve(test(tr), score),
+                  'bigram': curve(test(tr), lambda t: score(t, 'ref_bigram'))},
+                  refs={'bigram': partial(ngram, order=1, alpha=0.5)}, ...)
+    Returns the axes.
+    """
+    def curves_of(rec):
+        tr = trace(rec, refs=refs, keep=keep)
+        if keep is not None:
+            tr = tr[tr['kept']]
+        tr.attrs['args'] = {**rec['task_args'], **rec['model_args']}
+        out = f(tr)
+        if not isinstance(out, dict):
+            out = {ylabel or 'value': out}
+        return {k: _as_curve(v) for k, v in out.items()}
+
+    return _draw_grid(records, prm, curves_of, rows, cols, hue, where, err, traces, cmap,
+                      size, sharey, xlabel, ylabel)
 
 
 # -- one run, token by token -----------------------------------------------------------
@@ -541,9 +702,6 @@ def trace(record, refs=(), keep=None):
 
 # -- tables across runs -----------------------------------------------------------------
 
-ABSENT = '<absent>'     # in runs() and table(): an argument the run was saved without
-
-
 def runs(records, varying=False):
     """
     One row per run (indexed by its position in records), its saved arguments as columns:
@@ -638,11 +796,12 @@ def _task_name(record):
     return t if isinstance(t, str) else getattr(t, '__name__', str(t))
 
 
-def _sample_graph(data, i):
+def _sample_graph(data, i, actions_shown=True):
     """Sample i's graph, as a MultiDiGraph with an `action` on each edge, and the label
     of each grammar token. From data['automaton'] (an FSA description) when the run
     saved it; otherwise rebuilt from every transition its blocks show, with grammar
-    tokens as labels (an edge no block shows is missed)."""
+    tokens as labels (an edge no block shows is missed), and with action None on every
+    edge if the trials don't show actions."""
     if 'automaton' in data:
         desc = data['automaton'][i]
         if desc['type'] != 'FSA':
@@ -656,13 +815,51 @@ def _sample_graph(data, i):
         return G, desc['vocab']
     code = block_code(data, i)
     G = nx.MultiDiGraph()
+    kinds = data.get('kinds')
     for b, trials in enumerate(data['blocks'][i]):
         gram = {int(x): r for r, x in enumerate(code[b])}          # symbol -> grammar token
         for tr in trials:
             toks = [gram[int(x)] for x in tr[:-1]]
-            for p in range(0, len(toks) - 2, 2):
-                G.add_edge(toks[p], toks[p + 2], action=toks[p + 1])
+            if kinds is not None:
+                is_act = [kinds[t] == 'action' for t in toks]
+            else:                                   # nodes and actions alternate, if shown
+                is_act = [actions_shown and p % 2 == 1 for p in range(len(toks))]
+            u = a = None
+            for t, act in zip(toks, is_act):
+                if act:
+                    a = t
+                    continue
+                if u is not None:
+                    G.add_edge(u, t, action=a)
+                u, a = t, None
     return G, list(range(code.shape[1]))
+
+
+def _test_transition(toks, kinds, label, actions_shown=True):
+    """The last transition (u, a, v) of a trial's grammar tokens `toks`, as labels: v its
+    last node, u the node before, a the action between them, or None if the trials don't
+    show actions. By kind when the run saved data['kinds'], otherwise by position."""
+    if kinds is not None:
+        nodes = [p for p, t in enumerate(toks) if kinds[t] == 'node']
+        if len(nodes) < 2:
+            raise ValueError("the test trial shows fewer than two nodes, so it has no "
+                             "transition to check")
+        p, q = nodes[-2], nodes[-1]
+        acts = [toks[x] for x in range(p + 1, q) if kinds[toks[x]] == 'action']
+        return label[toks[p]], (label[acts[-1]] if acts else None), label[toks[q]]
+    if actions_shown:
+        u, a, v = toks[-3:]
+        return label[u], label[a], label[v]
+    return label[toks[-2]], None, label[toks[-1]]
+
+
+def _action_blind(G):
+    """G with every action the same (None) and parallel edges merged: the graph as trials
+    that show only nodes present it."""
+    H = nx.MultiDiGraph()
+    H.add_nodes_from(G)
+    H.add_edges_from((x, y, {'action': None}) for x, y in dict.fromkeys(G.edges()))
+    return H
 
 
 def _training_graph(G, u, a, v, unit, symmetric):
@@ -775,6 +972,10 @@ def fixed_answers(record):
     words doesn't say which node it is under another's. Runs saved without
     data['automaton'] rebuild each sample's graph from the transitions its blocks show,
     with a warning. Cached per record. Needs nothing from automata.
+
+    If the trials don't show actions (show without 'action'), the test is u -> v, and the
+    symmetries are those of the graph with the actions erased: a node answers the test
+    only if no symmetry of that graph fixing u moves it.
     """
     m = record['metrics']
     hit = _FIXED.get(id(m))
@@ -789,16 +990,30 @@ def fixed_answers(record):
                       "sample's graph from the transitions its blocks show", stacklevel=2)
     unit = 'transition' if exhaustive else targs.get('holdout_unit', 'edge')
     symmetric = bool(targs.get('symmetric', False))
+    show = targs.get('show')
+    actions_shown = show is None or 'action' in show
+    kinds = data.get('kinds')
     out = np.zeros((len(m['logp_ctx']), len(data['blocks'][0])), bool)
     for i in range(len(out)):
-        G, label = _sample_graph(data, i)
+        G, label = _sample_graph(data, i, actions_shown)
         code = block_code(data, i)
         done = {}                                    # blocks testing the same transition
         for b, trials in enumerate(data['blocks'][i]):
             gram = {int(x): r for r, x in enumerate(code[b])}       # symbol -> grammar token
-            u, a, v = (label[gram[int(x)]] for x in trials[-1][:-1][-3:])
+            toks = [gram[int(x)] for x in trials[-1][:-1]]
+            u, a, v = _test_transition(toks, kinds, label, actions_shown)
             if (u, a, v) not in done:
-                done[u, a, v] = fixed_target(_training_graph(G, u, a, v, unit, symmetric), u, a, v)
+                if a is not None:
+                    H = _training_graph(G, u, a, v, unit, symmetric)
+                    done[u, a, v] = fixed_target(H, u, a, v)
+                else:                                 # actions hidden: the action-blind graph
+                    acts = {d['action'] for _, y, d in G.out_edges(u, data=True) if y == v}
+                    if unit != 'edge' and len(acts) != 1:
+                        raise ValueError(f"the test {u} -> {v} doesn't show its action, and "
+                                         f"{len(acts)} actions take {u} to {v}: can't tell "
+                                         f"which {unit!r} was held out")
+                    H = _training_graph(G, u, next(iter(acts), None), v, unit, symmetric)
+                    done[u, a, v] = fixed_target(_action_blind(H), u, None, v)
             out[i, b] = done[u, a, v]
     _FIXED[id(m)] = (m, out)
     return out.copy()
@@ -860,17 +1075,16 @@ def _exhaustive_samples(record):
     data = m['data']
     fixed = fixed_answers(record)[:, 0]                 # every block holds out the same edge
     nodes_r = [r for r, k in enumerate(data['kinds']) if k == 'node']
+    show = record['task_args'].get('show')
+    actions_shown = show is None or 'action' in show
     out = []
     for i in range(len(m['logp_ctx'])):
-        G, label = _sample_graph(data, i)
+        G, label = _sample_graph(data, i, actions_shown)
         h = data['holdout'][i] if 'holdout' in data else {}
-        if 'edges' in h:
-            raise ValueError("this run holds out a different edge in each block (the newer "
-                             "ExhaustiveRelationTask); these plots assume one per sample: use "
-                             "trace, whose target column follows each block")
         code = block_code(data, i)
         gram = {int(x): r for r, x in enumerate(code[0])}
-        u, a, v = (label[gram[int(x)]] for x in data['blocks'][i][0][-1][:-1][-3:])
+        toks = [gram[int(x)] for x in data['blocks'][i][0][-1][:-1]]
+        u, a, v = _test_transition(toks, data['kinds'], label, actions_shown)
         rest = sorted((x, y, d['action']) for x, y, d in G.edges(data=True) if (x, y, d['action']) != (u, v, a))
         out.append({'target': h.get('target', v), 'edge': (u, a, v), 'unique': bool(fixed[i]),
                     'rest': rest, 'node_tokens': nodes_r, 'node_labels': [label[r] for r in nodes_r]})
@@ -1026,7 +1240,8 @@ def plot_node_probs(records, prm, by='index', where=None, unique=True, over='tas
             L = np.exp(L)
         u, a, v = S[rows[0]]['edge']
         d = len({c for *_, c in S[0]['rest']} | {a})
-        ruled_out = {y for x, y, c in S[0]['rest'] if x == u and c != a}
+        ruled_out = ({y for x, y, c in S[0]['rest'] if x == u and c != a}
+                     if a is not None else set())          # no actions shown: none ruled out
         x = np.arange(1, L.shape[1] + 1)
         for n, lab in enumerate(S[0]['node_labels']):
             role = ('answer' if lab == v else 'source' if lab == u else
