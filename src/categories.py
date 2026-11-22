@@ -189,12 +189,12 @@ def embeddings(model, embedding, tokenizer=None):
             meta = json.loads(str(z['meta']))
             if meta.get('model') == model and meta.get('fit_tokens') == repr(FIT_TOKENS):
                 return z['tokens'], z['vectors'].astype(np.float32)
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     import geometry
+    import hf_models
     tokenizer = tokenizer or AutoTokenizer.from_pretrained(model)
     pool = voc.get_pool(FIT_TOKENS, tokenizer)
-    hf = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16, device_map='auto')
+    hf = hf_models.load_model(model, device_map='auto')    # the auto-class its config calls for
     X = geometry.model_vectors(hf, pool.ids, embedding, len(tokenizer))
     tokens = [pool.strs[i] for i in pool.ids]
     save_embeddings(model, embedding, tokens, X, tokenizer=getattr(tokenizer, 'name_or_path', None))

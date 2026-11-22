@@ -38,7 +38,15 @@ class ChatLM:
     end_of_reasoning: the text that ends a thought and starts the answer, e.g. '\\n</think>\\n\\n'.
         Leave as None to read it off the template (see think_tokens); pass it explicitly for
         templates where that fails.
-    The model itself is still at self.bridge, for hooks, caching, etc.
+    answer_prefix: text that opens the answer when not thinking, for templates whose
+        generation prompt doesn't (Inkling 2's has none: '<|message_model|><|content_text|>').
+        None: the generation cue is enough (Qwen, Gemma).
+    no_think_kwargs: chat-template arguments that mean "don't think", for templates without
+        an enable_thinking switch (Inkling 2: {'reasoning_effort': 'none'}); applied over
+        the trial's own arguments when think=False. hf_models.chat_settings() gives both,
+        and end_of_reasoning, for the models that need them.
+    The model itself is still at self.bridge, for hooks, caching, etc. (with hf_models.HFBridge,
+    for models transformer-lens doesn't support, there are no hooks).
 
     hf_model: the Hugging Face model under the bridge. Given, trials are scored with
         memory-efficient attention and the unembedding applied a chunk of positions at a
@@ -53,20 +61,26 @@ class ChatLM:
       bypass_bridge    score with the bridge's wrappers swapped out for the HF modules they
                        wrap (see plain_hf). Some bridge components compute attention
                        themselves, eager-style, ignoring the HF attention setting.
+      prefill_block    for models without SDPA (Inkling 2), positions per forward pass when
+                       scoring (see hidden_states); None for a single pass
     """
     placeholder = '!'    # message content that splice_template replaces with token ids
     chunked_scoring = True
+    prefill_block = 1024  # positions per forward pass when scoring a model without SDPA support
     score_chunk = 512
     strict_kernels = True
     bypass_bridge = True
 
-    def __init__(self, bridge, prepend_bos=False, end_of_reasoning=None, hf_model=None):
+    def __init__(self, bridge, prepend_bos=False, end_of_reasoning=None, hf_model=None,
+                 answer_prefix=None, no_think_kwargs=None):
         self.bridge = bridge
         self.hf_model = hf_model
         self.tokenizer = bridge.tokenizer
         self.device = bridge.device
         self.bos = bridge.to_tokens('', prepend_bos=True)[0][0].item() if prepend_bos else None
         self.end_of_reasoning = end_of_reasoning
+        self.answer_prefix = answer_prefix
+        self.no_think_kwargs = dict(no_think_kwargs or {})
 
     # -- tokens ---------------------------------------------------------------
 
@@ -251,6 +265,8 @@ class ChatLM:
         start = close
         while start > 0 and blank[start - 1]:     # include the whitespace leading into it
             start -= 1
+        if self.end_of_reasoning is not None:
+            start = 0     # given explicitly: all of it closes a thought (Inkling 2: three tokens)
 
         as_ids = lambda x: torch.tensor(x, dtype=torch.long, device=self.device)
         return ids[close], as_ids(ids[close + 1:]), as_ids(ids[start:])
@@ -270,7 +286,14 @@ class ChatLM:
         if len(out) - n < budget:
             warnings.warn("the model stopped before closing its reasoning (or never started); "
                           "appending the end of reasoning to whatever it produced")
-        return torch.cat([out, eot])
+            eos = getattr(self.bridge, 'eos_token_ids', None) or [self.tokenizer.eos_token_id]
+            if len(out) > n and out[-1].item() in eos:
+                out = out[:-1]             # the end-of-turn token it stopped on
+        # append only the part of the end of reasoning it hasn't already written (Inkling 2
+        # can close its thought with <|end_message|> and then stop without an answer block)
+        tail, e = out[n:].tolist(), eot.tolist()
+        k = next((j for j in range(min(len(tail), len(e)), 0, -1) if tail[-j:] == e[:j]), 0)
+        return torch.cat([out, eot[k:]])
 
     # -- scoring --------------------------------------------------------------------
 
@@ -372,14 +395,67 @@ class ChatLM:
             z = torch.tanh(z / cap) * cap
         return z
 
+    @cached_property
+    def sdpa_ok(self):
+        """Whether the HF model runs on SDPA attention. Not all do: Inkling 2's attention adds
+        per-head sinks, which transformers' SDPA function silently ignores, so forcing SDPA
+        there would give wrong numbers without an error."""
+        return bool(getattr(self.hf_model, '_supports_sdpa', False))
+
     @torch.no_grad()
     def hidden_states(self, ids):
-        """Final hidden states (T, d_model) for a 1-d sequence of ids, with SDPA attention
-        and no KV cache: memory linear in T rather than quadratic."""
-        with (self.plain_hf() if self.bypass_bridge else nullcontext()), \
-                self.attention('sdpa'), self._kernels():
-            out = self.hf_model.model(input_ids=ids[None], use_cache=False)
-        return out.last_hidden_state[0]
+        """
+        Final hidden states (T, d_model) for a 1-d sequence of ids, in memory linear in T.
+
+        Models with SDPA support run in one pass on SDPA, without a KV cache. Models without
+        it (sdpa_ok) run their own eager attention, whose intermediates are (queries x keys):
+        quadratic in T in one pass, so the sequence goes through in blocks of prefill_block
+        positions instead, each attending to the earlier ones through the KV cache, and the
+        intermediates are (block x T). check_blocked_scoring() compares the two ways.
+        """
+        with (self.plain_hf() if self.bypass_bridge else nullcontext()):
+            if self.sdpa_ok:
+                with self.attention('sdpa'), self._kernels():
+                    out = self.hf_model.model(input_ids=ids[None], use_cache=False)
+                return out.last_hidden_state[0]
+            return self._hidden_states_blocked(ids, self.prefill_block)
+
+    def _hidden_states_blocked(self, ids, block):
+        """hidden_states in blocks of `block` positions through the model's KV cache (one
+        pass if block is None or the sequence is no longer)."""
+        if block is None or len(ids) <= block:
+            return self.hf_model.model(input_ids=ids[None], use_cache=False).last_hidden_state[0]
+        past, outs = None, []
+        for s in range(0, len(ids), block):
+            out = self.hf_model.model(input_ids=ids[None, s:s + block], past_key_values=past,
+                                      use_cache=True)
+            past = out.past_key_values
+            outs.append(out.last_hidden_state[0])
+        del past
+        return torch.cat(outs)
+
+    @torch.no_grad()
+    def check_blocked_scoring(self, n=1500, block=500, seed=0):
+        """
+        Score a random n-token sequence in one pass and in blocks of `block` (how sequences
+        longer than prefill_block are scored on models without SDPA), and compare the
+        next-token log-probs. Run once per new model before relying on blocked scoring:
+        differences should be at the level of bfloat16 rounding (around 0.01-0.1 nats at
+        most, with the same top token nearly everywhere); large ones mean the model's cache
+        doesn't handle multi-token blocks, and prefill_block = None is the fallback.
+        """
+        rng = np.random.default_rng(seed)
+        ids = torch.tensor(rng.integers(1000, min(len(self.tokenizer), 100_000), n),
+                           dtype=torch.long, device=self.device)
+        with (self.plain_hf() if self.bypass_bridge else nullcontext()):
+            lp = [torch.log_softmax(self.logits_from_hidden(self._hidden_states_blocked(ids, b)).float(), -1)
+                  for b in (None, block)]
+        diff = (lp[0] - lp[1]).abs().max(-1).values
+        same_top = (lp[0].argmax(-1) == lp[1].argmax(-1)).float().mean().item()
+        print(f'{n} tokens, blocks of {block}: max |dlogp| {diff.max().item():.3g} '
+              f'(median over positions {diff.median().item():.3g}); same top token at '
+              f'{100 * same_top:.1f}% of positions')
+        return diff.max().item(), same_top
 
     @torch.no_grad()
     def score(self, ids, task_toks, equiv=None):
@@ -429,6 +505,8 @@ class ChatLM:
                     0) and over text only (column 1: without special_ids), with its
                     full-vocabulary log-prob. -1 and nan where nothing predicts.
         """
+        if not think and mode != 'raw':
+            template_kwargs = {**template_kwargs, **self.no_think_kwargs}
         input_ids, spans, target = self.build_prompt(
             mode, blocks, task_toks, k_show, k_hide, system_prompt, think,
             block_text=block_text, **template_kwargs)
@@ -436,6 +514,9 @@ class ChatLM:
         if mode != 'raw' and think:
             input_ids = self.reason(input_ids, thinking_budget)
             torch.cuda.empty_cache()   # generation's cached blocks don't fit scoring's shapes
+        elif mode != 'raw' and self.answer_prefix:
+            input_ids = torch.cat([input_ids, torch.tensor(self._ids(self.answer_prefix),
+                                                           dtype=torch.long, device=self.device)])
 
         L = len(input_ids)
         lp, top_ids, top_lp = self.score(torch.cat([input_ids, target]), task_toks, equiv)

@@ -25,6 +25,7 @@ import prompts
 import vocabulary
 import geometry
 import categories
+import hf_models
 
 
 # -- model cache ------------------------------------------------------------------------
@@ -37,21 +38,20 @@ def get_lm(model_name, prepend_bos=False):
     different model first drops the current one, since two large models won't share a GPU
     (any `lm` you still hold elsewhere keeps the old one alive; del it first)."""
     if model_name not in _BRIDGES:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from transformer_lens.model_bridge import TransformerBridge
+        from transformers import AutoTokenizer
 
         _BRIDGES.clear(); _HF.clear()
         gc.collect(); torch.cuda.empty_cache()
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=torch.bfloat16, device_map="cuda",
-            attn_implementation="sdpa")
+        # the auto-class the checkpoint calls for, SDPA where supported (see hf_models)
+        hf_model = hf_models.load_model(model_name, device_map="cuda")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        _BRIDGES[model_name] = TransformerBridge.boot_transformers(
-            model_name, hf_model=hf_model, tokenizer=tokenizer, device="cuda")
+        # transformer-lens' bridge, or a hook-less stand-in if it doesn't know the model
+        _BRIDGES[model_name] = hf_models.make_bridge(model_name, hf_model, tokenizer, device="cuda")
         _HF[model_name] = hf_model
         # the bridge may switch this back to eager; check:
         # print(hf_model.config.get_text_config()._attn_implementation)
-    lm = ChatLM(_BRIDGES[model_name], prepend_bos=prepend_bos)
+    lm = ChatLM(_BRIDGES[model_name], prepend_bos=prepend_bos,
+                **hf_models.chat_settings(_HF[model_name].config))
     lm.hf_model = _HF[model_name]
     return lm
 
