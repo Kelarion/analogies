@@ -386,11 +386,20 @@ class ChatLM:
             getattr(cfg, 'final_logit_softcapping', None)
         return self.hf_model.get_output_embeddings(), cap
 
+    @cached_property
+    def _float_logits(self):
+        """Whether the HF forward upcasts logits to float32 before the soft-cap (Inkling 2,
+        whose models hold the cap as a `logit_softcap` module) rather than capping in the
+        model's dtype (Gemma)."""
+        return hasattr(self.hf_model, 'logit_softcap')
+
     def logits_from_hidden(self, h):
         """Logits for final hidden states h (already final-normed), as the HF forward
         computes them."""
         head, cap = self._unembed
         z = head(h)
+        if self._float_logits:
+            z = z.float()
         if cap:
             z = torch.tanh(z / cap) * cap
         return z
