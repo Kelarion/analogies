@@ -38,7 +38,7 @@ task_args = {
              # 'graph_seed': 0,                  # same graph for every prompt condition below
              'num_trials': [i*[None] for i in [1,2,4,8]],
              # 'length': 1,
-             'samps': 100,
+             'samps': 8,
              'holdout': True,
              'max_tok': np.inf, 
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
