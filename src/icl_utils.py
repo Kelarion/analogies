@@ -28,6 +28,14 @@ def split_block(trials, k_show=None, k_hide=None):
     assert 0 <= k < n, f"can't hide {k_hide} tokens of a {n}-token trial"
     return np.concatenate(trials[:-1] + [last[:k]]), last[k:-1]
 
+def span_rows(a, s, e, fill):
+    """Rows of per-position predictions `a` for a span s..e-1 of the sequence: those predicting
+    each of its tokens, plus the one predicting the token after it."""
+    if s == 0:     # raw stream without BOS: nothing predicts the very first token
+        return np.concatenate([np.full((1,) + a.shape[1:], fill, a.dtype), a[:e]])
+    return a[s - 1 : e]
+
+
 class ChatLM:
     """
     A TransformerBridge plus the chat-template facts the ICL experiments need: prompt
@@ -467,15 +475,21 @@ class ChatLM:
         return diff.max().item(), same_top
 
     @torch.no_grad()
-    def score(self, ids, task_toks, equiv=None):
+    def score(self, ids, task_toks, equiv=None, keep=None):
         """
         Task-token log-probs and top tokens at every position of a 1-d sequence of ids:
         lp (T, n_task), top_ids (T, 2), top_lp (T, 2), as task_logprobs_gpu and
         top_tokens_gpu. The full (T, vocab) logits are never held at once.
+
+        keep: positions (sorted, unique) at which to also return what the logits are made
+        from, as a 4th value on the GPU: the final hidden states (len(keep), d_model), or
+        when scoring through the bridge, the logits themselves. rep_logits turns them into
+        logits; full_kl compares two sets of them over the whole vocabulary.
         """
-        if self.hf_model is None or not self.chunked_scoring:
-            return self.score_bridge(ids, task_toks, equiv)
+        if not self._scores_hidden:
+            return self.score_bridge(ids, task_toks, equiv, keep)
         h = self.hidden_states(ids)
+        rep = None if keep is None else h[torch.as_tensor(keep, device=h.device)].clone()
         lps, tids, tlps = [], [], []
         for hc in h.split(self.score_chunk):
             z = self.logits_from_hidden(hc)
@@ -485,21 +499,51 @@ class ChatLM:
             tlps.append(v)
             del z
         del h
-        return np.concatenate(lps), np.concatenate(tids), np.concatenate(tlps)
+        out = np.concatenate(lps), np.concatenate(tids), np.concatenate(tlps)
+        return out if keep is None else out + (rep,)
 
     @torch.no_grad()
-    def score_bridge(self, ids, task_toks, equiv=None):
+    def score_bridge(self, ids, task_toks, equiv=None, keep=None):
         """score through the bridge, the old way: one forward with the bridge's own
         attention (eager), full logits in memory. For short checks against score."""
         logits = self.bridge(ids[None])[0]
         lp = task_logprobs_gpu(logits, task_toks, equiv)
         top_ids, top_lp = top_tokens_gpu(logits, self.not_text(logits.shape[-1]))
+        rep = None if keep is None else logits[torch.as_tensor(keep, device=logits.device)].clone()
         del logits
-        return lp, top_ids, top_lp
+        return (lp, top_ids, top_lp) if keep is None else (lp, top_ids, top_lp, rep)
+
+    @property
+    def _scores_hidden(self):
+        """Whether score works from hidden states (the chunked path) or the bridge's logits."""
+        return self.hf_model is not None and self.chunked_scoring
+
+    def rep_logits(self, rep):
+        """Logits from what score(keep=...) returned."""
+        return self.logits_from_hidden(rep) if self._scores_hidden else rep
+
+    def full_kl(self, rep_p, rep_q, task_toks=None, equiv=None):
+        """KL(P ‖ Q) over the whole vocabulary, row by row, between the distributions that
+        two sets of score(keep=...) representations give, a chunk of rows at a time on the
+        GPU. With equiv, each task token's equivalence class counts as one outcome."""
+        groups = None if equiv is None else [
+            torch.as_tensor(m, dtype=torch.long, device=rep_p.device) for m in equiv.members(task_toks)]
+        out = [full_kl_gpu(self.rep_logits(a), self.rep_logits(b), groups)
+               for a, b in zip(rep_p.split(self.score_chunk), rep_q.split(self.score_chunk))]
+        return np.concatenate(out) if out else np.zeros(0)
+
+    @staticmethod
+    def _rows_of(rep, kept, pos):
+        """The rows of rep (kept at positions `kept`) for positions pos, where pos >= 0:
+        (valid mask over pos, rows for the valid positions)."""
+        valid = pos >= 0
+        idx = torch.as_tensor(np.searchsorted(kept, pos[valid]), device=rep.device)
+        return valid, rep[idx]
 
     @torch.no_grad()
     def run_trial(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
-                  think=True, thinking_budget=4000, equiv=None, block_text=None, **template_kwargs):
+                  think=True, thinking_budget=4000, equiv=None, block_text=None,
+                  return_hidden=False, **template_kwargs):
         """
         Build the prompt, think if asked (not in 'raw' mode), and score it.
 
@@ -513,6 +557,10 @@ class ChatLM:
                     likely token at each row, (rows, 2), over the whole vocabulary (column
                     0) and over text only (column 1: without special_ids), with its
                     full-vocabulary log-prob. -1 and nan where nothing predicts.
+        With return_hidden, also a 5th value, ref: {(role, block): (valid, rows)}, keyed and
+        rowed like logp_ctx, of what those rows' logits are made from (see score's keep), on
+        the GPU, for run_isolated's full-vocabulary KL. valid marks the rows that something
+        predicts; rows has one entry per valid row.
         """
         if not think and mode != 'raw':
             template_kwargs = {**template_kwargs, **self.no_think_kwargs}
@@ -528,16 +576,16 @@ class ChatLM:
                                                            dtype=torch.long, device=self.device)])
 
         L = len(input_ids)
-        lp, top_ids, top_lp = self.score(torch.cat([input_ids, target]), task_toks, equiv)
-
-        def rows(a, s, e, fill):
-            """Predictions for tokens s..e-1, plus the prediction of the token after the span."""
-            if s == 0:     # raw stream without BOS: nothing predicts the very first token
-                return np.concatenate([np.full((1,) + a.shape[1:], fill, a.dtype), a[:e]])
-            return a[s - 1 : e]
+        positions = {(r, b): np.arange(s - 1, e) for r, b, s, e in spans}     # as span_rows
+        positions[('assistant', len(blocks) - 1)] = np.arange(L - 1, L + len(target))
+        keep = None
+        if return_hidden:
+            keep = np.unique(np.concatenate(list(positions.values())))
+            keep = keep[keep >= 0]
+        lp, top_ids, top_lp, *rep = self.score(torch.cat([input_ids, target]), task_toks, equiv, keep)
 
         def by_span(a, fill):
-            out = {(r, b): rows(a, s, e, fill) for r, b, s, e in spans}
+            out = {(r, b): span_rows(a, s, e, fill) for r, b, s, e in spans}
             out[('assistant', len(blocks) - 1)] = a[L - 1 : L + len(target)]
             return out
 
@@ -548,8 +596,88 @@ class ChatLM:
         # freed GPU blocks back so memory doesn't creep up across trials
         gc.collect()
         torch.cuda.empty_cache()
+        if return_hidden:
+            ref = {k: self._rows_of(rep[0], keep, p) for k, p in positions.items()}
+            return logp_ctx, lp[L - 1], input_ids, top, ref
         return logp_ctx, lp[L - 1], input_ids, top
 
+
+    @torch.no_grad()
+    def run_isolated(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
+                     think=True, equiv=None, block_text=None, ref=None, **template_kwargs):
+        """
+        Every block scored without the blocks before it, and without reasoning, for comparing
+        with run_trial's scores. Forward passes only: no generation. Returns logp, kl:
+          logp  {(role, block): rows}, keyed and shaped like run_trial's logp_ctx: the task
+                tokens' log-probs (normalised over the whole vocabulary) at the same tokens of
+                the same trials, so kl_rows(logp_ctx[k], logp[k]) is the KL over the task
+                alphabet
+          kl    with ref (run_trial's 5th value, from return_hidden=True), the KL from
+                run_trial's distribution to this one over the whole vocabulary, row by row
+                (see full_kl): {(role, block): (rows,)}, nan where nothing predicts; else None
+
+        Block b is scored at the start of a prompt of its own, laid out as a first block:
+        the same system prompt, and block_text[b] before it. So pass each block's text as it
+        would be for a first block (ICLModel's _prompt gives it: no transition from a previous
+        block). Rows only depend on what comes before them, so a non-final block is scored on
+        a prompt cut off right after its completion, which is laid out as it is in context
+        (in 'dialogue', an earlier assistant turn). The final block's completion is scored
+        straight after the generation cue: when thinking, the prompt is rendered for thinking
+        as in run_trial, and the thought is closed at once with the end of reasoning (an empty
+        thought), so against run_trial the comparison measures the earlier blocks and the
+        reasoning trace together; otherwise after answer_prefix, as in run_trial.
+        """
+        block_text = block_text or [''] * len(blocks)
+        assert len(block_text) == len(blocks), "block_text needs one entry per block"
+        prompt_kwargs = (dict(template_kwargs, **self.no_think_kwargs)
+                         if not think and mode != 'raw' else template_kwargs)
+        logp, kl = {}, (None if ref is None else {})
+
+        def take(seq, positions):
+            """Score seq and fill in logp (and kl) for {key: positions}."""
+            keep = None
+            if ref is not None:
+                keep = np.unique(np.concatenate(list(positions.values())))
+                keep = keep[keep >= 0]
+            lp, _, _, *rep = self.score(seq, task_toks, equiv, keep)
+            for key, pos in positions.items():
+                logp[key] = np.full((len(pos), lp.shape[1]), np.nan, lp.dtype)
+                logp[key][pos >= 0] = lp[pos[pos >= 0]]
+                if ref is not None:
+                    vp, hp = ref[key]
+                    vq, hq = self._rows_of(rep[0], keep, pos)
+                    assert len(vp) == len(pos), f"{key}: {len(vp)} rows in context, {len(pos)} alone"
+                    both = vp & vq
+                    kl[key] = np.full(len(pos), np.nan)
+                    kl[key][both] = self.full_kl(hp[torch.as_tensor(both[vp], device=hp.device)],
+                                                 hq[torch.as_tensor(both[vq], device=hq.device)],
+                                                 task_toks, equiv)
+
+        for b in range(len(blocks) - 1):
+            # the block followed by a final block that is cut off again: only so that the
+            # block is laid out as a non-final one, with its completion in context
+            ids, spans, _ = self.build_prompt(
+                mode, [blocks[b], blocks[b]], task_toks, k_show, k_hide, system_prompt, think,
+                block_text=[block_text[b], ''], **prompt_kwargs)
+            mine = {(r, b): np.arange(s - 1, e) for r, blk, s, e in spans if blk == 0}
+            end = max(p[-1] for p in mine.values()) + 1
+            take(ids[:end].to(self.device), mine)
+
+        last = len(blocks) - 1
+        ids, spans, target = self.build_prompt(
+            mode, blocks[-1:], task_toks, k_show, k_hide, system_prompt, think,
+            block_text=block_text[-1:], **prompt_kwargs)
+        ids, target = ids.to(self.device), target.to(self.device)
+        if mode != 'raw' and think:
+            ids = torch.cat([ids, self.think_tokens[2]])           # an empty thought
+        elif mode != 'raw' and self.answer_prefix:
+            ids = torch.cat([ids, torch.tensor(self._ids(self.answer_prefix),
+                                               dtype=torch.long, device=self.device)])
+        L = len(ids)
+        positions = {(r, last): np.arange(s - 1, e) for r, _, s, e in spans}
+        positions[('assistant', last)] = np.arange(L - 1, L + len(target))
+        take(torch.cat([ids, target]), positions)
+        return logp, kl
 
 def test_token_logits(logs, spans, blocks, Y, task_toks, k_show=None, k_hide=None, ans=None):
     """
@@ -603,6 +731,24 @@ def xent(lp, y, renorm=True):
         lp = lp - spc.logsumexp(lp, -1, keepdims=True)
     with np.errstate(invalid='ignore'):
         return np.where(y > 0, lp * y, 0).sum(-1)       # 0 * -inf counts as 0
+
+def kl_rows(lp, lq, renorm=True):
+    """KL(P ‖ Q) row by row, from task-token log-probs lp (P) and lq (Q) of the same shape,
+    e.g. a span of run_trial's logp_ctx and the same span of run_isolated's. renorm: between
+    the distributions renormalised over the task alphabet; otherwise over the task tokens plus
+    one outcome for the rest of the vocabulary, so a shift of probability onto or off the task
+    tokens counts too. nan where either row is nan."""
+    def dist(l):
+        l = np.asarray(l, float)
+        lse = spc.logsumexp(l, -1, keepdims=True)
+        if renorm:
+            return l - lse
+        with np.errstate(divide='ignore'):                   # all mass on the task: log 0
+            return np.concatenate([l, np.log(-np.expm1(np.minimum(lse, 0)))], -1)
+    lp, lq = dist(lp), dist(lq)
+    with np.errstate(invalid='ignore'):
+        terms = np.exp(lp) * (lp - lq)
+    return np.where(lp == -np.inf, 0, terms).sum(-1)       # 0 log 0 counts as 0; nan stays nan
 
 def mean_sem(a):
     a = np.asarray(a, dtype=float)
@@ -889,7 +1035,7 @@ def ylabel(perplexity=False, kl=False, renorm=True):
     return out if renorm else out + ', whole vocabulary'
 
 def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title='', cmap='viridis',
-             refs=(), perplexity=False, kl=False, err='std', traces=False, renorm=True):
+             refs=(), perplexity=False, kl=False, err='std', traces=False, renorm=True, iso=None):
     """
     n_trl:  number of trials (comma-separated segments) per block to show, from the block's start
     k_hide: if given, show only the last k_hide tokens of each trial; otherwise every token
@@ -918,7 +1064,16 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
             default); False keeps them normalised over the whole vocabulary, so
             probability on other tokens (e.g. <|im_end|>) counts against it. The
             references are distributions over the task alphabet either way.
+    iso:    plot KL(with ‖ without) at each token instead, as stored per row of logp_ctx:
+            how much the earlier blocks change the model's prediction, and when thinking, the
+            reasoning trace too, at the final block's completion (see ChatLM.run_isolated).
+            metrics['kl_iso'] for the KL over the whole vocabulary, metrics['kl_iso_task'] for
+            the task alphabet; renorm doesn't apply. Block 0 has no earlier blocks, so its
+            curve is a check that the two runs line up: 0 up to numerical noise. Doesn't
+            combine with refs, kl or perplexity.
     """
+    if iso is not None and (refs or kl or perplexity):
+        raise ValueError("iso plots KL(with ‖ without earlier blocks), which takes no refs, kl or perplexity")
     refs = dict(refs)
     f = (lambda v: np.exp(-v)) if perplexity else (lambda v: v)
 
@@ -958,13 +1113,20 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
 
             ctx = logp_ctx[i][('user', b)]
             asst = logp_ctx[i][('assistant', b)]
-            vals[:len(ctx)] = xent(ctx, Y[t0:t0 + len(ctx)], renorm)
             rest, s = asst[1:-1], len(ctx)                          # completion tokens after the first
+            if iso is None:                                         # against the true distribution
+                score = lambda lp, y: xent(lp, y, renorm)
+                y_ctx, y_rest, y_star = Y[t0:t0 + s], Y[t0 + s:t0 + s + len(rest)], Y[t0 + s - 1]
+            else:                                                   # against the same rows, block alone
+                score = lambda lp, kl: kl                           # stored, row for row
+                q_asst = iso[i][('assistant', b)]
+                y_ctx, y_rest, y_star = iso[i][('user', b)], q_asst[1:-1], q_asst[0]
+            vals[:s] = score(ctx, y_ctx)
             if len(rest):
-                vals[s:s + len(rest)] = xent(rest, Y[t0 + s:t0 + s + len(rest)], renorm)
+                vals[s:s + len(rest)] = score(rest, y_rest)
             vals -= best[t0:t0 + len(vals)]
-            stars[b].append(f(xent(asst[0], Y[t0 + len(ctx) - 1], renorm)    # first completion token, assistant turn
-                              - best[t0 + len(ctx) - 1]))
+            stars[b].append(f(score(asst[0], y_star)                # first completion token, assistant turn
+                              - best[t0 + s - 1]))
 
             curves['model'][b].append(to_grid(f(vals), blocks[b]))
             for k, r in ref.items():                                # only where the model is scored
@@ -1015,8 +1177,8 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
     # ax.set_xticks(ticks, labels)
     ax.set_title(title)
     ax.set_xlabel('trial')
-    ax.set_ylabel(ylabel(perplexity, kl, renorm))
-    ax.legend(loc='upper right' if perplexity else 'lower right', fontsize='small')
+    ax.set_ylabel(ylabel(perplexity, kl, renorm) if iso is None else 'KL(with ‖ without earlier blocks)')
+    ax.legend(loc='upper right' if perplexity or iso is not None else 'lower right', fontsize='small')
 
 
 """Token equivalence: collapse nuisance variants (e.g. 'nature' vs ' nature') before scoring"""
@@ -1040,6 +1202,22 @@ def task_logprobs_gpu(logits, task_toks, equiv=None, chunk=512):
             out.append(torch.stack([torch.logsumexp(c[:, g], dim=-1) for g in groups], dim=-1) - lse)
     return torch.cat(out).cpu().numpy()
 
+
+
+def full_kl_gpu(zp, zq, groups=None):
+    """KL(P ‖ Q) per row between the distributions of two logits tensors (rows, vocab), on
+    their device; returned on the CPU. groups: index tensors of tokens to count as one
+    outcome each (task tokens' equivalence classes), or None."""
+    lp, lq = torch.log_softmax(zp.float(), -1), torch.log_softmax(zq.float(), -1)
+    terms = torch.where(lp > -torch.inf, lp.exp() * (lp - lq), 0.0)        # 0 log 0 = 0
+    kl = terms.sum(-1)
+    if groups:
+        members = torch.cat(groups)
+        kl = kl - terms[:, members].sum(-1)
+        cp = torch.stack([torch.logsumexp(lp[:, g], -1) for g in groups], -1)
+        cq = torch.stack([torch.logsumexp(lq[:, g], -1) for g in groups], -1)
+        kl = kl + torch.where(cp > -torch.inf, cp.exp() * (cp - cq), 0.0).sum(-1)
+    return kl.cpu().numpy()
 
 def top_tokens_gpu(logits, exclude=(), chunk=512):
     """The most likely token at each position, over the whole vocabulary and over all but

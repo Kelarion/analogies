@@ -20,7 +20,7 @@ import torch
 
 import util
 import super_experiments as sxp
-from icl_utils import ChatLM, split_block
+from icl_utils import ChatLM, split_block, kl_rows
 import prompts
 import vocabulary
 import geometry
@@ -140,9 +140,13 @@ class ICLModel(sxp.Model):
         equiv = pool.equiv
 
         # top_ids, top_lp: the most likely token over the whole vocabulary and over text
-        # only, per row of logp_ctx (see ChatLM.run_trial); top_vocab decodes their ids
-        self.metrics = {'logp_ctx': [], 'ans': [], 'task_tokens': [], 'prompts': [],
-                        'top_ids': [], 'top_lp': [], 'top_vocab': {},
+        # only, per row of logp_ctx (see ChatLM.run_trial); top_vocab decodes their ids.
+        # kl_iso, kl_iso_task: per row of logp_ctx, KL(P ‖ Q) from the model's prediction (P)
+        # to its prediction with the block scored on its own, without the blocks before it or
+        # any reasoning (Q; see ChatLM.run_isolated), over the whole vocabulary and over the
+        # task alphabet (renormalised, as xent). plot_icl(..., iso=...) plots either
+        self.metrics = {'logp_ctx': [], 'kl_iso': [], 'kl_iso_task': [], 'ans': [], 'task_tokens': [],
+                        'prompts': [], 'top_ids': [], 'top_lp': [], 'top_vocab': {},
                         'data': dict(data, blocks=blocks, X=X, prompt=prompt)}
         assigner = None
         space = geometry.get_space(self.embedding, pool, lm, self.model_name)
@@ -166,12 +170,20 @@ class ICLModel(sxp.Model):
             self.metrics['similarity'].append(space.cosines(task_toks).astype(np.float16))
 
             code = data['code'][i] if 'code' in data else None
-            system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks, code)
-            lp, a, ids, top = lm.run_trial(
-                self.mode, blks, task_toks, k_show=self.k_show, k_hide=self.k_hide,
-                system_prompt=system_prompt, think=self.think,
-                thinking_budget=self.thinking_budget, equiv=equiv, block_text=block_text,
-                effort_without_thinking=self.effort_without_thinking, **template_kwargs)
+            system_prompt, block_text, first_text = self._prompt(lm, prompt, blks, task_toks, code)
+            trial_kwargs = dict(k_show=self.k_show, k_hide=self.k_hide,
+                                system_prompt=system_prompt, think=self.think, equiv=equiv,
+                                effort_without_thinking=self.effort_without_thinking,
+                                **template_kwargs)
+            lp, a, ids, top, ref = lm.run_trial(self.mode, blks, task_toks, block_text=block_text,
+                                                thinking_budget=self.thinking_budget,
+                                                return_hidden=True, **trial_kwargs)
+            lp_iso, kl_iso = lm.run_isolated(self.mode, blks, task_toks, block_text=first_text,
+                                             ref=ref, **trial_kwargs)
+            del ref
+            self.metrics['kl_iso'].append({k: v.astype(np.float32) for k, v in kl_iso.items()})
+            self.metrics['kl_iso_task'].append(
+                {k: kl_rows(lp[k], lp_iso[k]).astype(np.float32) for k in lp})
 
             self.metrics['logp_ctx'].append(lp)
             self.metrics['ans'].append(a)
@@ -187,14 +199,20 @@ class ICLModel(sxp.Model):
 
     def _prompt(self, lm, prompt, blks, task_toks, code=None):
         """The task's prompt rendered for one sample: (system message or None, text
-        before each block or None). code: the sample's data['code'], for the hint's
-        remapping."""
+        before each block or None, text before each block were it the first block or None).
+        The last is for scoring blocks on their own (metrics['kl_iso']): a block keeps its
+        own fields but loses the transition and relabelling text, which describe a previous
+        block; the system message stays the same. code: the sample's data['code'], for the
+        hint's remapping."""
         if prompt is None:
-            return None, None
+            return None, None, None
         splits = [split_block(trials, self.k_show, self.k_hide) for trials in blks]
         word = lambda t: lm.tokenizer.decode([task_toks[t]]).strip()
-        out = prompts.render(prompt['spec'], prompt['facts'], self.mode,
-                             vocabulary.base_pool(self.tokens),
-                             prompts.finals_of(splits, code, word))
+        finals = prompts.finals_of(splits, code, word)
+        render = lambda f: prompts.render(prompt['spec'], prompt['facts'], self.mode,
+                                          vocabulary.base_pool(self.tokens), f)
+        out = render(finals)
         system = {'role': 'system', 'content': out['system']} if out['system'] else None
-        return system, out['blocks']
+        # each block in the first block's place: the system text still comes from the last
+        first = [render([dict(f, remap=None)] + finals[1:])['blocks'][0] for f in finals]
+        return system, out['blocks'], first
