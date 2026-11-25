@@ -607,11 +607,12 @@ class ChatLM:
                      think=True, equiv=None, block_text=None, ref=None, **template_kwargs):
         """
         Every block scored without the blocks before it, and without reasoning, for comparing
-        with run_trial's scores. Forward passes only: no generation. Returns logp, kl:
+        with run_trial's scores. Forward passes only: no generation. Returns logp, top, kl:
           logp  {(role, block): rows}, keyed and shaped like run_trial's logp_ctx: the task
                 tokens' log-probs (normalised over the whole vocabulary) at the same tokens of
                 the same trials, so kl_rows(logp_ctx[k], logp[k]) is the KL over the task
                 alphabet
+          top   {'ids': {...}, 'lp': {...}}, as run_trial's top, for the same rows
           kl    with ref (run_trial's 5th value, from return_hidden=True), the KL from
                 run_trial's distribution to this one over the whole vocabulary, row by row
                 (see full_kl): {(role, block): (rows,)}, nan where nothing predicts; else None
@@ -631,7 +632,7 @@ class ChatLM:
         assert len(block_text) == len(blocks), "block_text needs one entry per block"
         prompt_kwargs = (dict(template_kwargs, **self.no_think_kwargs)
                          if not think and mode != 'raw' else template_kwargs)
-        logp, kl = {}, (None if ref is None else {})
+        logp, top, kl = {}, {'ids': {}, 'lp': {}}, (None if ref is None else {})
 
         def take(seq, positions):
             """Score seq and fill in logp (and kl) for {key: positions}."""
@@ -639,10 +640,13 @@ class ChatLM:
             if ref is not None:
                 keep = np.unique(np.concatenate(list(positions.values())))
                 keep = keep[keep >= 0]
-            lp, _, _, *rep = self.score(seq, task_toks, equiv, keep)
+            lp, top_ids, top_lp, *rep = self.score(seq, task_toks, equiv, keep)
             for key, pos in positions.items():
-                logp[key] = np.full((len(pos), lp.shape[1]), np.nan, lp.dtype)
-                logp[key][pos >= 0] = lp[pos[pos >= 0]]
+                ok = pos >= 0                                   # nothing predicts pos -1
+                for out, a, fill in [(logp, lp, np.nan), (top['ids'], top_ids, -1),
+                                     (top['lp'], top_lp, np.nan)]:
+                    out[key] = np.full((len(pos),) + a.shape[1:], fill, a.dtype)
+                    out[key][ok] = a[pos[ok]]
                 if ref is not None:
                     vp, hp = ref[key]
                     vq, hq = self._rows_of(rep[0], keep, pos)
@@ -677,7 +681,7 @@ class ChatLM:
         positions = {(r, last): np.arange(s - 1, e) for r, _, s, e in spans}
         positions[('assistant', last)] = np.arange(L - 1, L + len(target))
         take(torch.cat([ids, target]), positions)
-        return logp, kl
+        return logp, top, kl
 
 def test_token_logits(logs, spans, blocks, Y, task_toks, k_show=None, k_hide=None, ans=None):
     """
@@ -1064,18 +1068,22 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
             default); False keeps them normalised over the whole vocabulary, so
             probability on other tokens (e.g. <|im_end|>) counts against it. The
             references are distributions over the task alphabet either way.
-    iso:    plot KL(with ‖ without) at each token instead, as stored per row of logp_ctx:
-            how much the earlier blocks change the model's prediction, and when thinking, the
-            reasoning trace too, at the final block's completion (see ChatLM.run_isolated).
-            metrics['kl_iso'] for the KL over the whole vocabulary, metrics['kl_iso_task'] for
-            the task alphabet; renorm doesn't apply. Block 0 has no earlier blocks, so its
-            curve is a check that the two runs line up: 0 up to numerical noise. Doesn't
-            combine with refs, kl or perplexity.
+    iso:    plot KL(with ‖ without) at each token instead: how much the earlier blocks change
+            the model's prediction, and when thinking, the reasoning trace too, at the final
+            block's completion (see ChatLM.run_isolated). One dict per sample, either
+              metrics['kl_iso']   the KL over the whole vocabulary, as stored (renorm
+                                  doesn't apply), or
+              metrics['logp_iso'] the same blocks' task-token log-probs, for the KL over the
+                                  task alphabet (renorm=False: the task tokens and the rest
+                                  of the vocabulary as one more outcome; see kl_rows)
+            Block 0 has no earlier blocks, so its curve is a check that the two runs line up:
+            0 up to numerical noise. Doesn't combine with refs, kl or perplexity.
     """
     if iso is not None and (refs or kl or perplexity):
         raise ValueError("iso plots KL(with ‖ without earlier blocks), which takes no refs, kl or perplexity")
     refs = dict(refs)
     f = (lambda v: np.exp(-v)) if perplexity else (lambda v: v)
+    stored_kl = iso is not None and np.ndim(iso[0][('user', 0)]) == 1    # kl_iso, not logp_iso
 
     nblk = len(data['blocks'][0])
     colors = plt.get_cmap(cmap)(np.linspace(0, 0.85, nblk))
@@ -1118,7 +1126,7 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
                 score = lambda lp, y: xent(lp, y, renorm)
                 y_ctx, y_rest, y_star = Y[t0:t0 + s], Y[t0 + s:t0 + s + len(rest)], Y[t0 + s - 1]
             else:                                                   # against the same rows, block alone
-                score = lambda lp, kl: kl                           # stored, row for row
+                score = (lambda lp, kl: kl) if stored_kl else (lambda lp, lq: kl_rows(lp, lq, renorm))
                 q_asst = iso[i][('assistant', b)]
                 y_ctx, y_rest, y_star = iso[i][('user', b)], q_asst[1:-1], q_asst[0]
             vals[:s] = score(ctx, y_ctx)
@@ -1177,7 +1185,10 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
     # ax.set_xticks(ticks, labels)
     ax.set_title(title)
     ax.set_xlabel('trial')
-    ax.set_ylabel(ylabel(perplexity, kl, renorm) if iso is None else 'KL(with ‖ without earlier blocks)')
+    ax.set_ylabel(ylabel(perplexity, kl, renorm) if iso is None else
+                  'KL(with ‖ without earlier blocks)' + (', whole vocabulary' if stored_kl else
+                                                         ', task alphabet' if renorm else
+                                                         ', task tokens + rest'))
     ax.legend(loc='upper right' if perplexity or iso is not None else 'lower right', fontsize='small')
 
 
