@@ -37,9 +37,9 @@ task_args = {'task': icl_tasks.ExhaustiveRelationTask,
         }
 
 mod_args = {'model': ICLModel,
-        #     'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it'],
-            'model_name': ['Qwen/Qwen3.5-35B-A3B-Base', 'google/gemma-4-31B'],
-        #     'think': False,        
+        #     'model_name': ['Qwen/Qwen3.8-27B', 'google/gemma-4-31B-it', 'thinkingmachines/Inkling-2-Mini'],
+            'model_name': ['Qwen/Qwen3.5-35B-A3B-Base', 'google/gemma-4-31B', 'thinkingmachines/Inkling-2-Mini'],
+            'think': False,
         }
 
 # %% Check what a prompt says for a task, without a model (symbols shown as w1, w2, ...)
@@ -69,11 +69,13 @@ these |= {'share_toks': False}
 # these |= {'num_trials': [[72,72]]}       # a list: any of these
 # these |= {'k': lambda k: k >= 8} 
 # these |= {'delim': ','}
-these |= {'index': 1}
+these |= {'index': 0}
 these |= {'d':1}
 these |= {'think': False}
 these |= {'delim': ','}
 these |= {'categories': {'kmeans100'}}
+these |= {'effort':'low'}
+# these |= {'group': None}
 # these |= {'tokens': icl_utils.Vocabulary('words', content=True)}
 # these |= {'show': [None, {'node'}]}
 
@@ -126,6 +128,11 @@ refs = {
         # 'kernel': partial(icl_utils.cue_ref, weights=(1,1,1))
         }
 
+# def heldout_ll(trace):
+
+#     perf = trace['top_any'] == trace['word']
+    
+
 isw.plot_heldout(records, prm, hue=lines, rows=rows, cols=cols, 
                  where=these, refs=refs, kl=kl,
                  err='iqr', traces=0.1, renorm=False)
@@ -160,7 +167,10 @@ deez = {
         # 'target': 0,
         # 'geometry': geo.Geometry({'action','node'}, within=2, between=0.5, beta=2),
         'show': [{'node'}],
+        # 'show': None,
         'group': {'action','node'},
+        # 'group': {'block'},
+        # 'group': None,
         }
 
 refs = {

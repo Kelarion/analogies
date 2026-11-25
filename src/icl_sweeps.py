@@ -42,7 +42,7 @@ import itertools
 
 import networkx as nx
 
-from icl_utils import xent, plot_icl, split_block, ylabel, spread, draw_traces, block_code
+from icl_utils import xent, kl_rows, plot_icl, split_block, ylabel, spread, draw_traces, block_code
 
 
 # -- choosing runs ---------------------------------------------------------------------
@@ -608,6 +608,19 @@ def trace(record, refs=(), keep=None):
                                is the assistant turn's prediction, after the template's
                                header; in 'raw' and 'single' its first row is the user
                                span's last, so ll and ll_assistant agree on that token.
+        ll_iso, task_mass_iso, top_any_iso, p_top_any_iso, top_text_iso, p_top_text_iso,
+        ll_iso_assistant, ...  the same from the comparison run, which scores each block on
+                               its own, without the blocks before it or any reasoning
+                               (ICLModel's logp_iso, top_ids_iso, top_lp_iso)
+        kl_iso, kl_iso_task    KL(with ‖ without earlier blocks) at that row, from ll's
+                               prediction to ll_iso's, over the whole vocabulary (stored) and
+                               over the task alphabet (from the two), as in plot_icl(...,
+                               iso=...). From the user span, like ll
+        kl_iso_assistant, kl_iso_task_assistant
+                               the same from the assistant span, like ll_assistant; when
+                               thinking, this also measures the reasoning trace
+                               (runs saved before these were recorded leave out what they
+                               lack; runs that stored kl_iso_task have no ll_iso)
         ref_<name>             each reference predictor's log-probabilities, as a vector
                                the same way
         kept                   (given keep) whether block_mask keeps the token's block
@@ -630,7 +643,10 @@ def trace(record, refs=(), keep=None):
     m, a = record['metrics'], record['model_args']
     data, refs = m['data'], dict(refs)
     k_show, k_hide = a.get('k_show'), a.get('k_hide')
-    has_top = 'top_ids' in m
+    # the runs whose scores are stored, as (column suffix, log-probs, top ids, top log-probs)
+    runs = [('', 'logp_ctx', 'top_ids', 'top_lp'), ('_iso', 'logp_iso', 'top_ids_iso', 'top_lp_iso')]
+    runs = [r for r in runs if r[1] in m]
+    has_top = {sfx: tid in m for sfx, _, tid, _ in runs}
     M = block_mask(record, keep)
     word_of = lambda j: m['top_vocab'].get(int(j)) if j >= 0 else None
 
@@ -643,23 +659,19 @@ def trace(record, refs=(), keep=None):
         alphabets.append(tuple(names))
         for b, trials in enumerate(blocks):
             t0 = int(np.argmax(B == b))
-            ctx, asst = lpc[('user', b)], lpc[('assistant', b)]
-            n_ctx, comp = len(ctx) - 1, split_block(trials, k_show, k_hide)[1]
+            n_ctx, comp = len(lpc[('user', b)]) - 1, split_block(trials, k_show, k_hide)[1]
             n = sum(len(tr) for tr in trials)
-            V = ctx.shape[1]
-            span = {}                                       # 'user' / 'assistant' -> (n, V) rows
-            span['user'] = np.full((n, V), np.nan)
-            span['user'][:n_ctx + 1] = ctx[:n_ctx + 1]      # row r predicts token r
-            span['assistant'] = np.full((n, V), np.nan)
-            span['assistant'][n_ctx:n_ctx + len(comp)] = asst[:len(comp)]
-            tops = {}
-            if has_top:                                     # the same rows of the top tokens
-                for side, lo, hi, s0 in [('user', 0, n_ctx + 1, 0), ('assistant', n_ctx, n_ctx + len(comp), 0)]:
-                    tid, tlp = np.full((n, 2), -1), np.full((n, 2), np.nan)
-                    src_i, src_l = m['top_ids'][i][(side, b)], m['top_lp'][i][(side, b)]
-                    k = min(hi - lo, len(src_i))
-                    tid[lo:lo + k], tlp[lo:lo + k] = src_i[:k], src_l[:k]
-                    tops[side] = (tid, tlp)
+
+            def place(src, side, fill):
+                """A span's stored rows (src[(side, b)]) on the block's tokens: the user
+                span's row r predicts token r; the assistant span's rows the completion."""
+                a = src[(side, b)]
+                out = np.full((n,) + a.shape[1:], fill, np.result_type(a, type(fill)))
+                lo, k = (0, n_ctx + 1) if side == 'user' else (n_ctx, len(comp))
+                k = min(k, len(a))
+                out[lo:lo + k] = a[:k]
+                return out
+
             trial = np.repeat(np.arange(len(trials)), [len(tr) for tr in trials])
             pos = np.concatenate([np.arange(len(tr)) for tr in trials])
             real = np.repeat([len(tr) - 1 for tr in trials], [len(tr) for tr in trials])
@@ -677,16 +689,25 @@ def trace(record, refs=(), keep=None):
                    'y': list(Yb[:, sym]),
                    'n_valid': (Yb > 0).sum(-1)}
             for side, suffix in [('user', ''), ('assistant', '_assistant')]:
-                lp = span[side]
-                with np.errstate(invalid='ignore', divide='ignore'):
-                    row['ll' + suffix] = list(lp[:, sym])
-                    mass = np.exp(spc.logsumexp(lp, -1))
-                row['task_mass' + suffix] = np.where(np.isnan(lp).all(-1), np.nan, mass)
-                if has_top:
-                    tid, tlp = tops[side]
-                    for c, nm in enumerate(['any', 'text']):
-                        row[f'top_{nm}{suffix}'] = [word_of(j) for j in tid[:, c]]
-                        row[f'p_top_{nm}{suffix}'] = np.exp(tlp[:, c])
+                span = {}
+                for run, lps, tids, tlps in runs:
+                    lp = span[run] = place(m[lps][i], side, np.nan)
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        row[f'll{run}{suffix}'] = list(lp[:, sym])
+                        mass = np.exp(spc.logsumexp(lp, -1))
+                    row[f'task_mass{run}{suffix}'] = np.where(np.isnan(lp).all(-1), np.nan, mass)
+                    if has_top[run]:
+                        tid, tlp = place(m[tids][i], side, -1), place(m[tlps][i], side, np.nan)
+                        for c, nm in enumerate(['any', 'text']):
+                            row[f'top_{nm}{run}{suffix}'] = [word_of(j) for j in tid[:, c]]
+                            row[f'p_top_{nm}{run}{suffix}'] = np.exp(tlp[:, c])
+                if 'kl_iso' in m:                           # one value per row, placed like ll
+                    row['kl_iso' + suffix] = place(m['kl_iso'][i], side, np.nan)
+                if 'kl_iso_task' in m:                      # stored by runs before logp_iso
+                    row['kl_iso_task' + suffix] = place(m['kl_iso_task'][i], side, np.nan)
+                elif '_iso' in span:
+                    with np.errstate(invalid='ignore'):
+                        row['kl_iso_task' + suffix] = kl_rows(span[''], span['_iso'])
             with np.errstate(divide='ignore'):
                 for k, Pk in P.items():
                     Q = Pk[ts]
