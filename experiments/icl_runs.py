@@ -29,6 +29,7 @@ task_args = {
              'edges': 4,
              'index': [0,1,2],
              'all_edges': True, 
+             'control': [True, False],
              # 'index': [2,4],
              # 'target': [0,1,2],
             # 'index': 0,
@@ -45,7 +46,7 @@ task_args = {
              # the prompt, tailored to the task (see GrammarTask); left out, there is none. E.g.
              # 'explicitness': [0, 2],        # 0 none, 1 vague, 2 moderate, 3 explicit
             #  'explicitness': 2, 
-             'explicitness': (2, 1,0),
+             'explicitness': (2,1,0),
              # 'describe_format': True,
              'describe_format': (True, True, False), 
              'describe_task': (True, True, False),

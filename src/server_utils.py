@@ -16,6 +16,9 @@ STATUS = 'jobs/sweep_status.py'
 
 # Submitting from elsewhere (e.g. the laptop): the ssh host, and the repo's path there.
 REMOTE_HOST = os.environ.get('ICL_REMOTE_HOST', 'mila')
+# What the jobs run, so what must match between here and the cluster when submitting from here.
+# Anything else (sweep definitions like icl_runs.py, notebooks, plots) can differ freely.
+CODE_PATHS = ('src', 'jobs', 'pyproject.toml', 'uv.lock')
 REMOTE_REPO = os.environ.get('ICL_REMOTE_REPO', '~/analogies')
 
 import socket
@@ -690,6 +693,20 @@ def _remote(cmd, capture=True):
     return out.stdout.strip() if capture else None
 
 
+def _code_id(cwd=REPO_DIR):
+    """The committed state of CODE_PATHS: git's hash of each at HEAD ('-' if absent)."""
+    ids = []
+    for p in CODE_PATHS:
+        r = subprocess.run(['git', 'rev-parse', f'HEAD:{p}'], cwd=cwd, capture_output=True, text=True)
+        ids.append(r.stdout.strip() if r.returncode == 0 else '-')
+    return ' '.join(ids)
+
+
+_CODE_ID_SH = ('for p in ' + ' '.join(CODE_PATHS) + '; do git rev-parse HEAD:$p 2>/dev/null || echo -; done '
+               "| paste -sd' '; git status --porcelain --untracked-files=no -- "
+               + ' '.join(CODE_PATHS) + ' | wc -l')     # the same, run in the cluster's checkout
+
+
 def _git(*args, cwd=REPO_DIR):
     return subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True).stdout.strip()
 
@@ -712,8 +729,12 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
 
     remote: None submits with sbatch here if this machine has it, else over ssh to
         REMOTE_HOST (pickles written here, copied over with rsync). True/False forces it.
-    check_commit: when submitting remotely, refuse unless the cluster's checkout is at
-        this repo's commit, since the jobs run the cluster's code on pickles made here.
+    check_commit: when submitting remotely, refuse unless the cluster's checkout has the
+        same committed code as here (CODE_PATHS: src/, jobs/, pyproject.toml, uv.lock), since
+        the jobs run the cluster's code on pickles made here. Other files, like the sweep
+        definitions, needn't be committed or synced at all.
+    Each sweep folder gets a definition.txt: task_args, mod_args, these options and the code
+    commit, so a sweep's record doesn't depend on the definition being committed.
     ensure_weights: if the model class has a model_name field, check that each model in the
         sweep is fully in the cluster's Hugging Face cache; for any that isn't, first submit
         a CPU job that downloads it, and make the array wait for that job to succeed.
@@ -749,16 +770,22 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     name = name or time.strftime('%Y%m%d-%H%M%S')
 
     if remote:
-        here = _git('rev-parse', 'HEAD')
-        if _git('status', '--porcelain', '--untracked-files=no'):
-            print('warning: uncommitted changes here; the jobs will run the cluster\'s code')
+        here = _code_id()
+        if _git('status', '--porcelain', '--untracked-files=no', '--', *CODE_PATHS):
+            print('warning: uncommitted changes to the code here (src/, jobs/, ...); the jobs '
+                  'run the cluster\'s code, so they won\'t see them')
         info = _remote('echo $SCRATCH; echo ${ICL_RESULTS:-$SCRATCH/icl_results}; '
                        'echo ${ICL_SWEEPS:-$SCRATCH/icl_sweeps}; '
-                       f'cd {REMOTE_REPO} && pwd && git rev-parse HEAD').splitlines()
-        scratch, results, sweeps, repo, there = info[-5:]   # last lines, past any login chatter
+                       f'cd {REMOTE_REPO} && pwd && {_CODE_ID_SH}').splitlines()
+        scratch, results, sweeps, repo, there, there_dirty = info[-6:]   # past any login chatter
         if check_commit and here != there:
-            raise RuntimeError(f'cluster checkout is at {there[:8]}, this repo at {here[:8]}: '
-                               'push here and pull there first (or check_commit=False)')
+            raise RuntimeError('the code the jobs run (' + ', '.join(CODE_PATHS) + ') differs '
+                               'between here and the cluster at their latest commits: push here '
+                               'and pull there first (or check_commit=False). Other files, like '
+                               'the sweep definitions, needn\'t match.')
+        if int(there_dirty.strip() or 0):
+            print('warning: the cluster\'s checkout has uncommitted changes to the code; '
+                  'the jobs will run them')
         sweep = os.path.join(sweeps, name)
     else:
         scratch, repo, results = _BASE, REPO_DIR, SAVE_DIR.rstrip('/')
@@ -796,6 +823,9 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         shutil.copy(path_, os.path.join(local, os.path.basename(path_)))
     with open(os.path.join(local, 'sweep.json'), 'w') as f:
         json.dump({'n_task': n_task, 'n_tot': n_tot, 'per_job': per_job}, f)
+    _write_definition(local, task_args, mod_args,
+                      dict(per_job=per_job, max_parallel=max_parallel, exclude=exclude,
+                           remote=remote, ensure_weights=ensure_weights))
     if verbose:
         print(f'{n_task} tasks x {len(models)} models = {n_tot} combinations, '
               f'in {n_jobs} jobs of up to {per_job}, in {sweep}'
@@ -857,6 +887,18 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     _record_job(sweep, job, remote)
     print(f'Submitted batch job {job} ({n_jobs} array tasks)')
     return sweep
+
+
+def _write_definition(folder, task_args, mod_args, options):
+    """A readable record of what a sweep was asked to run: definition.txt in its folder."""
+    commit = _git('rev-parse', 'HEAD') or '?'
+    dirty = bool(_git('status', '--porcelain', '--untracked-files=no', '--', *CODE_PATHS))
+    fmt = lambda d: '{\n' + ''.join(f'    {k!r}: {v!r},\n' for k, v in d.items()) + '}'
+    with open(os.path.join(folder, 'definition.txt'), 'w') as f:
+        f.write(f"# submitted {time.strftime('%Y-%m-%d %H:%M:%S')} from {socket.gethostname()}\n"
+                f"# code here: {commit}" + (' + uncommitted changes' if dirty else '') + '\n'
+                f'task_args = {fmt(task_args)}\n\nmod_args = {fmt(mod_args)}\n\n'
+                f'options = {options!r}\n')
 
 
 def _model_names(mod_args, models):
