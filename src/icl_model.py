@@ -20,7 +20,7 @@ import torch
 
 import util
 import super_experiments as sxp
-from icl_utils import ChatLM, split_block, kl_rows
+from icl_utils import ChatLM, split_block
 import prompts
 import vocabulary
 import geometry
@@ -141,12 +141,14 @@ class ICLModel(sxp.Model):
 
         # top_ids, top_lp: the most likely token over the whole vocabulary and over text
         # only, per row of logp_ctx (see ChatLM.run_trial); top_vocab decodes their ids.
-        # kl_iso, kl_iso_task: per row of logp_ctx, KL(P ‖ Q) from the model's prediction (P)
-        # to its prediction with the block scored on its own, without the blocks before it or
-        # any reasoning (Q; see ChatLM.run_isolated), over the whole vocabulary and over the
-        # task alphabet (renormalised, as xent). plot_icl(..., iso=...) plots either
-        self.metrics = {'logp_ctx': [], 'kl_iso': [], 'kl_iso_task': [], 'ans': [], 'task_tokens': [],
-                        'prompts': [], 'top_ids': [], 'top_lp': [], 'top_vocab': {},
+        # logp_iso, top_ids_iso, top_lp_iso: the same, with each block scored on its own,
+        # without the blocks before it or any reasoning (see ChatLM.run_isolated). kl_iso:
+        # per row, KL(P ‖ Q) over the whole vocabulary from the model's prediction (P) to that
+        # one (Q); the KL over the task alphabet is kl_rows(logp_ctx, logp_iso).
+        # plot_icl(..., iso=...) plots either
+        self.metrics = {'logp_ctx': [], 'logp_iso': [], 'kl_iso': [], 'ans': [], 'task_tokens': [],
+                        'prompts': [], 'top_ids': [], 'top_lp': [], 'top_ids_iso': [],
+                        'top_lp_iso': [], 'top_vocab': {},
                         'data': dict(data, blocks=blocks, X=X, prompt=prompt)}
         assigner = None
         space = geometry.get_space(self.embedding, pool, lm, self.model_name)
@@ -178,18 +180,20 @@ class ICLModel(sxp.Model):
             lp, a, ids, top, ref = lm.run_trial(self.mode, blks, task_toks, block_text=block_text,
                                                 thinking_budget=self.thinking_budget,
                                                 return_hidden=True, **trial_kwargs)
-            lp_iso, kl_iso = lm.run_isolated(self.mode, blks, task_toks, block_text=first_text,
-                                             ref=ref, **trial_kwargs)
+            lp_iso, top_iso, kl_iso = lm.run_isolated(self.mode, blks, task_toks,
+                                                      block_text=first_text, ref=ref, **trial_kwargs)
             del ref
+            self.metrics['logp_iso'].append(lp_iso)
+            self.metrics['top_ids_iso'].append(top_iso['ids'])
+            self.metrics['top_lp_iso'].append(top_iso['lp'])
             self.metrics['kl_iso'].append({k: v.astype(np.float32) for k, v in kl_iso.items()})
-            self.metrics['kl_iso_task'].append(
-                {k: kl_rows(lp[k], lp_iso[k]).astype(np.float32) for k in lp})
 
             self.metrics['logp_ctx'].append(lp)
             self.metrics['ans'].append(a)
             self.metrics['top_ids'].append(top['ids'])
             self.metrics['top_lp'].append(top['lp'])
-            seen = np.unique(np.concatenate([v.ravel() for v in top['ids'].values()]))
+            seen = np.unique(np.concatenate([v.ravel() for t in (top, top_iso)
+                                             for v in t['ids'].values()]))
             self.metrics['top_vocab'].update(
                 {int(t): lm.tokenizer.decode([int(t)]) for t in seen
                  if t >= 0 and int(t) not in self.metrics['top_vocab']})
@@ -200,7 +204,7 @@ class ICLModel(sxp.Model):
     def _prompt(self, lm, prompt, blks, task_toks, code=None):
         """The task's prompt rendered for one sample: (system message or None, text
         before each block or None, text before each block were it the first block or None).
-        The last is for scoring blocks on their own (metrics['kl_iso']): a block keeps its
+        The last is for scoring blocks on their own (metrics['logp_iso']): a block keeps its
         own fields but loses the transition and relabelling text, which describe a previous
         block; the system message stays the same. code: the sample's data['code'], for the
         hint's remapping."""

@@ -52,6 +52,18 @@ class GrammarTask(sxp.Task):
     data['code'] (code[b, r]: grammar token r's symbol in block b), and each grammar token's
     kind as data['kinds']. The model only maps symbols to its own tokens.
 
+    control: a control without the shared structure. The blocks are drawn as usual, then
+    each block's tokens, other than the delimiters, are put in a random order of their own
+    (a fresh permutation for every block of every sample). So each block keeps its
+    vocabulary, its word counts and its trial lengths, but nothing about order carries over
+    between blocks (or holds within one). The shuffle has a random stream of its own, so
+    every other draw is as without control: a control run is the shuffle of the run with the
+    same seed. Y becomes the true distribution of the shuffled sequence: at each token, the
+    block's tokens not used yet, in proportion (so a block's last token is certain, given the
+    block's tokens), and the delimiter where it was. The prompt is unchanged, and
+    data['automaton'] and data['holdout'] still describe the grammar the blocks were drawn
+    from, which analyses that read the structure (e.g. icl_sweeps.fixed_answers) assume.
+
     The grammar is either given (grammar=..., or a Build of one), or left out and made by
     make_grammar() from the task's own fields, as the subclasses at the end of this file do.
     Either way it is made when the task is, i.e. inside the job. A subclass can replace it
@@ -74,6 +86,7 @@ class GrammarTask(sxp.Task):
     hint: int = 0
     answer_only: bool = False
     prompt: str = None
+    control: bool = False       # shuffle each block's tokens (see above)
 
     def __post_init__(self):
         # stored as an int however it's given (2, np.int64(2), 'remap'), before .args is
@@ -267,6 +280,8 @@ class GrammarTask(sxp.Task):
 
             X, Y = np.array(seq), np.array(pr)
             trl_blk = np.repeat(block, trial_len)                 # block of each position
+            if self.control:                                      # a stream no block uses
+                X, Y = self._shuffle_blocks(X, trl_blk, Y.shape[1], stream(s, nblk + 1))
 
             code, V = self._code(stream(s, 0), nblk)        # grammar token -> symbol, per block
 
@@ -294,6 +309,22 @@ class GrammarTask(sxp.Task):
         return {'X': seqs, 'Y': Ys, 'B': which_block, 'blocks': blks, 'V': V,
                 'code': codes, 'kinds': self._kinds(),
                 'prompt': {'spec': spec, 'facts': facts}}
+
+    @staticmethod
+    def _shuffle_blocks(X, blk, nt, rng):
+        """The control (see control): grammar tokens X, with blk the block of each, put in a
+        random order within each block, the delimiters (0) staying put; and Y (len(X), nt),
+        the true distribution of that: what is left of the block's tokens, in proportion."""
+        X, Y = X.copy(), np.zeros((len(X), nt))
+        for b in np.unique(blk):
+            idx = np.flatnonzero((blk == b) & (X != 0))
+            X[idx] = X[idx][rng.permutation(len(idx))]
+            left = np.bincount(X[idx], minlength=nt).astype(float)
+            for t in idx:
+                Y[t] = left / left.sum()
+                left[X[t]] -= 1
+        Y[X == 0, 0] = 1
+        return X, Y
 
 
 @dataclass(kw_only=True)
