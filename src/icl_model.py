@@ -25,7 +25,6 @@ import prompts
 import vocabulary
 import geometry
 import categories
-import hf_models
 
 
 # -- model cache ------------------------------------------------------------------------
@@ -38,20 +37,21 @@ def get_lm(model_name, prepend_bos=False):
     different model first drops the current one, since two large models won't share a GPU
     (any `lm` you still hold elsewhere keeps the old one alive; del it first)."""
     if model_name not in _BRIDGES:
-        from transformers import AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformer_lens.model_bridge import TransformerBridge
 
         _BRIDGES.clear(); _HF.clear()
         gc.collect(); torch.cuda.empty_cache()
-        # the auto-class the checkpoint calls for, SDPA where supported (see hf_models)
-        hf_model = hf_models.load_model(model_name, device_map="cuda")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.bfloat16, device_map="cuda",
+            attn_implementation="sdpa")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # transformer-lens' bridge, or a hook-less stand-in if it doesn't know the model
-        _BRIDGES[model_name] = hf_models.make_bridge(model_name, hf_model, tokenizer, device="cuda")
+        _BRIDGES[model_name] = TransformerBridge.boot_transformers(
+            model_name, hf_model=hf_model, tokenizer=tokenizer, device="cuda")
         _HF[model_name] = hf_model
         # the bridge may switch this back to eager; check:
         # print(hf_model.config.get_text_config()._attn_implementation)
-    lm = ChatLM(_BRIDGES[model_name], prepend_bos=prepend_bos,
-                **hf_models.chat_settings(_HF[model_name].config))
+    lm = ChatLM(_BRIDGES[model_name], prepend_bos=prepend_bos)
     lm.hf_model = _HF[model_name]
     return lm
 
@@ -83,6 +83,9 @@ class ICLModel(sxp.Model):
     categories       where similar tokens come from, with a group: a set of sources, e.g.
                      {'hypernyms'}, {'frames', 'hypernyms'}, {'kmeans100'}, {'semibmf300'}
                      (see geometry.py)
+    scramble         a control, with a group: None, 'roles' (role groups pair mismatched
+                     roles across blocks) or 'all' (tokens selected as for the group, then
+                     shuffled across the shown symbols); see geometry.py
     embedding        what similarity is measured in ('input', 'canonical', or an .npz): the
                      tokens are selected by it, with a group, and every run records each
                      sample's similarities in it (metrics['similarity'], see geometry.py)
@@ -103,6 +106,7 @@ class ICLModel(sxp.Model):
     prepend_bos: bool = False
     seed: int = None
     group: object = None
+    scramble: str = None
     categories: object = frozenset({'hypernyms'})
     embedding: str = 'input'
 
@@ -123,6 +127,7 @@ class ICLModel(sxp.Model):
         vocabulary.check_tokens(self.tokens)     # checked, never rewritten: saved as given
         geometry.check_embedding(self.embedding)
         geometry.check_categories(self.categories, self.embedding)
+        geometry.check_scramble(self.scramble, self.group)
         self._geometry = (None if self.group is None else       # checks group; not an argument
                           geometry.Geometry(self.group, self.categories, self.embedding))
         super().__post_init__()
@@ -140,15 +145,9 @@ class ICLModel(sxp.Model):
         equiv = pool.equiv
 
         # top_ids, top_lp: the most likely token over the whole vocabulary and over text
-        # only, per row of logp_ctx (see ChatLM.run_trial); top_vocab decodes their ids.
-        # logp_iso, top_ids_iso, top_lp_iso: the same, with each block scored on its own,
-        # without the blocks before it or any reasoning (see ChatLM.run_isolated). kl_iso:
-        # per row, KL(P ‖ Q) over the whole vocabulary from the model's prediction (P) to that
-        # one (Q); the KL over the task alphabet is kl_rows(logp_ctx, logp_iso).
-        # plot_icl(..., iso=...) plots either
-        self.metrics = {'logp_ctx': [], 'logp_iso': [], 'kl_iso': [], 'ans': [], 'task_tokens': [],
-                        'prompts': [], 'top_ids': [], 'top_lp': [], 'top_ids_iso': [],
-                        'top_lp_iso': [], 'top_vocab': {},
+        # only, per row of logp_ctx (see ChatLM.run_trial); top_vocab decodes their ids
+        self.metrics = {'logp_ctx': [], 'ans': [], 'task_tokens': [], 'prompts': [],
+                        'top_ids': [], 'top_lp': [], 'top_vocab': {},
                         'data': dict(data, blocks=blocks, X=X, prompt=prompt)}
         assigner = None
         space = geometry.get_space(self.embedding, pool, lm, self.model_name)
@@ -164,36 +163,31 @@ class ICLModel(sxp.Model):
             if assigner is None:
                 task_toks = pool.assign(n_tok, rng)
             else:
-                groups = geometry.symbol_groups(data['code'][i], data['kinds'], self.group)
+                code = data['code'][i]
+                if self.scramble == 'roles':
+                    code = geometry.scramble_roles(code, data['kinds'], rng)
+                groups = geometry.symbol_groups(code, data['kinds'], self.group)
                 seen = np.unique(X[i])                    # leave out symbols the trials never show
                 groups = [g[np.isin(g, seen)] for g in groups]
                 task_toks, info = assigner.assign(n_tok, rng, groups)
+                if self.scramble == 'all':
+                    task_toks, info = geometry.scramble_all(task_toks, info, seen, rng)
                 self.metrics['geometry'].append(info)
             self.metrics['similarity'].append(space.cosines(task_toks).astype(np.float16))
 
             code = data['code'][i] if 'code' in data else None
-            system_prompt, block_text, first_text = self._prompt(lm, prompt, blks, task_toks, code)
-            trial_kwargs = dict(k_show=self.k_show, k_hide=self.k_hide,
-                                system_prompt=system_prompt, think=self.think, equiv=equiv,
-                                effort_without_thinking=self.effort_without_thinking,
-                                **template_kwargs)
-            lp, a, ids, top, ref = lm.run_trial(self.mode, blks, task_toks, block_text=block_text,
-                                                thinking_budget=self.thinking_budget,
-                                                return_hidden=True, **trial_kwargs)
-            lp_iso, top_iso, kl_iso = lm.run_isolated(self.mode, blks, task_toks,
-                                                      block_text=first_text, ref=ref, **trial_kwargs)
-            del ref
-            self.metrics['logp_iso'].append(lp_iso)
-            self.metrics['top_ids_iso'].append(top_iso['ids'])
-            self.metrics['top_lp_iso'].append(top_iso['lp'])
-            self.metrics['kl_iso'].append({k: v.astype(np.float32) for k, v in kl_iso.items()})
+            system_prompt, block_text = self._prompt(lm, prompt, blks, task_toks, code)
+            lp, a, ids, top = lm.run_trial(
+                self.mode, blks, task_toks, k_show=self.k_show, k_hide=self.k_hide,
+                system_prompt=system_prompt, think=self.think,
+                thinking_budget=self.thinking_budget, equiv=equiv, block_text=block_text,
+                effort_without_thinking=self.effort_without_thinking, **template_kwargs)
 
             self.metrics['logp_ctx'].append(lp)
             self.metrics['ans'].append(a)
             self.metrics['top_ids'].append(top['ids'])
             self.metrics['top_lp'].append(top['lp'])
-            seen = np.unique(np.concatenate([v.ravel() for t in (top, top_iso)
-                                             for v in t['ids'].values()]))
+            seen = np.unique(np.concatenate([v.ravel() for v in top['ids'].values()]))
             self.metrics['top_vocab'].update(
                 {int(t): lm.tokenizer.decode([int(t)]) for t in seen
                  if t >= 0 and int(t) not in self.metrics['top_vocab']})
@@ -203,20 +197,14 @@ class ICLModel(sxp.Model):
 
     def _prompt(self, lm, prompt, blks, task_toks, code=None):
         """The task's prompt rendered for one sample: (system message or None, text
-        before each block or None, text before each block were it the first block or None).
-        The last is for scoring blocks on their own (metrics['logp_iso']): a block keeps its
-        own fields but loses the transition and relabelling text, which describe a previous
-        block; the system message stays the same. code: the sample's data['code'], for the
-        hint's remapping."""
+        before each block or None). code: the sample's data['code'], for the hint's
+        remapping."""
         if prompt is None:
-            return None, None, None
+            return None, None
         splits = [split_block(trials, self.k_show, self.k_hide) for trials in blks]
         word = lambda t: lm.tokenizer.decode([task_toks[t]]).strip()
-        finals = prompts.finals_of(splits, code, word)
-        render = lambda f: prompts.render(prompt['spec'], prompt['facts'], self.mode,
-                                          vocabulary.base_pool(self.tokens), f)
-        out = render(finals)
+        out = prompts.render(prompt['spec'], prompt['facts'], self.mode,
+                             vocabulary.base_pool(self.tokens),
+                             prompts.finals_of(splits, code, word))
         system = {'role': 'system', 'content': out['system']} if out['system'] else None
-        # each block in the first block's place: the system text still comes from the last
-        first = [render([dict(f, remap=None)] + finals[1:])['blocks'][0] for f in finals]
-        return system, out['blocks'], first
+        return system, out['blocks']
