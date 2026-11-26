@@ -1,12 +1,104 @@
 import os
+import socket
+import fnmatch
+from contextlib import contextmanager
 
-# Where things live, from the environment so the same file works on the laptop and the cluster.
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # src/.. = repo root
+
+
+# -- clusters ------------------------------------------------------------------------------------
+# Where sweeps can run is described in clusters.toml at the repo root (see the comments there):
+# per cluster its ssh host, the repo's path, its big storage, its #SBATCH options, and whether its
+# compute nodes can download. Every sweep function takes cluster=NAME; left out, it's the cluster
+# this code is running on, else the file's default.
+
+class Cluster:
+    """One section of clusters.toml."""
+    def __init__(self, name, host=None, repo='~/analogies', scratch='$SCRATCH', hostnames=(),
+                 internet=True, download_host=None, max_parallel=8, sbatch=None, cpu_sbatch=None):
+        self.name, self.host, self.repo, self.scratch = name, host or name, repo, scratch
+        self.hostnames, self.internet = list(hostnames), internet
+        self.download_host = download_host or self.host
+        self.max_parallel, self.sbatch, self.cpu_sbatch = max_parallel, sbatch or {}, cpu_sbatch or {}
+
+    def directives(self, which='sbatch'):
+        """Its #SBATCH lines for the GPU jobs ('sbatch') or the CPU download job ('cpu_sbatch')."""
+        return '\n'.join(f'#SBATCH --{k}={v}' for k, v in getattr(self, which).items())
+
+    def __repr__(self):
+        return f'Cluster({self.name!r}, host={self.host!r})'
+
+
+def _load_clusters():
+    path = os.path.join(REPO_DIR, 'clusters.toml')
+    if not os.path.exists(path):           # the setup from before clusters.toml: Mila, by env vars
+        c = Cluster('mila', host=os.environ.get('ICL_REMOTE_HOST', 'mila'),
+                    repo=os.environ.get('ICL_REMOTE_REPO', '~/analogies'))
+        return {'mila': c}, 'mila'
+    import tomllib
+    with open(path, 'rb') as f:
+        cfg = tomllib.load(f)
+    default = cfg.pop('default', None)
+    clusters = {name: Cluster(name, **opts) for name, opts in cfg.items()}
+    return clusters, default or next(iter(clusters))
+
+
+CLUSTERS, DEFAULT_CLUSTER = _load_clusters()
+
+
+def _cluster_here():
+    """The cluster this code is running on ($ICL_CLUSTER, else by host name), or None."""
+    name = os.environ.get('ICL_CLUSTER')
+    if name:
+        return CLUSTERS[name]
+    names = {socket.gethostname(), socket.getfqdn()}
+    for c in CLUSTERS.values():
+        if any(fnmatch.fnmatch(n, pat) for n in names for pat in c.hostnames):
+            return c
+    return None
+
+
+HERE = _cluster_here()
+_ACTIVE = None
+
+
+def get_cluster(cluster=None):
+    """A Cluster from its name (or itself): by default the one here, else the file's default."""
+    if isinstance(cluster, Cluster):
+        return cluster
+    if cluster is None:
+        return HERE or CLUSTERS[DEFAULT_CLUSTER]
+    if cluster not in CLUSTERS:
+        raise KeyError(f'no cluster {cluster!r} in clusters.toml (have: {", ".join(CLUSTERS)})')
+    return CLUSTERS[cluster]
+
+
+@contextmanager
+def _on(cluster):
+    """Make `cluster` the one the helpers below talk to (its host, repo and storage)."""
+    global _ACTIVE
+    prev, _ACTIVE = _ACTIVE, get_cluster(cluster)
+    try:
+        yield _ACTIVE
+    finally:
+        _ACTIVE = prev
+
+
+def _cl():
+    return _ACTIVE or get_cluster()
+
+
+def _is_remote(remote, cl):
+    """Whether to reach `cl` over ssh: unless told, whenever it isn't the cluster we're on."""
+    return (cl is not HERE) if remote is None else remote
+
+
+# Where things live here: on a cluster, under its big storage; elsewhere (the laptop) under ~.
 # SAVE_DIR: results (Experiment.save_experiment / load_experiments).
 # SWEEP_DIR: one folder per submitted sweep: its task/model pickles, job script and logs.
-_BASE = os.environ.get('SCRATCH', os.path.expanduser('~'))
+_BASE = os.path.expandvars(HERE.scratch) if HERE else os.environ.get('SCRATCH', os.path.expanduser('~'))
 SAVE_DIR = os.environ.get('ICL_RESULTS', os.path.join(_BASE, 'icl_results')) + '/'
 SWEEP_DIR = os.environ.get('ICL_SWEEPS', os.path.join(_BASE, 'icl_sweeps'))
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # src/.. = repo root
 JOB_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'array_template.sh')
 WORKER = os.path.join(REPO_DIR, 'jobs', 'run_experiment.py')
 DOWNLOAD_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'download_template.sh')
@@ -14,14 +106,10 @@ PREREQUISITE_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'prerequisite_template.sh
 WEIGHTS = 'jobs/weights.py'          # relative to the repo, run on the cluster
 STATUS = 'jobs/sweep_status.py'
 
-# Submitting from elsewhere (e.g. the laptop): the ssh host, and the repo's path there.
-REMOTE_HOST = os.environ.get('ICL_REMOTE_HOST', 'mila')
 # What the jobs run, so what must match between here and the cluster when submitting from here.
 # Anything else (sweep definitions like icl_runs.py, notebooks, plots) can differ freely.
 CODE_PATHS = ('src', 'jobs', 'pyproject.toml', 'uv.lock')
-REMOTE_REPO = os.environ.get('ICL_REMOTE_REPO', '~/analogies')
 
-import socket
 import sys
 import time
 import json
@@ -684,13 +772,21 @@ def parse_params(dictionary, forbidden_keys=None):
     return out_dicts
 
 
-def _remote(cmd, capture=True):
-    """Run `cmd` in a login shell on REMOTE_HOST (so $SCRATCH, PATH etc. are set)."""
-    out = subprocess.run(['ssh', REMOTE_HOST, 'bash -lc ' + shlex.quote(cmd)],
+def _remote(cmd, capture=True, host=None):
+    """Run `cmd` in a login shell on the current cluster's host (or `host`), so its environment
+    ($SCRATCH, PATH, ...) is set."""
+    host = host or _cl().host
+    out = subprocess.run(['ssh', host, 'bash -lc ' + shlex.quote(cmd)],
                          capture_output=capture, text=True)
     if out.returncode:
-        raise RuntimeError(f'on {REMOTE_HOST}: {cmd}\n{out.stderr if capture else ""}')
+        raise RuntimeError(f'on {host}: {cmd}\n{out.stderr if capture else ""}')
     return out.stdout.strip() if capture else None
+
+
+def _scratch_sh():
+    """Shell snippets, run on the cluster, for its storage, results and sweeps folders."""
+    s = _cl().scratch
+    return s, '${ICL_RESULTS:-' + s + '/icl_results}', '${ICL_SWEEPS:-' + s + '/icl_sweeps}'
 
 
 def _code_id(cwd=REPO_DIR):
@@ -712,9 +808,9 @@ def _git(*args, cwd=REPO_DIR):
 
 
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
-                   name=None, max_parallel=8, template=None, remote=None, check_commit=True,
+                   name=None, max_parallel=None, template=None, remote=None, check_commit=True,
                    ensure_weights=True, ensure_prerequisites=True, per_job=1, exclude=None,
-                   dry_run=False, attach=()):
+                   dry_run=False, attach=(), cluster=None):
     """
     Submit every task x model combination as one Slurm job array.
 
@@ -727,8 +823,10 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     still in the queue. Array task k runs task k % n_task with model k // n_task (see
     jobs/run_experiment.py); results go to the cluster's SAVE_DIR.
 
-    remote: None submits with sbatch here if this machine has it, else over ssh to
-        REMOTE_HOST (pickles written here, copied over with rsync). True/False forces it.
+    cluster: which cluster in clusters.toml to run on: by default the one this is running on,
+        else the file's default. Its section gives the #SBATCH options, storage and so on.
+    remote: None submits with sbatch here when here is that cluster, else over ssh to its
+        host (pickles written here, copied over with rsync). True/False forces it.
     check_commit: when submitting remotely, refuse unless the cluster's checkout has the
         same committed code as here (CODE_PATHS: src/, jobs/, pyproject.toml, uv.lock), since
         the jobs run the cluster's code on pickles made here. Other files, like the sweep
@@ -736,8 +834,10 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     Each sweep folder gets a definition.txt: task_args, mod_args, these options and the code
     commit, so a sweep's record doesn't depend on the definition being committed.
     ensure_weights: if the model class has a model_name field, check that each model in the
-        sweep is fully in the cluster's Hugging Face cache; for any that isn't, first submit
-        a CPU job that downloads it, and make the array wait for that job to succeed.
+        sweep is fully in the cluster's Hugging Face cache. For any that isn't: on clusters
+        whose compute nodes have internet, first submit a CPU job that downloads it, and make
+        the array wait for that job to succeed; on the others, download it now, before
+        submitting, on the cluster's download_host.
     ensure_prerequisites: if the task or model class has a `prerequisites(args)` classmethod
         (e.g. icl_model.ICLModel: the stored token categories its geometry names), check each
         file it declares for the sweep's combinations on the cluster; for any that is missing
@@ -752,15 +852,23 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         Consecutive combinations share a model, so a job loads one (or two, at a boundary).
     exclude: nodes to keep the jobs off, e.g. ['cn-g028'] for a node with known problems.
     run_remote=False runs the first array task here instead, for debugging.
-    max_parallel caps how many array tasks run at once.
+    max_parallel caps how many array tasks run at once (default: the cluster's).
     dry_run: say what would be submitted (combinations, missing weights and prerequisites, on
         the cluster if remote) and stop, writing and submitting nothing.
     attach: files to copy into the sweep folder alongside the pickles (e.g. the spec file
         `sweeps send` read the arguments from), so the folder records how it was made.
     """
-    if remote is None:
-        remote = run_remote and shutil.which('sbatch') is None
+    with _on(cluster) as cl:
+        return _send(task_args, mod_args, run_remote, verbose, name,
+                     max_parallel or cl.max_parallel, template,
+                     run_remote and _is_remote(remote, cl), check_commit, ensure_weights,
+                     ensure_prerequisites, per_job, exclude, dry_run, attach)
 
+
+def _send(task_args, mod_args, run_remote, verbose, name, max_parallel, template, remote,
+          check_commit, ensure_weights, ensure_prerequisites, per_job, exclude, dry_run, attach):
+    """send_to_server, for the cluster _on() made current."""
+    cl = _cl()
     tasks = parse_params(task_args, forbidden_keys=['task'])
     models = parse_params(mod_args, forbidden_keys=['model'])
     for args in tasks + models:         # a value with no stable save name: fail here, not in
@@ -774,9 +882,9 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         if _git('status', '--porcelain', '--untracked-files=no', '--', *CODE_PATHS):
             print('warning: uncommitted changes to the code here (src/, jobs/, ...); the jobs '
                   'run the cluster\'s code, so they won\'t see them')
-        info = _remote('echo $SCRATCH; echo ${ICL_RESULTS:-$SCRATCH/icl_results}; '
-                       'echo ${ICL_SWEEPS:-$SCRATCH/icl_sweeps}; '
-                       f'cd {REMOTE_REPO} && pwd && {_CODE_ID_SH}').splitlines()
+        sc, res_sh, sw_sh = _scratch_sh()
+        info = _remote(f'echo {sc}; echo {res_sh}; echo {sw_sh}; '
+                       f'cd {cl.repo} && pwd && {_CODE_ID_SH}').splitlines()
         scratch, results, sweeps, repo, there, there_dirty = info[-6:]   # past any login chatter
         if check_commit and here != there:
             raise RuntimeError('the code the jobs run (' + ', '.join(CODE_PATHS) + ') differs '
@@ -799,11 +907,12 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         missing = _missing_weights(names, scratch, repo, remote) if names else {}
         prereqs = _prerequisites(task_args, tasks, mod_args, models) if ensure_prerequisites else []
         needed = _missing_prerequisites(prereqs, repo, remote) if prereqs else {}
-        where = f'{REMOTE_HOST}:{sweep}' if remote else sweep
+        where = f'{cl.name} ({cl.host}):{sweep}' if remote else f'{cl.name}: {sweep}'
         print(f'Dry run: {n_task} tasks x {len(models)} models = {n_tot} combinations, '
               f'in {n_jobs} array tasks of up to {per_job}, {max_parallel} at once, into {where}')
+        how = 'in a CPU job' if cl.internet else f'now, on {cl.download_host}'
         for m, why in missing.items():
-            print(f'  would download first: {m}  ({why})')
+            print(f'  would download first ({how}): {m}  ({why})')
         for p, why in needed.values():
             print(f'  would make first: {p["what"]}  ({why})')
         if names and not missing:
@@ -822,14 +931,13 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     for path_ in attach:
         shutil.copy(path_, os.path.join(local, os.path.basename(path_)))
     with open(os.path.join(local, 'sweep.json'), 'w') as f:
-        json.dump({'n_task': n_task, 'n_tot': n_tot, 'per_job': per_job}, f)
+        json.dump({'n_task': n_task, 'n_tot': n_tot, 'per_job': per_job, 'cluster': cl.name}, f)
     _write_definition(local, task_args, mod_args,
-                      dict(per_job=per_job, max_parallel=max_parallel, exclude=exclude,
-                           remote=remote, ensure_weights=ensure_weights))
+                      dict(cluster=cl.name, per_job=per_job, max_parallel=max_parallel,
+                           exclude=exclude, remote=remote, ensure_weights=ensure_weights))
     if verbose:
         print(f'{n_task} tasks x {len(models)} models = {n_tot} combinations, '
-              f'in {n_jobs} jobs of up to {per_job}, in {sweep}'
-              + (f' on {REMOTE_HOST}' if remote else ''))
+              f'in {n_jobs} jobs of up to {per_job}, in {sweep} on {cl.name}')
 
     prereqs = (_prerequisites(task_args, tasks, mod_args, models) if ensure_prerequisites else [])
     if not run_remote:
@@ -842,7 +950,8 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         return local
 
     fill = dict(last=n_jobs - 1, n_tot=n_tot, per_job=per_job, n_task=n_task, sweep_dir=sweep,
-                repo=repo, scratch=scratch, results=results, max_parallel=max_parallel)
+                repo=repo, scratch=scratch, results=results, max_parallel=max_parallel,
+                sbatch=cl.directives('sbatch'), cpu_sbatch=cl.directives('cpu_sbatch'))
     with open(template or JOB_TEMPLATE) as f:
         script = f.read().format(**fill)
     with open(os.path.join(local, 'job_script.sh'), 'w') as f:
@@ -850,6 +959,11 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
 
     names = _model_names(mod_args, models) if ensure_weights else []
     missing = _missing_weights(names, scratch, repo, remote) if names else {}
+    if missing and not cl.internet:     # compute nodes can't download: do it now, outside Slurm
+        _download_now(missing, scratch, repo, remote)
+        missing = _missing_weights(names, scratch, repo, remote)
+        if missing:
+            raise RuntimeError(f'still not complete after downloading on {cl.download_host}: {missing}')
     if missing:
         with open(DOWNLOAD_TEMPLATE) as f:
             script = f.read().format(models=' '.join(shlex.quote(m) for m in missing), **fill)
@@ -867,7 +981,7 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
 
     if remote:
         _remote(f'mkdir -p {sweep}')
-        subprocess.run(['rsync', '-a', local + '/', f'{REMOTE_HOST}:{sweep}/'], check=True)
+        subprocess.run(['rsync', '-a', local + '/', f'{cl.host}:{sweep}/'], check=True)
 
     after = []
     if missing:
@@ -885,8 +999,26 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
     extra = [f'--exclude={",".join(exclude)}'] if exclude else []
     job = _sbatch(os.path.join(sweep, 'job_script.sh'), remote, after=after, extra=extra)
     _record_job(sweep, job, remote)
-    print(f'Submitted batch job {job} ({n_jobs} array tasks)')
+    print(f'Submitted batch job {job} ({n_jobs} array tasks) on {cl.name}')
     return sweep
+
+
+def _download_now(missing, scratch, repo, remote):
+    """Download model weights before submitting, for clusters whose compute nodes have no
+    internet: on its download_host over ssh, or here when here is that cluster."""
+    cl = _cl()
+    names = ' '.join(shlex.quote(m) for m in missing)
+    cmd = (f'cd {repo} && HF_HOME={scratch}/.cache/huggingface '
+           f'HF_TOKEN_PATH=$HOME/.cache/huggingface/token .venv/bin/python {WEIGHTS} download {names}')
+    for m, why in missing.items():
+        print(f'Not cached on {cl.name}: {m}\n    ({why})')
+    where = cl.download_host if remote else socket.gethostname()
+    print(f"{cl.name}'s compute nodes have no internet: downloading now, on {where} "
+          '(this can take a while for large models)...', flush=True)
+    if remote:
+        _remote(cmd, capture=False, host=cl.download_host)
+    else:
+        subprocess.run(['bash', '-c', cmd], check=True)
 
 
 def _write_definition(folder, task_args, mod_args, options):
@@ -986,15 +1118,18 @@ def _record_job(sweep, job, remote):
 def _cluster_script(args, remote):
     """Run one of the repo's scripts on the cluster (over ssh if remote); its stdout."""
     if remote:
-        return _remote(f'cd {REMOTE_REPO} && .venv/bin/python ' + ' '.join(shlex.quote(a) for a in args))
-    res = subprocess.run([sys.executable, *args], cwd=REPO_DIR, capture_output=True, text=True)
+        _, _, sw_sh = _scratch_sh()
+        return _remote(f'cd {_cl().repo} && ICL_SWEEPS={sw_sh} .venv/bin/python '
+                       + ' '.join(shlex.quote(a) for a in args))
+    res = subprocess.run([sys.executable, *args], cwd=REPO_DIR, capture_output=True, text=True,
+                         env={**os.environ, 'ICL_SWEEPS': SWEEP_DIR})
     if res.returncode:
         raise RuntimeError(res.stderr.strip().splitlines()[-1] if res.stderr.strip()
                            else f'{args[0]} exited with {res.returncode}')
     return res.stdout
 
 
-def sweep_status(sweep=None, remote=None, verbose=True, job_ids=None):
+def sweep_status(sweep=None, remote=None, verbose=True, job_ids=None, cluster=None):
     """
     What happened to each array task of a sweep: whether its result was saved, Slurm's
     state, the node and start time, and for the ones that didn't finish, why (from Slurm
@@ -1005,8 +1140,25 @@ def sweep_status(sweep=None, remote=None, verbose=True, job_ids=None):
         sweep's array job ids, or None for the most recent sweep. remote: as in send_to_server (None: decide by whether
         this machine has sbatch). job_ids: the sweep's array job ids, for sweeps submitted
         before they were recorded, if they can't be found automatically (remembered after).
+        cluster: where the sweep ran; by default the one recorded with it (for sweeps sent from
+        here), else as in send_to_server.
     """
-    remote = shutil.which('sbatch') is None if remote is None else remote
+    with _on(cluster or _sweep_cluster(sweep)) as cl:
+        return _status(sweep, _is_remote(remote, cl), verbose, job_ids)
+
+
+def _sweep_cluster(sweep):
+    """The cluster a sweep sent from here ran on (its local folder's sweep.json), or None."""
+    if not sweep or os.path.isabs(str(sweep)):
+        return None
+    meta = os.path.join(SWEEP_DIR, str(sweep), 'sweep.json')
+    if os.path.exists(meta):
+        with open(meta) as f:
+            return json.load(f).get('cluster')
+    return None
+
+
+def _status(sweep, remote, verbose, job_ids):
     args = [STATUS, str(sweep) if sweep else ''] + ([f"--job-ids={','.join(map(str, job_ids))}"] if job_ids else [])
     out = _cluster_script(args, remote)
     st = json.loads(out.strip().splitlines()[-1])
@@ -1037,7 +1189,7 @@ def _ranges(ix):
 
 
 def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None, dry_run=False,
-                     job_ids=None, per_job=None, max_parallel=None):
+                     job_ids=None, per_job=None, max_parallel=None, cluster=None):
     """
     Resubmit the array tasks of a sweep that didn't save all their results and aren't queued
     or running, as a new array job running the sweep's own job script (same pickles, so the
@@ -1055,10 +1207,15 @@ def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None
     for that) go to a new continuation sweep, <sweep>-r1 (-r2, ...), chunked per_job at a
     time; its name is returned. It is a sweep like any other for sweep_status and
     resubmit_missing, and saves its results to the same place. max_parallel defaults to the
-    original sweep's.
+    original sweep's. cluster: as in sweep_status.
     """
-    remote = shutil.which('sbatch') is None if remote is None else remote
-    st = sweep_status(sweep, remote, verbose=False, job_ids=job_ids)
+    with _on(cluster or _sweep_cluster(sweep)) as cl:
+        return _resubmit(sweep, exclude, include_errors, _is_remote(remote, cl), dry_run, job_ids,
+                         per_job, max_parallel)
+
+
+def _resubmit(sweep, exclude, include_errors, remote, dry_run, job_ids, per_job, max_parallel):
+    st = _status(sweep, remote, False, job_ids)
     if per_job is not None and per_job != st.get('per_job', 1):
         return _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run,
                                max_parallel or st['max_parallel'] or 8)
@@ -1120,8 +1277,9 @@ def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_p
     old = st['sweep']
     base = re.sub(r'-r\d+$', '', old)               # a continuation's continuation counts on
     if remote:
-        info = _remote('echo $SCRATCH; echo ${ICL_RESULTS:-$SCRATCH/icl_results}; '
-                       f'cd {REMOTE_REPO} && pwd; '
+        sc, res_sh, _ = _scratch_sh()
+        info = _remote(f'echo {sc}; echo {res_sh}; '
+                       f'cd {_cl().repo} && pwd; '
                        f'for k in $(seq 1 99); do [ -e {base}-r$k ] || {{ echo {base}-r$k; break; }}; done'
                        ).splitlines()
         scratch, results, repo, sweep = info[-4:]
@@ -1141,9 +1299,10 @@ def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_p
         json.dump(pairs, f)
     with open(os.path.join(local, 'sweep.json'), 'w') as f:
         json.dump({'n_task': st['n_task'], 'n_tot': n_tot, 'per_job': per_job,
-                   'continues': os.path.basename(old)}, f)
+                   'continues': os.path.basename(old), 'cluster': _cl().name}, f)
     fill = dict(last=n_jobs - 1, n_tot=n_tot, per_job=per_job, n_task=st['n_task'], sweep_dir=sweep,
-                repo=repo, scratch=scratch, results=results, max_parallel=max_parallel)
+                repo=repo, scratch=scratch, results=results, max_parallel=max_parallel,
+                sbatch=_cl().directives('sbatch'), cpu_sbatch=_cl().directives('cpu_sbatch'))
     with open(JOB_TEMPLATE) as f:
         script = f.read().format(**fill)
     with open(os.path.join(local, 'job_script.sh'), 'w') as f:
@@ -1152,7 +1311,7 @@ def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_p
     copy = f'cp {old}/task_*.pkl {old}/model_*.pkl {sweep}/ && echo {name} >> {old}/continued_in'
     if remote:
         _remote(f'mkdir -p {sweep}')
-        subprocess.run(['rsync', '-a', local + '/', f'{REMOTE_HOST}:{sweep}/'], check=True)
+        subprocess.run(['rsync', '-a', local + '/', f'{_cl().host}:{sweep}/'], check=True)
         _remote(copy)
     else:
         subprocess.run(['bash', '-c', copy], check=True)
@@ -1164,13 +1323,20 @@ def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_p
     print(f'Submitted batch job {job} ({n_jobs} array tasks); follow it with sweep_status({name!r})')
     return name
 
-def fetch_results(dest=None):
-    """Copy the cluster's results into SAVE_DIR here (or `dest`), e.g. for plotting on the
-    laptop. Only new or changed files are transferred."""
+def fetch_results(dest=None, cluster=None):
+    """Copy a cluster's results into SAVE_DIR here (or `dest`), e.g. for plotting on the
+    laptop; cluster='all' for every cluster in clusters.toml. Only new or changed files are
+    transferred, and since result files are named by their settings, results from different
+    clusters merge without clashing."""
     dest = dest or SAVE_DIR
     os.makedirs(dest, exist_ok=True)
-    results = _remote('echo ${ICL_RESULTS:-$SCRATCH/icl_results}').splitlines()[-1]
-    subprocess.run(['rsync', '-a', f'{REMOTE_HOST}:{results}/', dest], check=True)
+    for name in (CLUSTERS if cluster == 'all' else [cluster]):
+        with _on(name) as cl:
+            if cl is HERE:
+                continue                     # already here
+            results = _remote('echo ' + _scratch_sh()[1]).splitlines()[-1]
+            print(f'fetching from {cl.name} ({cl.host}:{results})', flush=True)
+            subprocess.run(['rsync', '-a', f'{cl.host}:{results}/', dest], check=True)
 
 
 def get_all_experiments(task_args, model_args, bool_friendly=True):

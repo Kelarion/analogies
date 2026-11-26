@@ -20,6 +20,12 @@ otherwise, and the spec file is copied into its folder.
 SWEEP is a sweep's folder name (as send_to_server printed it), one of its array job ids, or
 left out for the most recent sweep. From the laptop these run on the cluster over ssh, as
 the functions do. `uv run sweeps <command> --help` lists each command's options.
+
+--cluster NAME (before the command) picks a cluster from clusters.toml, e.g.
+`uv run sweeps --cluster della send spec.py`. Left out: for send, the cluster this is
+running on, else the file's default; for status and resubmit, the cluster a sweep sent from
+here was recorded on; `fetch --cluster all` fetches from every cluster. A spec's `send` can
+name its cluster too.
 """
 import argparse
 import os
@@ -29,7 +35,8 @@ import sys
 def main(argv=None):
     p = argparse.ArgumentParser(prog='sweeps', description=__doc__.split('\n\n')[0].strip())
     p.add_argument('--remote', action=argparse.BooleanOptionalAction, default=None,
-                   help='go through ssh (default: only if this machine has no sbatch)')
+                   help="go through ssh (default: unless this is the cluster)")
+    p.add_argument('--cluster', help="a cluster in clusters.toml ('all' for fetch)")
     sub = p.add_subparsers(dest='command', required=True)
 
     n = sub.add_parser('send', help='submit the sweep a spec file describes')
@@ -73,20 +80,20 @@ def main(argv=None):
         if a.command == 'send':
             send(a)
         elif a.command == 'status':
-            su.sweep_status(a.sweep, remote=a.remote, job_ids=a.job_ids)
+            su.sweep_status(a.sweep, remote=a.remote, job_ids=a.job_ids, cluster=a.cluster)
         elif a.command == 'resubmit':
             exclude = a.exclude[0] if a.exclude == ['failed'] else a.exclude
             su.resubmit_missing(a.sweep, exclude=exclude, include_errors=a.include_errors,
                                 remote=a.remote, dry_run=a.dry_run, job_ids=a.job_ids,
-                                per_job=a.per_job, max_parallel=a.max_parallel)
+                                per_job=a.per_job, max_parallel=a.max_parallel, cluster=a.cluster)
         elif a.command == 'fetch':
-            su.fetch_results(a.dest)
-    except (RuntimeError, FileExistsError, ValueError) as e:
+            su.fetch_results(a.dest, cluster=a.cluster)
+    except (RuntimeError, FileExistsError, ValueError, KeyError) as e:
         sys.exit(f'sweeps {a.command}: {e}')
 
 
 SEND_OPTIONS = ('name', 'per_job', 'max_parallel', 'exclude', 'check_commit', 'ensure_weights',
-                'ensure_prerequisites', 'verbose', 'template')
+                'ensure_prerequisites', 'verbose', 'template', 'cluster')
 
 
 def load_spec(path):
@@ -113,7 +120,8 @@ def send(a):
     import time
     import server_utils as su
     task_args, mod_args, opts = load_spec(a.spec)
-    given = {'name': a.name, 'per_job': a.per_job, 'max_parallel': a.max_parallel, 'exclude': a.exclude}
+    given = {'name': a.name, 'per_job': a.per_job, 'max_parallel': a.max_parallel, 'exclude': a.exclude,
+             'cluster': a.cluster}
     opts.update({k: v for k, v in given.items() if v is not None})
     if a.no_check_commit:
         opts['check_commit'] = False

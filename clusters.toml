@@ -1,0 +1,78 @@
+# Where sweeps can run: server_utils.send_to_server(..., cluster=NAME), `sweeps --cluster NAME`.
+#
+# Per cluster:
+#   host           ssh alias of the login node to submit from (in ~/.ssh/config)
+#   repo           this repo's clone there (with its .venv, from `uv sync`)
+#   scratch        big, fast storage for sweeps, results and model weights; shell syntax,
+#                  expanded on the cluster ($SCRATCH, $USER, ...)
+#   hostnames      patterns for its machines' names, so code running on it knows where it is
+#                  (or set ICL_CLUSTER=NAME there)
+#   internet       whether its compute nodes can download; if not, missing model weights are
+#                  downloaded before submitting, over ssh on download_host
+#   download_host  ssh alias of a machine there with internet and the same filesystems
+#                  (default: host)
+#   max_parallel   default cap on a sweep's array tasks running at once
+#   [NAME.sbatch]      #SBATCH options for the GPU jobs (sweeps, prerequisites): key = value
+#                      becomes #SBATCH --key=value
+#   [NAME.cpu_sbatch]  the same for the CPU job that downloads weights (internet = true only)
+
+default = "mila"
+
+
+[mila]
+host = "mila"
+repo = "~/analogies"
+scratch = "$SCRATCH"
+hostnames = ["*.server.mila.quebec", "login-*", "cn-*"]
+internet = true
+max_parallel = 8
+
+[mila.sbatch]
+partition = "long"            # no resource cap, but preemptible (see the -grace variants)
+gres = "gpu:1"
+constraint = "80gb"           # A100 80GB
+cpus-per-task = 8
+mem = "48G"
+time = "0-11:59:00"
+
+[mila.cpu_sbatch]
+partition = "main-cpu"
+cpus-per-task = 4
+mem = "8G"
+time = "0-04:00:00"
+
+
+# Princeton's Della, GPU side. Off campus, ssh needs the university VPN up.
+[della]
+host = "della"                # an alias for della-gpu.princeton.edu: GPU jobs are submitted there
+repo = "~/analogies"          # home: 50 GiB and 2M files, enough for the code and .venv
+scratch = "/scratch/gpfs/TWW/$USER"   # the group's fileset (40 TiB, shared); see checkquota
+hostnames = ["della*"]
+internet = false              # compute nodes can't download ...
+download_host = "della-vis1"  # ... but the visualization nodes can, and see the same filesystems
+max_parallel = 8              # jobs up to 24 h: at most 30 at once, 35 GPUs per user
+
+[della.sbatch]
+gres = "gpu:1"
+constraint = "gpu80"          # A100 80GB; the QOS follows from the time, so none is given
+cpus-per-task = 8
+mem = "48G"
+time = "0-11:59:00"
+
+
+# A DRAC cluster, for when you know which one and which account: compute nodes on Fir and
+# Nibi have internet, on Rorqual, Trillium and Narval they don't.
+# [rorqual]
+# host = "rorqual"
+# repo = "~/analogies"
+# scratch = "$SCRATCH"
+# hostnames = ["rorqual*", "rg*"]
+# internet = false
+# max_parallel = 8
+#
+# [rorqual.sbatch]
+# account = "rrg-bengioy-ad"
+# gres = "gpu:h100:1"
+# cpus-per-task = 8
+# mem = "64G"
+# time = "0-11:59:00"

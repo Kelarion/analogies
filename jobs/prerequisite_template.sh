@@ -4,12 +4,8 @@
 # waits for this to succeed. Submitted with a job name derived from the file and
 # --dependency=singleton, so two sweeps needing the same file make it once: the second job
 # runs after the first, finds it current, and does nothing. {{name}} fields are placeholders.
-#SBATCH --partition=long
-#SBATCH --gres=gpu:1
-#SBATCH --constraint=80gb
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
-#SBATCH --time=0-11:59:00
+# The resource lines ({{sbatch}}) come from the cluster's section of clusters.toml.
+{sbatch}
 #SBATCH --output={sweep_dir}/logs/{log}.out
 
 export PATH="$HOME/.local/bin:$PATH"                       # uv

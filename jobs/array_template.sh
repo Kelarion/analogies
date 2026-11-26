@@ -2,16 +2,9 @@
 # Job-array template filled in by server_utils.send_to_server: {{name}} fields are
 # placeholders, so literal braces in bash have to be doubled ({{ }}).
 #
-# Partition: main caps resources (2 GPUs, 48G, 8 CPUs per partitions.md). long has no cap
-# but is preemptible: a preempted task is requeued and rerun from the start, which is safe
-# here because a run only saves at the end.
+# The resource lines ({{sbatch}}) come from the cluster's section of clusters.toml.
 #SBATCH --job-name=icl
-#SBATCH --partition=long
-#SBATCH --gres=gpu:1
-#SBATCH --constraint=80gb
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
-#SBATCH --time=0-11:59:00
+{sbatch}
 #SBATCH --array=0-{last}%{max_parallel}
 #SBATCH --output={sweep_dir}/logs/%a.out
 

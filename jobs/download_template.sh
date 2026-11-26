@@ -2,11 +2,10 @@
 # Filled in by server_utils.send_to_server when a sweep needs weights that aren't cached.
 # CPU only. Jobs with the same name run one at a time (singleton), so two sweeps needing
 # the same model don't download it twice at once; the second finds it already there.
+# Only for clusters whose compute nodes have internet; the resource lines ({{cpu_sbatch}})
+# come from the cluster's cpu_sbatch in clusters.toml.
 #SBATCH --job-name=hf-download
-#SBATCH --partition=main-cpu
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
-#SBATCH --time=0-04:00:00
+{cpu_sbatch}
 #SBATCH --dependency=singleton
 #SBATCH --output={sweep_dir}/logs/download.out
 
