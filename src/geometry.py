@@ -34,6 +34,16 @@ ICLModel takes three arguments for this:
               Each group gets a category its tokens all carry, and no token outside the group
               carries it, so groups are kept apart by construction. Categories covering more
               than MAX_SHARE of the pool (WordNet's 'entity', say) are never used.
+  scramble    a control, with a group: None (the default), or what to break after the groups
+              are drawn as `group` says:
+                'roles'       role groups pair symbols of the same kind from every block, but
+                              which ones is random in each block and sample (node 2 of block 1
+                              with node 5 of block 2), so similar tokens span blocks without
+                              marking corresponding roles. Block groups are unaffected.
+                'all'         the tokens are selected exactly as for `group`, then shuffled
+                              across all the symbols the trials show: the same vocabulary, with
+                              the same bias towards tokens that cluster, and no structure.
+              The groups recorded are the symbols that hold each group's tokens in the end.
   embedding   the similarity tokens are selected by, and the geometry is recorded in:
                 'input'       the model's input embeddings
                 'canonical'   the unembeddings, centred and whitened over the vocabulary (Park
@@ -160,6 +170,41 @@ def symbol_groups(code, kinds, group):
         if len(g) >= 2 and sorted(g) not in [sorted(h.tolist()) for h in out]:
             out.append(np.array(g, int))
     return out
+
+
+SCRAMBLES = ('roles', 'all')
+
+
+def check_scramble(scramble, group):
+    """Raise unless `scramble` is None or one of SCRAMBLES, and has a group to scramble."""
+    if scramble is None:
+        return
+    if scramble not in SCRAMBLES:
+        raise ValueError(f"scramble={scramble!r}: None or one of {SCRAMBLES}")
+    if group is None:
+        raise ValueError(f"scramble={scramble!r} scrambles a group's structure: give a group too")
+
+
+def scramble_roles(code, kinds, rng):
+    """code with the grammar tokens of each kind permuted within each block, independently,
+    so that role groups formed from it pair mismatched roles (for grouping only)."""
+    code = np.array(code, copy=True)
+    for k in dict.fromkeys(x for x in kinds[1:]):
+        rows = np.array([r for r in range(1, len(kinds)) if kinds[r] == k])
+        for b in range(code.shape[0]):
+            code[b, rows] = code[b, rng.permutation(rows)]
+    return code
+
+
+def scramble_all(task_toks, info, seen, rng):
+    """The tokens shuffled across the shown symbols `seen` (not the delimiter), and info's groups
+    relabelled to the symbols now holding their tokens."""
+    seen = np.array([s for s in np.unique(seen) if s != 0])
+    order = rng.permutation(len(seen))
+    toks = np.array(task_toks, copy=True)
+    toks[seen] = task_toks[seen[order]]
+    moved = {int(seen[order[j]]): int(seen[j]) for j in range(len(seen))}   # old symbol -> new
+    return toks, dict(info, groups=[[moved.get(s, s) for s in g] for g in info['groups']])
 
 
 # -- categories -----------------------------------------------------------------------------
