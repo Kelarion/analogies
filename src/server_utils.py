@@ -21,9 +21,11 @@ class Cluster:
         self.download_host = download_host or self.host
         self.max_parallel, self.sbatch, self.cpu_sbatch = max_parallel, sbatch or {}, cpu_sbatch or {}
 
-    def directives(self, which='sbatch'):
-        """Its #SBATCH lines for the GPU jobs ('sbatch') or the CPU download job ('cpu_sbatch')."""
-        return '\n'.join(f'#SBATCH --{k}={v}' for k, v in getattr(self, which).items())
+    def directives(self, which='sbatch', overrides=None):
+        """Its #SBATCH lines for the GPU jobs ('sbatch') or the CPU download job ('cpu_sbatch'),
+        with `overrides` ({option: value}, None to drop an option) on top."""
+        opts = {**getattr(self, which), **(overrides or {})}
+        return '\n'.join(f'#SBATCH --{k}={v}' for k, v in opts.items() if v is not None)
 
     def __repr__(self):
         return f'Cluster({self.name!r}, host={self.host!r})'
@@ -104,6 +106,7 @@ WORKER = os.path.join(REPO_DIR, 'jobs', 'run_experiment.py')
 DOWNLOAD_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'download_template.sh')
 PREREQUISITE_TEMPLATE = os.path.join(REPO_DIR, 'jobs', 'prerequisite_template.sh')
 WEIGHTS = 'jobs/weights.py'          # relative to the repo, run on the cluster
+NLTK_DATA = 'jobs/nltk_data.py'      # the NLTK data the code uses: checked, and installed if missing
 STATUS = 'jobs/sweep_status.py'
 
 # What the jobs run, so what must match between here and the cluster when submitting from here.
@@ -809,8 +812,9 @@ def _git(*args, cwd=REPO_DIR):
 
 def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
                    name=None, max_parallel=None, template=None, remote=None, check_commit=True,
-                   ensure_weights=True, ensure_prerequisites=True, per_job=1, exclude=None,
-                   dry_run=False, attach=(), cluster=None):
+                   ensure_weights=True, ensure_prerequisites=True, ensure_data=True,
+                   per_job=1, exclude=None,
+                   dry_run=False, attach=(), cluster=None, sbatch=None):
     """
     Submit every task x model combination as one Slurm job array.
 
@@ -825,6 +829,8 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
 
     cluster: which cluster in clusters.toml to run on: by default the one this is running on,
         else the file's default. Its section gives the #SBATCH options, storage and so on.
+    sbatch: #SBATCH options for this sweep's jobs over the cluster's, e.g. {'time': '1-12:00:00'}
+        for longer runs (None as a value drops one of the cluster's options).
     remote: None submits with sbatch here when here is that cluster, else over ssh to its
         host (pickles written here, copied over with rsync). True/False forces it.
     check_commit: when submitting remotely, refuse unless the cluster's checkout has the
@@ -838,6 +844,9 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         whose compute nodes have internet, first submit a CPU job that downloads it, and make
         the array wait for that job to succeed; on the others, download it now, before
         submitting, on the cluster's download_host.
+    ensure_data: check that the NLTK data the code uses (jobs/nltk_data.py) is installed on the
+        cluster, and install what's missing first (on download_host): jobs can't fetch it on
+        clusters whose compute nodes have no internet.
     ensure_prerequisites: if the task or model class has a `prerequisites(args)` classmethod
         (e.g. icl_model.ICLModel: the stored token categories its geometry names), check each
         file it declares for the sweep's combinations on the cluster; for any that is missing
@@ -862,11 +871,12 @@ def send_to_server(task_args, mod_args, run_remote=True, verbose=False,
         return _send(task_args, mod_args, run_remote, verbose, name,
                      max_parallel or cl.max_parallel, template,
                      run_remote and _is_remote(remote, cl), check_commit, ensure_weights,
-                     ensure_prerequisites, per_job, exclude, dry_run, attach)
+                     ensure_prerequisites, per_job, exclude, dry_run, attach, sbatch, ensure_data)
 
 
 def _send(task_args, mod_args, run_remote, verbose, name, max_parallel, template, remote,
-          check_commit, ensure_weights, ensure_prerequisites, per_job, exclude, dry_run, attach):
+          check_commit, ensure_weights, ensure_prerequisites, per_job, exclude, dry_run, attach,
+          sbatch=None, ensure_data=True):
     """send_to_server, for the cluster _on() made current."""
     cl = _cl()
     tasks = parse_params(task_args, forbidden_keys=['task'])
@@ -919,7 +929,13 @@ def _send(task_args, mod_args, run_remote, verbose, name, max_parallel, template
             print(f'  weights cached: {", ".join(names)}')
         if prereqs and not needed:
             print(f'  prerequisites present: {len(prereqs)}')
+        if ensure_data and run_remote:
+            nltk_missing = _missing_nltk(repo, remote)
+            print(f'  would install NLTK data first: {", ".join(nltk_missing)}' if nltk_missing
+                  else '  NLTK data installed')
         return None
+    if ensure_data and run_remote:
+        _ensure_nltk(repo, remote)
     os.makedirs(os.path.join(local, 'logs'))
 
     for i, args in enumerate(tasks):
@@ -934,7 +950,8 @@ def _send(task_args, mod_args, run_remote, verbose, name, max_parallel, template
         json.dump({'n_task': n_task, 'n_tot': n_tot, 'per_job': per_job, 'cluster': cl.name}, f)
     _write_definition(local, task_args, mod_args,
                       dict(cluster=cl.name, per_job=per_job, max_parallel=max_parallel,
-                           exclude=exclude, remote=remote, ensure_weights=ensure_weights))
+                           exclude=exclude, remote=remote, ensure_weights=ensure_weights,
+                           sbatch=sbatch))
     if verbose:
         print(f'{n_task} tasks x {len(models)} models = {n_tot} combinations, '
               f'in {n_jobs} jobs of up to {per_job}, in {sweep} on {cl.name}')
@@ -951,7 +968,7 @@ def _send(task_args, mod_args, run_remote, verbose, name, max_parallel, template
 
     fill = dict(last=n_jobs - 1, n_tot=n_tot, per_job=per_job, n_task=n_task, sweep_dir=sweep,
                 repo=repo, scratch=scratch, results=results, max_parallel=max_parallel,
-                sbatch=cl.directives('sbatch'), cpu_sbatch=cl.directives('cpu_sbatch'))
+                sbatch=cl.directives('sbatch', sbatch), cpu_sbatch=cl.directives('cpu_sbatch'))
     with open(template or JOB_TEMPLATE) as f:
         script = f.read().format(**fill)
     with open(os.path.join(local, 'job_script.sh'), 'w') as f:
@@ -1001,6 +1018,36 @@ def _send(task_args, mod_args, run_remote, verbose, name, max_parallel, template
     _record_job(sweep, job, remote)
     print(f'Submitted batch job {job} ({n_jobs} array tasks) on {cl.name}')
     return sweep
+
+
+def _in_repo(cmd, repo, remote, host=None, capture=True):
+    """Run a shell command in the repo's checkout on the current cluster (over ssh if remote,
+    on `host` if given); its output if captured."""
+    full = f'cd {repo} && {cmd}'
+    if remote:
+        return _remote(full, capture=capture, host=host)
+    r = subprocess.run(['bash', '-c', full], capture_output=capture, text=True)
+    if r.returncode:
+        raise RuntimeError(f'{cmd}: ' + ((r.stderr or '').strip().splitlines() or ['failed'])[-1])
+    return r.stdout
+
+
+def _missing_nltk(repo, remote):
+    """The NLTK packages jobs/nltk_data.py lists that aren't installed on the current cluster."""
+    return json.loads(_in_repo(f'.venv/bin/python {NLTK_DATA} check', repo, remote).strip().splitlines()[-1])
+
+
+def _ensure_nltk(repo, remote):
+    """Install any missing NLTK data on the current cluster before its jobs need it: on its
+    download_host over ssh, or here when here is that cluster."""
+    need = _missing_nltk(repo, remote)
+    if not need:
+        return
+    cl = _cl()
+    print(f'NLTK data not installed on {cl.name}: {", ".join(need)}; installing now'
+          + (f', on {cl.download_host}' if remote else ''), flush=True)
+    _in_repo(f'.venv/bin/python {NLTK_DATA} download', repo, remote,
+             host=cl.download_host if remote else None, capture=False)
 
 
 def _download_now(missing, scratch, repo, remote):
@@ -1189,7 +1236,7 @@ def _ranges(ix):
 
 
 def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None, dry_run=False,
-                     job_ids=None, per_job=None, max_parallel=None, cluster=None):
+                     job_ids=None, per_job=None, max_parallel=None, cluster=None, sbatch=None):
     """
     Resubmit the array tasks of a sweep that didn't save all their results and aren't queued
     or running, as a new array job running the sweep's own job script (same pickles, so the
@@ -1208,17 +1255,22 @@ def resubmit_missing(sweep=None, exclude=None, include_errors=False, remote=None
     time; its name is returned. It is a sweep like any other for sweep_status and
     resubmit_missing, and saves its results to the same place. max_parallel defaults to the
     original sweep's. cluster: as in sweep_status.
+
+    sbatch: #SBATCH options for the reruns over the sweep's, e.g. {'time': '2-00:00:00'}. With a
+    new time, tasks that hit the time limit are rerun too (otherwise they're left out, as they'd
+    only time out again).
     """
     with _on(cluster or _sweep_cluster(sweep)) as cl:
         return _resubmit(sweep, exclude, include_errors, _is_remote(remote, cl), dry_run, job_ids,
-                         per_job, max_parallel)
+                         per_job, max_parallel, sbatch)
 
 
-def _resubmit(sweep, exclude, include_errors, remote, dry_run, job_ids, per_job, max_parallel):
+def _resubmit(sweep, exclude, include_errors, remote, dry_run, job_ids, per_job, max_parallel,
+              sbatch=None):
     st = _status(sweep, remote, False, job_ids)
     if per_job is not None and per_job != st.get('per_job', 1):
         return _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run,
-                               max_parallel or st['max_parallel'] or 8)
+                               max_parallel or st['max_parallel'] or 8, sbatch)
     for w in st.get('warnings', []):
         print('warning:', w)
     if not st.get('job_ids'):
@@ -1226,11 +1278,16 @@ def _resubmit(sweep, exclude, include_errors, remote, dry_run, job_ids, per_job,
               "ones still queued or running; give them with job_ids=[...] (see sacct)")
     tasks = st['tasks']
     missing = {i: t for i, t in tasks.items() if not t['done'] and t['cause'] is not None}
-    todo = sorted(i for i, t in missing.items() if t['transient'] or include_errors)
+    longer = bool(sbatch and sbatch.get('time'))   # a new time limit: timeouts are worth rerunning
+    todo = sorted(i for i, t in missing.items()
+                  if t['transient'] or include_errors or (longer and t['cause'] == 'time limit'))
     skipped = sorted(set(missing) - set(todo))
     for i in skipped:
         print(f"leaving out {i}: {tasks[i]['cause']} ({(tasks[i]['detail'] or '')[:90]})")
-    if skipped:
+    if any(tasks[i]['cause'] == 'time limit' for i in skipped):
+        print("  (timeouts: rerun with more time, sbatch={'time': ...} / --time, or in smaller "
+              "chunks, per_job= / --per-job)")
+    if any(tasks[i]['cause'] != 'time limit' for i in skipped):
         print('  (fix the cause, then resubmit_missing(..., include_errors=True))')
     if not todo:
         print('nothing to resubmit')
@@ -1240,8 +1297,10 @@ def _resubmit(sweep, exclude, include_errors, remote, dry_run, job_ids, per_job,
         exclude = sorted({t['node'] for t in missing.values() if t['transient'] and t['node']})
     spec = _ranges(todo) + (f"%{st['max_parallel']}" if st['max_parallel'] else '')
     extra = [f'--array={spec}'] + ([f'--exclude={",".join(exclude)}'] if exclude else [])
+    extra += [f'--{k}={v}' for k, v in (sbatch or {}).items() if v is not None]  # over the script's
     print(f'resubmitting {len(todo)} task(s): {_ranges(todo)}'
-          + (f', not on {",".join(exclude)}' if exclude else ''))
+          + (f', not on {",".join(exclude)}' if exclude else '')
+          + (''.join(f', {k}={v}' for k, v in (sbatch or {}).items()) if sbatch else ''))
     if dry_run:
         return None
     job = _sbatch(os.path.join(st['sweep'], 'job_script.sh'), remote, extra=extra)
@@ -1250,7 +1309,8 @@ def _resubmit(sweep, exclude, include_errors, remote, dry_run, job_ids, per_job,
     return job
 
 
-def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_parallel):
+def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_parallel,
+                    sbatch=None):
     """resubmit_missing with a new chunk size: the unfinished combinations of sweep `st` as a
     new sweep, which lists its (task, model) pairs in combos.json and reuses the pickles."""
     tasks = st['tasks']
@@ -1302,7 +1362,7 @@ def _continue_sweep(st, per_job, exclude, include_errors, remote, dry_run, max_p
                    'continues': os.path.basename(old), 'cluster': _cl().name}, f)
     fill = dict(last=n_jobs - 1, n_tot=n_tot, per_job=per_job, n_task=st['n_task'], sweep_dir=sweep,
                 repo=repo, scratch=scratch, results=results, max_parallel=max_parallel,
-                sbatch=_cl().directives('sbatch'), cpu_sbatch=_cl().directives('cpu_sbatch'))
+                sbatch=_cl().directives('sbatch', sbatch), cpu_sbatch=_cl().directives('cpu_sbatch'))
     with open(JOB_TEMPLATE) as f:
         script = f.read().format(**fill)
     with open(os.path.join(local, 'job_script.sh'), 'w') as f:

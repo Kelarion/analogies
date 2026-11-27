@@ -45,10 +45,14 @@ def main(argv=None):
     n.add_argument('--per-job', type=int, help='combinations each array task runs')
     n.add_argument('--max-parallel', type=int, help='array tasks at once')
     n.add_argument('--exclude', nargs='+', metavar='NODE', help='nodes to keep the jobs off')
+    n.add_argument('--time', help="this sweep's time limit, e.g. 1-12:00:00 (default: the cluster's)")
+    n.add_argument('--sbatch', nargs='+', metavar='KEY=VALUE',
+                   help="other #SBATCH options over the cluster's, e.g. mem=64G cpus-per-task=12")
     n.add_argument('--dry-run', action='store_true', help='say what would be submitted, and stop')
     n.add_argument('--here', action='store_true', help='run the first combination here instead of submitting')
     n.add_argument('--no-check-commit', action='store_true', help="don't require the cluster's checkout to match")
     n.add_argument('--no-weights', action='store_true', help="don't check or download model weights")
+    n.add_argument('--no-data', action='store_true', help="don't check or install the NLTK data")
     n.add_argument('--no-prerequisites', action='store_true',
                    help="don't check or make the files the runs need (stored token categories)")
     n.add_argument('--quiet', action='store_true', help='print less')
@@ -69,6 +73,8 @@ def main(argv=None):
                    help='also rerun tasks that failed for reasons a retry won\'t fix')
     r.add_argument('--dry-run', action='store_true', help='say what would be submitted, and stop')
     r.add_argument('--job-ids', nargs='+', help='as for status')
+    r.add_argument('--time', help='time limit for the reruns; tasks that timed out are rerun too')
+    r.add_argument('--sbatch', nargs='+', metavar='KEY=VALUE', help='other #SBATCH options for the reruns')
 
     f = sub.add_parser('fetch', help="copy the cluster's results here (from the laptop)")
     f.add_argument('--dest', help='where to (default: SAVE_DIR)')
@@ -85,7 +91,8 @@ def main(argv=None):
             exclude = a.exclude[0] if a.exclude == ['failed'] else a.exclude
             su.resubmit_missing(a.sweep, exclude=exclude, include_errors=a.include_errors,
                                 remote=a.remote, dry_run=a.dry_run, job_ids=a.job_ids,
-                                per_job=a.per_job, max_parallel=a.max_parallel, cluster=a.cluster)
+                                per_job=a.per_job, max_parallel=a.max_parallel, cluster=a.cluster,
+                                sbatch=sbatch_options(a))
         elif a.command == 'fetch':
             su.fetch_results(a.dest, cluster=a.cluster)
     except (RuntimeError, FileExistsError, ValueError, KeyError) as e:
@@ -93,7 +100,20 @@ def main(argv=None):
 
 
 SEND_OPTIONS = ('name', 'per_job', 'max_parallel', 'exclude', 'check_commit', 'ensure_weights',
-                'ensure_prerequisites', 'verbose', 'template', 'cluster')
+                'ensure_prerequisites', 'ensure_data', 'verbose', 'template', 'cluster', 'sbatch')
+
+
+def sbatch_options(a):
+    """{option: value} from --sbatch KEY=VALUE ... and --time, or None."""
+    opts = {}
+    for kv in a.sbatch or []:
+        if '=' not in kv:
+            raise ValueError(f'--sbatch takes KEY=VALUE, got {kv!r}')
+        k, v = kv.split('=', 1)
+        opts[k.lstrip('-')] = v
+    if a.time:
+        opts['time'] = a.time
+    return opts or None
 
 
 def load_spec(path):
@@ -123,10 +143,15 @@ def send(a):
     given = {'name': a.name, 'per_job': a.per_job, 'max_parallel': a.max_parallel, 'exclude': a.exclude,
              'cluster': a.cluster}
     opts.update({k: v for k, v in given.items() if v is not None})
+    cli_sbatch = sbatch_options(a)
+    if cli_sbatch:                    # over the spec's send['sbatch'], option by option
+        opts['sbatch'] = {**(opts.get('sbatch') or {}), **cli_sbatch}
     if a.no_check_commit:
         opts['check_commit'] = False
     if a.no_weights:
         opts['ensure_weights'] = False
+    if a.no_data:
+        opts['ensure_data'] = False
     if a.no_prerequisites:
         opts['ensure_prerequisites'] = False
     opts.setdefault('verbose', not a.quiet)
