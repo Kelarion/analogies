@@ -621,6 +621,14 @@ def trace(record, refs=(), keep=None):
                                thinking, this also measures the reasoning trace
                                (runs saved before these were recorded leave out what they
                                lack; runs that stored kl_iso_task have no ll_iso)
+        ll_think_assistant, task_mass_think_assistant, top_any_think_assistant, ...
+        ll_nothink_assistant, ...
+                               thinking runs only: the assistant span's columns with each
+                               block's completion scored as the answer to the conversation cut
+                               after its user turn, after reasoning of the model's own, and
+                               with the thought closed at once (ICLModel's logp_think,
+                               logp_nothink and their tops; the final block's _think are
+                               ll_assistant's)
         ref_<name>             each reference predictor's log-probabilities, as a vector
                                the same way
         kept                   (given keep) whether block_mask keeps the token's block
@@ -644,7 +652,9 @@ def trace(record, refs=(), keep=None):
     data, refs = m['data'], dict(refs)
     k_show, k_hide = a.get('k_show'), a.get('k_hide')
     # the runs whose scores are stored, as (column suffix, log-probs, top ids, top log-probs)
-    runs = [('', 'logp_ctx', 'top_ids', 'top_lp'), ('_iso', 'logp_iso', 'top_ids_iso', 'top_lp_iso')]
+    runs = [('', 'logp_ctx', 'top_ids', 'top_lp'), ('_iso', 'logp_iso', 'top_ids_iso', 'top_lp_iso'),
+            ('_think', 'logp_think', 'top_ids_think', 'top_lp_think'),
+            ('_nothink', 'logp_nothink', 'top_ids_nothink', 'top_lp_nothink')]
     runs = [r for r in runs if r[1] in m]
     has_top = {sfx: tid in m for sfx, _, tid, _ in runs}
     M = block_mask(record, keep)
@@ -691,6 +701,8 @@ def trace(record, refs=(), keep=None):
             for side, suffix in [('user', ''), ('assistant', '_assistant')]:
                 span = {}
                 for run, lps, tids, tlps in runs:
+                    if (side, b) not in m[lps][i]:          # _think, _nothink: assistant only
+                        continue
                     lp = span[run] = place(m[lps][i], side, np.nan)
                     with np.errstate(invalid='ignore', divide='ignore'):
                         row[f'll{run}{suffix}'] = list(lp[:, sym])

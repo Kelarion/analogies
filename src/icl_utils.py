@@ -303,6 +303,24 @@ class ChatLM:
         k = next((j for j in range(min(len(tail), len(e)), 0, -1) if tail[-j:] == e[:j]), 0)
         return torch.cat([out, eot[k:]])
 
+    def open_answer(self, input_ids, mode, think, budget=None):
+        """A prompt that ends with the generation cue, carried up to where the completion
+        starts. Thinking: the model's own reasoning (reason, up to `budget` tokens), or with
+        budget=None an empty thought (the end of reasoning at once). Not thinking:
+        answer_prefix, if any. 'raw' mode: as it is."""
+        if mode == 'raw':
+            return input_ids
+        if think and budget is None:
+            return torch.cat([input_ids, self.think_tokens[2]])
+        if think:
+            out = self.reason(input_ids, budget)
+            torch.cuda.empty_cache()   # generation's cached blocks don't fit scoring's shapes
+            return out
+        if self.answer_prefix:
+            return torch.cat([input_ids, torch.tensor(self._ids(self.answer_prefix),
+                                                      dtype=torch.long, device=input_ids.device)])
+        return input_ids
+
     # -- scoring --------------------------------------------------------------------
 
     @cached_property
@@ -568,12 +586,7 @@ class ChatLM:
             mode, blocks, task_toks, k_show, k_hide, system_prompt, think,
             block_text=block_text, **template_kwargs)
         input_ids, target = input_ids.to(self.device), target.to(self.device)
-        if mode != 'raw' and think:
-            input_ids = self.reason(input_ids, thinking_budget)
-            torch.cuda.empty_cache()   # generation's cached blocks don't fit scoring's shapes
-        elif mode != 'raw' and self.answer_prefix:
-            input_ids = torch.cat([input_ids, torch.tensor(self._ids(self.answer_prefix),
-                                                           dtype=torch.long, device=self.device)])
+        input_ids = self.open_answer(input_ids, mode, think, thinking_budget)
 
         L = len(input_ids)
         positions = {(r, b): np.arange(s - 1, e) for r, b, s, e in spans}     # as span_rows
@@ -601,6 +614,36 @@ class ChatLM:
             return logp_ctx, lp[L - 1], input_ids, top, ref
         return logp_ctx, lp[L - 1], input_ids, top
 
+
+    @torch.no_grad()
+    def answer(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
+               think=True, thinking_budget=4000, equiv=None, block_text=None, reason=True,
+               **template_kwargs):
+        """
+        The last block's completion scored as the conversation's answer, the way run_trial
+        scores its final block, and nothing else. To score an earlier block b this way, pass
+        blocks[:b + 1] (and block_text[:b + 1]): the conversation cut after b's user turn,
+        the blocks before it laid out as in run_trial (earlier turns with their completions,
+        no reasoning). Returns rows, top: the task-token log-probs predicting each token of
+        the completion and the one after it, as run_trial's final assistant entry, and the
+        top tokens of the same rows ({'ids', 'lp'}, as run_trial's top).
+        reason: when thinking, after reasoning of the model's own (up to thinking_budget
+        tokens); otherwise with the thought closed at once (an empty thought), so the two
+        differ only by the reasoning. Not thinking, or in 'raw' mode, reason doesn't apply.
+        """
+        if not think and mode != 'raw':
+            template_kwargs = {**template_kwargs, **self.no_think_kwargs}
+        ids, _, target = self.build_prompt(mode, blocks, task_toks, k_show, k_hide, system_prompt,
+                                           think, block_text=block_text, **template_kwargs)
+        ids = self.open_answer(ids.to(self.device), mode, think,
+                               thinking_budget if reason else None)
+        target = target.to(self.device)
+        L = len(ids)
+        lp, top_ids, top_lp = self.score(torch.cat([ids, target]), task_toks, equiv)
+        rows = slice(L - 1, L + len(target))
+        gc.collect()
+        torch.cuda.empty_cache()
+        return lp[rows], {'ids': top_ids[rows], 'lp': top_lp[rows]}
 
     @torch.no_grad()
     def run_isolated(self, mode, blocks, task_toks, k_show=None, k_hide=None, system_prompt=None,
@@ -672,11 +715,7 @@ class ChatLM:
             mode, blocks[-1:], task_toks, k_show, k_hide, system_prompt, think,
             block_text=block_text[-1:], **prompt_kwargs)
         ids, target = ids.to(self.device), target.to(self.device)
-        if mode != 'raw' and think:
-            ids = torch.cat([ids, self.think_tokens[2]])           # an empty thought
-        elif mode != 'raw' and self.answer_prefix:
-            ids = torch.cat([ids, torch.tensor(self._ids(self.answer_prefix),
-                                               dtype=torch.long, device=self.device)])
+        ids = self.open_answer(ids, mode, think)                    # an empty thought
         L = len(ids)
         positions = {(r, last): np.arange(s - 1, e) for r, _, s, e in spans}
         positions[('assistant', last)] = np.arange(L - 1, L + len(target))
@@ -1039,7 +1078,8 @@ def ylabel(perplexity=False, kl=False, renorm=True):
     return out if renorm else out + ', whole vocabulary'
 
 def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title='', cmap='viridis',
-             refs=(), perplexity=False, kl=False, err='std', traces=False, renorm=True, iso=None):
+             refs=(), perplexity=False, kl=False, err='std', traces=False, renorm=True, iso=None,
+             assistant=None):
     """
     n_trl:  number of trials (comma-separated segments) per block to show, from the block's start
     k_hide: if given, show only the last k_hide tokens of each trial; otherwise every token
@@ -1078,9 +1118,18 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
                                   of the vocabulary as one more outcome; see kl_rows)
             Block 0 has no earlier blocks, so its curve is a check that the two runs line up:
             0 up to numerical noise. Doesn't combine with refs, kl or perplexity.
+    assistant: where the assistant turn's rows come from, one dict per sample with an
+            ('assistant', b) entry for every block: e.g. ICLModel's metrics['logp_think'] (each
+            block answered after reasoning of its own) or metrics['logp_nothink'] (with the
+            thought closed at once). Default: logp_ctx's (earlier blocks' completions as
+            earlier turns, the final block's after reasoning when thinking). With iso, only
+            logp_iso: kl_iso is stored for logp_ctx's rows.
     """
     if iso is not None and (refs or kl or perplexity):
         raise ValueError("iso plots KL(with ‖ without earlier blocks), which takes no refs, kl or perplexity")
+    if assistant is not None and iso is not None and np.ndim(iso[0][('user', 0)]) == 1:
+        raise ValueError("kl_iso is stored for logp_ctx's assistant rows; with assistant=..., pass "
+                         "iso=logp_iso")
     refs = dict(refs)
     f = (lambda v: np.exp(-v)) if perplexity else (lambda v: v)
     stored_kl = iso is not None and np.ndim(iso[0][('user', 0)]) == 1    # kl_iso, not logp_iso
@@ -1120,7 +1169,7 @@ def plot_icl(ax, logp_ctx, data, n_trl, k_hide=None, show_assistant=False, title
             vals = np.full(sum(len(t) for t in blocks[b]), np.nan)
 
             ctx = logp_ctx[i][('user', b)]
-            asst = logp_ctx[i][('assistant', b)]
+            asst = (logp_ctx if assistant is None else assistant)[i][('assistant', b)]
             rest, s = asst[1:-1], len(ctx)                          # completion tokens after the first
             if iso is None:                                         # against the true distribution
                 score = lambda lp, y: xent(lp, y, renorm)
