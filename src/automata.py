@@ -1678,7 +1678,6 @@ def holdout_graph(k, d, edges, index, strict=False, all_edges=False, all_nodes=F
                 G.add_edge(x, key[r * k + x], action=r)
     return G
 
-
 def _well_defined_holdouts(F, strict):
     """[(u, a, v)] of the edges of F (d x k targets, -1 none) that holdout_graph allows."""
     d, k = F.shape

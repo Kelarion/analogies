@@ -578,9 +578,11 @@ class Assigner:
         of pairs of grouped symbols sharing no group (z units)."""
         within = []
         for g in groups:
-            ts = np.array([idx[int(s)] for s in g]); Z = self.z(ts, ts)
+            ts = np.array([idx[int(s)] for s in g], int); Z = self.z(ts, ts)
             within.append(float(Z[np.triu_indices(len(ts), 1)].mean()))
-        syms = sorted(of); ts = np.array([idx[s] for s in syms]); Z = self.z(ts, ts)
+        if not of:     # no groups (e.g. one block, grouping by role): every symbol drawn alone
+            return {'groups': [], 'categories': [], 'within_z': [], 'between_z': None}
+        syms = sorted(of); ts = np.array([idx[s] for s in syms], int); Z = self.z(ts, ts)
         apart = np.array([[not set(of[a]) & set(of[b]) for b in syms] for a in syms])
         np.fill_diagonal(apart, False)
         return {'groups': [g.tolist() for g in groups],
